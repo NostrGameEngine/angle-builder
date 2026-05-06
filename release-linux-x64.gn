@@ -1,0 +1,14 @@
+is_component_build = false
+target_cpu = "x64"
+is_debug = false
+angle_assert_always_on = false
+clang_use_chrome_plugins = false
+angle_use_x11 = true
+angle_use_wayland = true
+ozone_platform_x11 = true
+ozone_platform_wayland = true
+angle_use_vulkan_display = false
+angle_enable_vulkan = true
+angle_enable_gl = false
+angle_enable_null = false
+angle_shared_libvulkan = false

@@ -1,0 +1,149 @@
+def ownerRaw = System.getenv('GITHUB_REPOSITORY_OWNER') ?: 'unknown'
+def owner = ownerRaw.toLowerCase()
+def repository = System.getenv('GITHUB_REPOSITORY') ?: "${owner}/angle-build"
+def repoName = repository.contains('/') ? repository.split('/')[1] : repository
+
+def groupValue = System.getenv('GROUP_ID') ?: 'org.ngengine'
+def artifactValue = System.getenv('ARTIFACT_ID') ?: 'angle-natives'
+def versionValue = System.getenv('VERSION') ?: '0.0.0-SNAPSHOT'
+def distDir = file(System.getenv('DIST_DIR') ?: "${rootDir}/dist")
+def githubUrl = System.getenv('GITHUB_MAVEN_URL') ?: "https://maven.pkg.github.com/${owner}/${repoName}"
+def githubUser = System.getenv('MAVEN_USERNAME') ?: ''
+def githubToken = System.getenv('MAVEN_TOKEN') ?: ''
+
+def sonatypeEnabled = (System.getenv('ENABLE_SONATYPE_PUBLISH') ?: 'false').toBoolean()
+def sonatypeUser = System.getenv('SONATYPE_USERNAME') ?: ''
+def sonatypePass = System.getenv('SONATYPE_PASSWORD') ?: ''
+def isSnapshot = versionValue.endsWith('-SNAPSHOT')
+def sonatypeNexusUrl = System.getenv('SONATYPE_NEXUS_URL') ?: 'https://ossrh-staging-api.central.sonatype.com/service/local/'
+def sonatypeSnapshotsUrl = System.getenv('SONATYPE_SNAPSHOTS_URL') ?: 'https://central.sonatype.com/repository/maven-snapshots/'
+
+def mainJar = file("${distDir}/${artifactValue}-${versionValue}.jar")
+if (!mainJar.exists()) {
+    throw new GradleException("Missing main jar: ${mainJar}")
+}
+
+def metaDir = file("${buildDir}/central-meta")
+def emptySourcesJar = tasks.register('emptySourcesJar', Jar) {
+    archiveClassifier = 'sources'
+    destinationDirectory = file("${buildDir}/generated-jars")
+    doFirst {
+        metaDir.mkdirs()
+        file("${metaDir}/README-sources.txt").text = 'Sources are distributed in upstream ANGLE repositories.'
+    }
+    from(metaDir) {
+        include 'README-sources.txt'
+    }
+}
+
+def emptyJavadocJar = tasks.register('emptyJavadocJar', Jar) {
+    archiveClassifier = 'javadoc'
+    destinationDirectory = file("${buildDir}/generated-jars")
+    doFirst {
+        metaDir.mkdirs()
+        file("${metaDir}/README-javadoc.txt").text = 'Javadocs are not applicable for native runtime bundles.'
+    }
+    from(metaDir) {
+        include 'README-javadoc.txt'
+    }
+}
+
+def extraPrefix = "${artifactValue}-${versionValue}-"
+def extraJars = fileTree(distDir) {
+    include "${extraPrefix}*.jar"
+}.files.toList().sort { a, b -> a.name <=> b.name }
+
+publishing {
+    publications {
+        create('angleNatives', MavenPublication) {
+            groupId = groupValue
+            artifactId = artifactValue
+            version = versionValue
+
+            artifact(mainJar)
+            artifact(emptySourcesJar)
+            artifact(emptyJavadocJar)
+            extraJars.each { jarFile ->
+                def jarClassifier = jarFile.name.substring(extraPrefix.length(), jarFile.name.length() - '.jar'.length())
+                artifact(jarFile) {
+                    classifier = jarClassifier
+                }
+            }
+
+            pom {
+                name = artifactValue
+                description = 'ANGLE native runtime bundles'
+                url = "https://github.com/${repository}"
+                licenses {
+                    license {
+                        name = 'BSD-3-Clause'
+                        url = 'https://opensource.org/licenses/BSD-3-Clause'
+                    }
+                }
+                developers {
+                    developer {
+                        id = owner
+                        name = ownerRaw
+                    }
+                }
+                scm {
+                    url = "https://github.com/${repository}"
+                    connection = "scm:git:https://github.com/${repository}.git"
+                    developerConnection = "scm:git:ssh://git@github.com/${repository}.git"
+                }
+            }
+        }
+    }
+
+    repositories {
+        maven {
+            name = 'github'
+            url = uri(githubUrl)
+            credentials {
+                username = githubUser
+                password = githubToken
+            }
+        }
+    }
+}
+
+if (sonatypeEnabled) {
+    nexusPublishing {
+        packageGroup = groupValue
+        repositories {
+            sonatype {
+                nexusUrl = uri(sonatypeNexusUrl)
+                snapshotRepositoryUrl = uri(sonatypeSnapshotsUrl)
+                username = sonatypeUser
+                password = sonatypePass
+            }
+        }
+    }
+}
+
+def gpgKey = System.getenv('GPG_PRIVATE_KEY')
+def gpgPassphrase = System.getenv('GPG_PASSPHRASE')
+def signingEnabled = sonatypeEnabled && gpgKey && gpgPassphrase
+
+if (signingEnabled) {
+    signing {
+        useInMemoryPgpKeys(gpgKey, gpgPassphrase)
+        sign publishing.publications.angleNatives
+    }
+}
+
+tasks.register('publishArtifacts') {
+    dependsOn 'publishAngleNativesPublicationToGithubRepository'
+    if (sonatypeEnabled) {
+        dependsOn 'publishToSonatype'
+        if (!isSnapshot) {
+            if (tasks.findByName('closeAndReleaseSonatypeStagingRepository')) {
+                dependsOn 'closeAndReleaseSonatypeStagingRepository'
+            } else if (tasks.findByName('closeAndReleaseStagingRepositories')) {
+                dependsOn 'closeAndReleaseStagingRepositories'
+            } else {
+                throw new GradleException('No Sonatype close/release task found. Checked closeAndReleaseSonatypeStagingRepository and closeAndReleaseStagingRepositories.')
+            }
+        }
+    }
+}

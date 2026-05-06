@@ -1,0 +1,9 @@
+build
+angle
+out
+angle-artifacts
+dist
+generated
+.cache
+x.git
+.gradle

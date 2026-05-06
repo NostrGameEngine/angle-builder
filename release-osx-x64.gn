@@ -1,0 +1,9 @@
+is_component_build = false
+target_cpu = "x64"
+is_debug = false
+angle_assert_always_on = false
+clang_use_chrome_plugins = false
+angle_enable_null = false
+angle_enable_gl = false
+angle_enable_vulkan = false
+angle_enable_metal = true

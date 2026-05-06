@@ -1,0 +1,250 @@
+name: angle-natives-build
+
+on:
+  push:
+    branches: [master]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  LINUX_CONTAINER_IMAGE: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+    outputs:
+      ANGLE_COMMIT: ${{ steps.info.outputs.ANGLE_COMMIT }}
+      VERSION: ${{ steps.info.outputs.VERSION }}
+    steps:
+      - name: Resolve ANGLE HEAD commit + version
+        id: info
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git ls-remote https://chromium.googlesource.com/angle/angle HEAD | awk '{print $1}')"
+          SHORT="${SHA:0:12}"
+
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            if [[ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]]; then
+              VERSION="${VERSION}.r${GITHUB_RUN_ATTEMPT}"
+            fi
+          else
+            VERSION="$(date -u +%Y%m%d).${SHORT}-SNAPSHOT"
+          fi
+
+          echo "ANGLE_COMMIT=$SHA" >> "$GITHUB_OUTPUT"
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: resolve
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - classifier: natives-linux
+            arch_dir: x86_64
+            target_cpu: x64
+            args_file: release-linux-x64.gn
+          - classifier: natives-linux-arm64
+            arch_dir: arm64
+            target_cpu: arm64
+            args_file: release-linux-arm64.gn
+    env:
+      ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+      ANGLE_DEBUG: ${{ github.event_name != 'release' }}
+      DEPOT_TOOLS_PYTHON3: python3
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build Linux artifacts
+        shell: bash
+        env:
+          BUILD_CLASSIFIER: ${{ matrix.classifier }}
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/build-linux-in-container.sh
+          ./scripts/build-linux-in-container.sh
+
+      - name: Upload staged files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.classifier }}
+          path: angle-artifacts/${{ matrix.classifier }}
+          if-no-files-found: error
+
+  build-windows:
+    needs: resolve
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - classifier: natives-windows
+          - classifier: natives-windows-arm64
+    env:
+      ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "0"
+      ANGLE_DEBUG: ${{ github.event_name != 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Windows artifacts
+        shell: pwsh
+        env:
+          BUILD_CLASSIFIER: ${{ matrix.classifier }}
+        run: |
+          ./scripts/build-windows.ps1
+
+      - name: Upload staged files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.classifier }}
+          path: angle-artifacts/${{ matrix.classifier }}
+          if-no-files-found: error
+
+  build-macos:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runs_on: macos-15-intel
+            classifier: natives-macos
+          - runs_on: macos-latest
+            classifier: natives-macos-arm64
+    runs-on: ${{ matrix.runs_on }}
+    env:
+      ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+      ANGLE_DEBUG: ${{ github.event_name != 'release' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build macOS artifacts
+        shell: bash
+        env:
+          BUILD_CLASSIFIER: ${{ matrix.classifier }}
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/build-macos.sh
+          ./scripts/build-macos.sh
+
+      - name: Upload staged files
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.classifier }}
+          path: angle-artifacts/${{ matrix.classifier }}
+          if-no-files-found: error
+
+  package:
+    needs: [resolve, build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+    env:
+      VERSION: ${{ needs.resolve.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download staged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: natives-*
+          path: angle-artifacts
+
+      - name: Create jars in dist/
+        shell: bash
+        env:
+          PACKAGE_INPUT_DIR: angle-artifacts
+          PACKAGE_OUTPUT_DIR: dist
+          PACKAGE_EXPECTED_CLASSIFIERS: natives-linux natives-linux-arm64 natives-windows natives-windows-arm64 natives-macos natives-macos-arm64
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/package.sh
+          ./scripts/package.sh "$VERSION"
+
+      - name: Upload packaged jars
+        uses: actions/upload-artifact@v4
+        with:
+          name: angle-maven-jars
+          path: dist/*.jar
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, package]
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.VERSION }}
+      MAVEN_USERNAME: ${{ secrets.GH_PACKAGES_USERNAME || github.actor }}
+      MAVEN_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN || github.token }}
+      SONATYPE_USERNAME: ${{ secrets.SONATYPE_USERNAME }}
+      SONATYPE_PASSWORD: ${{ secrets.SONATYPE_PASSWORD }}
+      GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+      GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Download publish jars
+        uses: actions/download-artifact@v4
+        with:
+          name: angle-maven-jars
+          path: dist
+
+      - name: Resolve publish environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/resolve-publish-env.sh
+          .github/scripts/resolve-publish-env.sh
+
+      - name: Publish with Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon -p .github/gradle publishArtifacts
