@@ -1,6 +1,9 @@
 name: angle-natives-build
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: '07 2 * * 0'
   push:
     branches: [master]
   release:
