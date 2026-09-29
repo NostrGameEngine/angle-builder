@@ -12,7 +12,7 @@ ANGLE_DIR="${ANGLE_DIR:-$WORK_DIR/angle}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-$ROOT_DIR/angle-artifacts}"
 DIST_DIR="${DIST_DIR:-$ROOT_DIR/dist}"
 DEPOT_TOOLS_DIR="${DEPOT_TOOLS_DIR:-$ROOT_DIR/.cache/depot_tools}"
-ANGLE_PINNED_COMMIT="${ANGLE_PINNED_COMMIT:-${ANGLE_COMMIT:-84399673e381a301f2d4fd394a3a09450013feae}}"
+ANGLE_PINNED_COMMIT="${ANGLE_PINNED_COMMIT:-${ANGLE_COMMIT:-$(tr -d '[:space:]' < "$ROOT_DIR/ANGLE_COMMIT")}}"
 
 log() {
   printf '[%s] %s\n' "$(basename "$0")" "$*"
@@ -84,6 +84,7 @@ prepend_depot_tools() {
 }
 
 ensure_angle_checkout() {
+  [[ "$ANGLE_PINNED_COMMIT" =~ ^[0-9a-f]{40}$ ]] || fail "ANGLE_COMMIT must be a full commit SHA"
   ensure_depot_tools
   prepend_depot_tools
 
@@ -106,8 +107,17 @@ ensure_angle_checkout() {
 
   [[ -d "$ANGLE_DIR/.git" ]] || fail "ANGLE checkout was not created at $ANGLE_DIR"
 
-  log "Checking out pinned ANGLE commit: $ANGLE_PINNED_COMMIT"
-  git -C "$ANGLE_DIR" checkout --force --detach "$ANGLE_PINNED_COMMIT"
+  local current_commit
+  current_commit="$(git -C "$ANGLE_DIR" rev-parse HEAD)"
+  if [[ "$current_commit" != "$ANGLE_PINNED_COMMIT" ]]; then
+    [[ -z "$(git -C "$ANGLE_DIR" status --porcelain)" ]] || fail "Refusing to change a modified ANGLE checkout"
+    log "Checking out pinned ANGLE commit: $ANGLE_PINNED_COMMIT"
+    git -C "$ANGLE_DIR" checkout --detach "$ANGLE_PINNED_COMMIT"
+  fi
+  if [[ "${ANGLE_SKIP_SYNC:-0}" == "1" ]]; then
+    log "Dependency sync explicitly skipped for the verified ANGLE revision"
+    return
+  fi
 
   # Keep DEPS in sync for the exact ANGLE checkout before building.
   pushd "$ANGLE_DIR" >/dev/null
@@ -152,6 +162,11 @@ HOST_OS=$(host_os)
 HOST_ARCH=$(host_arch)
 BUILT_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF_INFO
+  local patch
+  for patch in "$ROOT_DIR"/patches/*.patch; do
+    [[ -f "$patch" ]] || continue
+    printf 'PATCH=%s:%s\n' "$(basename "$patch")" "$(git hash-object "$patch")" >> "$target_dir/ANGLE_BUILD_INFO.txt"
+  done
 }
 
 require_staged_file() {

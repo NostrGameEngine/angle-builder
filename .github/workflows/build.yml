@@ -22,12 +22,14 @@ jobs:
       ANGLE_COMMIT: ${{ steps.info.outputs.ANGLE_COMMIT }}
       VERSION: ${{ steps.info.outputs.VERSION }}
     steps:
-      - name: Resolve ANGLE HEAD commit + version
+      - uses: actions/checkout@v4
+      - name: Resolve pinned ANGLE commit + version
         id: info
         shell: bash
         run: |
           set -euo pipefail
-          SHA="$(git ls-remote https://chromium.googlesource.com/angle/angle HEAD | awk '{print $1}')"
+          SHA="$(tr -d '[:space:]' < ANGLE_COMMIT)"
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
           SHORT="${SHA:0:12}"
 
           if [[ "${{ github.event_name }}" == "release" ]]; then

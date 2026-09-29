@@ -1,0 +1,95 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index b309c96..4a546f3 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -464,6 +464,13 @@ bool IsMetalDisplayAvailable()
+ 
+ void DisplayMtl::generateExtensions(egl::DisplayExtensions *outExtensions) const
+ {
++    outExtensions->pixelFormatFloat = true;
++    outExtensions->glColorspace     = true;
++#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
++    outExtensions->glColorspaceScrgbLinear = true;
++#elif TARGET_OS_IOS && !TARGET_OS_TV && !TARGET_OS_WATCH
++    if (@available(iOS 16.0, *)) outExtensions->glColorspaceScrgbLinear = true;
++#endif
+     outExtensions->createContextRobustness    = true;
+     outExtensions->iosurfaceClientBuffer      = true;
+     outExtensions->surfacelessContext         = true;
+@@ -631,6 +638,17 @@ bool IsMetalDisplayAvailable()
+         configs.add(config);
+     }
+ 
++    // Native EDR requires float drawables; leave all existing SDR configurations intact.
++    config.renderTargetFormat = GL_RGBA16F;
++    config.colorComponentType = EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT;
++    config.redSize = config.greenSize = config.blueSize = config.alphaSize = 16;
++    config.bufferSize = 64;
++    config.samples = config.sampleBuffers = 0;
++    configs.add(config);
++    config.depthSize = 24;
++    config.stencilSize = 8;
++    config.depthStencilFormat = GL_DEPTH24_STENCIL8;
++    configs.add(config);
+     return configs;
+ }
+ 
+diff --git a/src/libANGLE/renderer/metal/SurfaceMtl.mm b/src/libANGLE/renderer/metal/SurfaceMtl.mm
+index 6e80d9b..cf1cc96 100644
+--- a/src/libANGLE/renderer/metal/SurfaceMtl.mm
++++ b/src/libANGLE/renderer/metal/SurfaceMtl.mm
+@@ -85,6 +85,14 @@
+     mRobustResourceInit =
+         attribs.get(EGL_ROBUST_RESOURCE_INITIALIZATION_ANGLE, EGL_FALSE) == EGL_TRUE;
+     mColorFormat = display->getPixelFormat(angle::FormatID::B8G8R8A8_UNORM);
++    if (state.config && state.config->colorComponentType == EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT)
++    {
++        mColorFormat = display->getPixelFormat(angle::FormatID::R16G16B16A16_FLOAT);
++    }
++    else if (attribs.get(EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_LINEAR_KHR) == EGL_GL_COLORSPACE_SRGB_KHR)
++    {
++        mColorFormat = display->getPixelFormat(angle::FormatID::B8G8R8A8_UNORM_SRGB);
++    }
+ 
+     mSamples = state.config->samples;
+ 
+@@ -424,6 +432,12 @@
+ 
+ egl::Error WindowSurfaceMtl::initialize(const egl::Display *display)
+ {
++    const bool hdr = mState.attributes.get(EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_LINEAR_KHR) ==
++                     EGL_GL_COLORSPACE_SCRGB_LINEAR_EXT;
++    if (hdr && mColorFormat.metalFormat != MTLPixelFormatRGBA16Float)
++    {
++        return egl::Error(EGL_BAD_MATCH, "Linear scRGB window surfaces require an FP16 configuration");
++    }
+     egl::Error re = SurfaceMtl::initialize(display);
+     if (re.isError())
+     {
+@@ -450,6 +464,26 @@
+         mMetalLayer.get().device          = metalDevice;
+         mMetalLayer.get().pixelFormat     = mColorFormat.metalFormat;
+         mMetalLayer.get().framebufferOnly = NO;  // Support blitting and glReadPixels
++        CGColorSpaceRef extended = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearSRGB);
++        if (hdr)
++        {
++            mMetalLayer.get().colorspace = extended;
++        }
++        else if (!mMetalLayer.get().colorspace || CFEqual(mMetalLayer.get().colorspace, extended))
++        {
++            // Tag new SDR layers and reset layers reused after HDR negotiation is abandoned.
++            CGColorSpaceRef sdr = CGColorSpaceCreateWithName(
++                mColorFormat.metalFormat == MTLPixelFormatRGBA16Float ? kCGColorSpaceLinearSRGB
++                                                                    : kCGColorSpaceSRGB);
++            mMetalLayer.get().colorspace = sdr;
++            CGColorSpaceRelease(sdr);
++        }
++        CGColorSpaceRelease(extended);
++#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
++        mMetalLayer.get().wantsExtendedDynamicRangeContent = hdr;
++#elif TARGET_OS_IOS && !TARGET_OS_TV && !TARGET_OS_WATCH
++        if (@available(iOS 16.0, *)) mMetalLayer.get().wantsExtendedDynamicRangeContent = hdr;
++#endif
+ 
+ #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+         // Autoresize with parent layer.

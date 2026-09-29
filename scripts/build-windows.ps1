@@ -11,7 +11,7 @@ if ($env:GITHUB_ACTIONS -eq 'true') {
 $ANGLE_DIR = if ($env:ANGLE_DIR) { $env:ANGLE_DIR } else { Join-Path $ANGLE_DEFAULT_ROOT 'angle' }
 $ARTIFACTS_DIR = if ($env:ARTIFACTS_DIR) { $env:ARTIFACTS_DIR } else { Join-Path $ROOT_DIR 'angle-artifacts' }
 $DEPOT_TOOLS_DIR = if ($env:DEPOT_TOOLS_DIR) { $env:DEPOT_TOOLS_DIR } else { Join-Path $ROOT_DIR '.cache\depot_tools' }
-$ANGLE_PINNED_COMMIT = if ($env:ANGLE_PINNED_COMMIT) { $env:ANGLE_PINNED_COMMIT } elseif ($env:ANGLE_COMMIT) { $env:ANGLE_COMMIT } else { '84399673e381a301f2d4fd394a3a09450013feae' }
+$ANGLE_PINNED_COMMIT = if ($env:ANGLE_PINNED_COMMIT) { $env:ANGLE_PINNED_COMMIT } elseif ($env:ANGLE_COMMIT) { $env:ANGLE_COMMIT } else { (Get-Content -Raw (Join-Path $ROOT_DIR 'ANGLE_COMMIT')).Trim() }
 $env:DEPOT_TOOLS_WIN_TOOLCHAIN = if ($env:DEPOT_TOOLS_WIN_TOOLCHAIN) { $env:DEPOT_TOOLS_WIN_TOOLCHAIN } else { '0' }
 $DEPOT_TOOLS_CIPD_BIN_DIR = Join-Path $DEPOT_TOOLS_DIR '.cipd_bin'
 

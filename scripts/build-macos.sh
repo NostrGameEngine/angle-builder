@@ -4,8 +4,6 @@ source "$(cd "$(dirname "$0")/.." && pwd)/scripts/common.sh"
 
 ensure_angle_checkout
 
-rm -rf "$ARTIFACTS_DIR/natives-macos" "$ARTIFACTS_DIR/natives-macos-arm64"
-
 targets=(
   "natives-macos|osx|x86_64|release-osx-x64.gn|libEGL libGLESv2"
   "natives-macos-arm64|osx|arm64|release-osx-arm64.gn|libEGL libGLESv2"
@@ -27,14 +25,17 @@ for target in "${targets[@]}"; do
   mkdir -p "$out_dir"
   cp "$ROOT_DIR/$args_file" "$out_dir/args.gn"
   gn gen "$out_dir"
-  autoninja -C "$out_dir" $ninja_targets
+  build_command=(autoninja -C "$out_dir")
+  if [[ -n "${BUILD_JOBS:-}" ]]; then
+    [[ "$BUILD_JOBS" =~ ^[1-9][0-9]*$ ]] || fail "BUILD_JOBS must be a positive integer"
+    build_command+=(-j "$BUILD_JOBS")
+  fi
+  "${build_command[@]}" $ninja_targets
 
   mkdir -p "$stage_dir"
   build_info_file "$stage_dir"
   cp -f LICENSE "$stage_dir/LICENSE.ANGLE" || true
-  cp -f "$out_dir"/libEGL.* "$stage_dir/"
-  cp -f "$out_dir"/libGLESv2.* "$stage_dir/"
-  rm -f "$stage_dir"/*.TOC || true
+  cp -f "$out_dir/libEGL.dylib" "$out_dir/libGLESv2.dylib" "$stage_dir/"
   require_staged_file "$stage_dir" libEGL.dylib
   require_staged_file "$stage_dir" libGLESv2.dylib
 done
