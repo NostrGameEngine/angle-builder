@@ -208,6 +208,8 @@ try {
           continue
         }
 
+        # Repeat the failed check without suppressing Git's hunk diagnostics.
+        git apply --check $patch.FullName
         throw "Patch does not apply cleanly: $($patch.FullName)"
       }
     }

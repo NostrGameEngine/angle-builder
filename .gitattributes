@@ -1,0 +1,2 @@
+# Patches must retain LF even when Git for Windows enables core.autocrlf.
+*.patch text eol=lf
