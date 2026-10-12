@@ -12,3 +12,6 @@ angle_enable_vulkan = true
 angle_enable_gl = false
 angle_enable_null = false
 angle_shared_libvulkan = false
+
+# Share the caller/toolkit Wayland ABI; do not bundle a private client copy.
+angle_use_system_wayland = true
