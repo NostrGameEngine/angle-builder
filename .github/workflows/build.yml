@@ -3,12 +3,14 @@ name: angle-natives-build
 on:
   push:
     branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
   release:
     types: [published]
 
 permissions:
   contents: read
-  packages: write
 
 env:
   LINUX_CONTAINER_IMAGE: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
@@ -164,8 +166,90 @@ jobs:
           path: angle-artifacts/${{ matrix.classifier }}
           if-no-files-found: error
 
+  test-linux-logic:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned ANGLE sources without build dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: google/angle
+          ref: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+          path: build/angle
+          persist-credentials: false
+
+      - name: Check patches and enumeration logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          for patch in patches/*.patch; do
+            git -C build/angle apply --check "$GITHUB_WORKSPACE/$patch"
+            git -C build/angle apply "$GITHUB_WORKSPACE/$patch"
+          done
+          python3 tests/test-linux-hdr-logic.py
+          python3 -m py_compile scripts/verify-linux-hdr-audit.py
+          bash -n scripts/test-linux-hdr.sh
+          bash -n scripts/build-hdr-audit-layer.sh
+          bash -n .github/scripts/test-linux-software.sh
+
+  test-linux-software:
+    needs: [resolve, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: ubuntu:26.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      ANGLE_DIR: ${{ github.workspace }}/build/angle
+      ANGLE_NATIVE_DIR: ${{ github.workspace }}/angle-artifacts/natives-linux/native/angle/linux/x86_64
+    steps:
+      - name: Install software rendering and test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential python3 pkg-config \
+            libwayland-dev wayland-protocols libvulkan-dev vulkan-tools \
+            libegl-mesa0 libgl1-mesa-dri mesa-vulkan-drivers weston
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout pinned public EGL and GLES headers
+        uses: actions/checkout@v4
+        with:
+          repository: google/angle
+          ref: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+          path: build/angle
+          persist-credentials: false
+
+      - name: Download the Linux libraries built by this run
+        uses: actions/download-artifact@v4
+        with:
+          name: natives-linux
+          path: angle-artifacts/natives-linux
+
+      - name: Test Wayland presentation with lavapipe and headless Weston
+        run: bash .github/scripts/test-linux-software.sh
+
+      - name: Upload software test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-software-test-logs
+          path: test-results/linux-software/
+          if-no-files-found: warn
+
   package:
-    needs: [resolve, build-linux, build-windows, build-macos]
+    needs: [resolve, build-linux, build-windows, build-macos, test-linux-logic, test-linux-software]
     runs-on: ubuntu-latest
     container:
       image: registry.gitlab.steamos.cloud/steamrt/sniper/sdk
@@ -204,6 +288,10 @@ jobs:
           if-no-files-found: error
 
   publish:
+    if: >-
+      github.repository == 'NostrGameEngine/angle-builder' &&
+      (github.event_name == 'release' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/master'))
     needs: [resolve, package]
     runs-on: ubuntu-latest
     container:

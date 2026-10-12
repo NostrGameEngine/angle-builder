@@ -299,11 +299,12 @@ static void RunPhase(EGLDisplay display, EGLConfig config, NativeWindow &window,
 int main(int argc, char **argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    bool requireHdr = false, requireScrgb = false;
+    bool requireHdr = false, requireScrgb = false, requireHdr10 = false;
     for (int i = 1; i < argc; ++i)
     {
         if (!std::strcmp(argv[i], "--require-hdr")) requireHdr = true;
         else if (!std::strcmp(argv[i], "--require-scrgb")) requireScrgb = true;
+        else if (!std::strcmp(argv[i], "--require-hdr10")) requireHdr10 = true;
         else { std::fprintf(stderr, "Unknown argument: %s\n", argv[i]); return 2; }
     }
     try
@@ -346,7 +347,7 @@ int main(int argc, char **argv)
         Require(sdr != nullptr, "No SDR EGL window config");
         RunPhase(display, sdr, window, wl, "SDR_before", EGL_GL_COLORSPACE_LINEAR_KHR, false, false);
         int hdrPasses = 0, hdrSkipped = 0;
-        bool scrgbPassed = false;
+        bool scrgbPassed = false, hdr10Passed = false;
         for (int index = 0; index < 2; ++index)
         {
             bool floating = index == 0;
@@ -363,7 +364,9 @@ int main(int argc, char **argv)
             RunPhase(display, config, window, wl, name,
                 floating ? EGL_GL_COLORSPACE_SCRGB_LINEAR_EXT : EGL_GL_COLORSPACE_BT2020_PQ_EXT,
                 floating, !floating);
-            ++hdrPasses; if (floating) scrgbPassed = true;
+            ++hdrPasses;
+            if (floating) scrgbPassed = true;
+            else hdr10Passed = true;
             RunPhase(display, sdr, window, wl, "SDR_after_HDR_same_native_window", EGL_GL_COLORSPACE_LINEAR_KHR, false, false);
         }
         const EGLint invalidAttributes[] = {EGL_GL_COLORSPACE_KHR, 0x7ffffffe, EGL_NONE};
@@ -375,7 +378,8 @@ int main(int argc, char **argv)
         RunPhase(display, sdr, window, wl, "SDR_after_rejection", EGL_GL_COLORSPACE_LINEAR_KHR, false, false);
         RunPhase(display, sdr, window, wl, "SDR_sRGB_encoding", EGL_GL_COLORSPACE_SRGB_KHR, false, false);
         std::printf("LINUX_HDR_SUMMARY hdr_pass=%d hdr_skip=%d sdr=PASS physical_hdr=NOT_TESTED\n", hdrPasses, hdrSkipped);
-        if ((requireHdr && hdrPasses == 0) || (requireScrgb && !scrgbPassed))
+        if ((requireHdr && hdrPasses == 0) || (requireScrgb && !scrgbPassed) ||
+            (requireHdr10 && !hdr10Passed))
         {
             std::puts("REQUIRED_HDR_UNAVAILABLE: returning 77, not success");
             return 77;

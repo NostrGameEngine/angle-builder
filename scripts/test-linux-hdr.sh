@@ -2,12 +2,12 @@
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 [[ "$(uname -s)" == Linux ]] || { echo 'This probe requires Linux/Wayland' >&2; exit 2; }
-ANGLE_DIR="${ANGLE_DIR:-$ROOT_DIR/build/angle}"
+export ANGLE_DIR="${ANGLE_DIR:-$ROOT_DIR/build/angle}"
 arch="$(uname -m)"; [[ "$arch" == x86_64 ]] && arch=x64; [[ "$arch" == aarch64 ]] && arch=arm64
 native_dir="${ANGLE_NATIVE_DIR:-$ANGLE_DIR/out/release-linux-$arch}"
 native_dir="$(realpath "$native_dir")"
 [[ -f "$native_dir/libEGL.so" && -f "$native_dir/libGLESv2.so" ]] || { echo "Build ANGLE first: $native_dir" >&2; exit 2; }
-for tool in pkg-config wayland-scanner "${CXX:-c++}" "${CC:-cc}" timeout; do
+for tool in pkg-config wayland-scanner "${CXX:-c++}" "${CC:-cc}" timeout python3 realpath sha256sum tee; do
     command -v "$tool" >/dev/null || { echo "Missing required tool: $tool" >&2; exit 2; }
 done
 pkg-config --exists wayland-client wayland-egl || { echo 'Install Wayland client development files' >&2; exit 2; }
@@ -35,13 +35,17 @@ if [[ "${HDR_AUDIT:-0}" == 1 ]]; then
     export VK_LAYER_PATH="$test_dir:/usr/share/vulkan/explicit_layer.d:/etc/vulkan/explicit_layer.d${VK_LAYER_PATH:+:$VK_LAYER_PATH}"
     export VK_INSTANCE_LAYERS="VK_LAYER_NGE_hdr_audit${VK_INSTANCE_LAYERS:+:$VK_INSTANCE_LAYERS}"
     log="${HDR_AUDIT_LOG:-$test_dir/hdr-audit-$(date -u +%Y%m%d-%H%M%S)-$$.log}"
+    mkdir -p "$(dirname "$log")"
     set +e
     timeout "${TEST_TIMEOUT_SECONDS:-90}" "$test_dir/linux-hdr-probe" "$@" 2>&1 | tee "$log"
-    probe_status=${PIPESTATUS[0]}
+    pipeline_status=("${PIPESTATUS[@]}")
+    probe_status=${pipeline_status[0]}
     python3 "$ROOT_DIR/scripts/verify-linux-hdr-audit.py" "$log"
     audit_status=$?
     set -e
-    [[ "$probe_status" == 0 ]] || exit "$probe_status"
-    exit "$audit_status"
+    # A missing optional HDR mode must never hide an audit or log-write failure.
+    [[ "${pipeline_status[1]}" == 0 ]] || exit 1
+    [[ "$audit_status" == 0 ]] || exit "$audit_status"
+    exit "$probe_status"
 fi
 exec timeout "${TEST_TIMEOUT_SECONDS:-90}" "$test_dir/linux-hdr-probe" "$@"
