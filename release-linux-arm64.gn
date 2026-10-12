@@ -13,3 +13,6 @@ angle_enable_gl = false
 angle_enable_null = false
 angle_shared_libvulkan = false
 use_sysroot = true
+
+# Share the caller/toolkit Wayland ABI; do not bundle a private client copy.
+angle_use_system_wayland = true
