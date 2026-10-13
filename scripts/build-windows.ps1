@@ -15,6 +15,10 @@ $ANGLE_PINNED_COMMIT = if ($env:ANGLE_PINNED_COMMIT) { $env:ANGLE_PINNED_COMMIT 
 $env:DEPOT_TOOLS_WIN_TOOLCHAIN = if ($env:DEPOT_TOOLS_WIN_TOOLCHAIN) { $env:DEPOT_TOOLS_WIN_TOOLCHAIN } else { '0' }
 $DEPOT_TOOLS_CIPD_BIN_DIR = Join-Path $DEPOT_TOOLS_DIR '.cipd_bin'
 
+if ($ANGLE_PINNED_COMMIT -notmatch '^[0-9a-f]{40}$') {
+  throw 'ANGLE_COMMIT must be a full commit SHA'
+}
+
 function Log([string]$Message) {
   Write-Host "[build-windows.ps1] $Message"
 }
@@ -145,13 +149,11 @@ if (Test-Path (Join-Path $ANGLE_DIR '.git')) {
   throw "ANGLE path exists but is not a directory: $ANGLE_DIR"
 } else {
   New-Item -ItemType Directory -Force -Path $ANGLE_DIR | Out-Null
-  if ((Split-Path -Leaf $ANGLE_DIR) -ne 'angle') {
-    throw "ANGLE_DIR must be named 'angle' when using depot_tools fetch: $ANGLE_DIR"
-  }
-  Log 'Fetching ANGLE with depot_tools'
+  Log 'Configuring pinned ANGLE checkout with depot_tools'
   Push-Location $ANGLE_DIR
   try {
-    Invoke-WithRetry -Attempts 3 -DelaySeconds 15 -Script { fetch angle }
+    Invoke-Native { gclient config --spec "solutions = [{'name': '.', 'url': 'https://chromium.googlesource.com/angle/angle.git', 'deps_file': 'DEPS', 'managed': False, 'custom_vars': {}}]" }
+    Invoke-WithRetry -Attempts 3 -DelaySeconds 15 -Script { gclient sync --no-history --revision ".@$ANGLE_PINNED_COMMIT" }
   } finally {
     Pop-Location
   }
@@ -161,8 +163,16 @@ if (-not (Test-Path (Join-Path $ANGLE_DIR '.git'))) {
   throw "ANGLE checkout was not created at $ANGLE_DIR"
 }
 
-Log "Checking out pinned ANGLE commit: $ANGLE_PINNED_COMMIT"
-Invoke-Native { git -C $ANGLE_DIR checkout --force --detach $ANGLE_PINNED_COMMIT }
+$currentCommit = (git -C $ANGLE_DIR rev-parse HEAD).Trim()
+if ($currentCommit -ne $ANGLE_PINNED_COMMIT) {
+  # gclient checks dependency worktrees; differing gitlinks are expected.
+  $changes = git -C $ANGLE_DIR status --porcelain --ignore-submodules=all
+  if ($changes) {
+    throw 'Refusing to change a modified ANGLE checkout'
+  }
+  Log "Checking out pinned ANGLE commit: $ANGLE_PINNED_COMMIT"
+  Invoke-Native { git -C $ANGLE_DIR checkout --detach $ANGLE_PINNED_COMMIT }
+}
 
 Push-Location $ANGLE_DIR
 try {
@@ -173,6 +183,8 @@ try {
 
 $GN_EXE = Get-GnExecutable
 $env:PATH = "$(Split-Path -Parent $GN_EXE);$env:PATH"
+
+& (Join-Path $PSScriptRoot 'setup-windows-sdk.ps1') -AngleDir $ANGLE_DIR
 
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $ARTIFACTS_DIR 'natives-windows')
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $ARTIFACTS_DIR 'natives-windows-arm64')

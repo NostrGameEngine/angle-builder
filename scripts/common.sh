@@ -96,13 +96,13 @@ ensure_angle_checkout() {
     fail "ANGLE path exists but is not a directory, and will not be deleted: $ANGLE_DIR"
   else
     ensure_dir "$ANGLE_DIR"
-    if [[ "$(basename "$ANGLE_DIR")" != "angle" ]]; then
-      fail "ANGLE_DIR must be named 'angle' when using depot_tools fetch: $ANGLE_DIR"
-    fi
-    log "Fetching ANGLE with depot_tools"
+    log "Fetching pinned ANGLE revision with depot_tools"
     pushd "$ANGLE_DIR" >/dev/null
-    retry_cmd 3 15 fetch angle
+    gclient config --spec 'solutions = [{"name": ".", "url": "https://chromium.googlesource.com/angle/angle.git", "deps_file": "DEPS", "managed": False, "custom_vars": {}}]'
+    retry_cmd 3 15 gclient sync --no-history --revision ".@$ANGLE_PINNED_COMMIT"
     popd >/dev/null
+    [[ "$(git -C "$ANGLE_DIR" rev-parse HEAD)" == "$ANGLE_PINNED_COMMIT" ]] || fail "ANGLE checkout is not at the pinned revision"
+    return
   fi
 
   [[ -d "$ANGLE_DIR/.git" ]] || fail "ANGLE checkout was not created at $ANGLE_DIR"
@@ -110,7 +110,9 @@ ensure_angle_checkout() {
   local current_commit
   current_commit="$(git -C "$ANGLE_DIR" rev-parse HEAD)"
   if [[ "$current_commit" != "$ANGLE_PINNED_COMMIT" ]]; then
-    [[ -z "$(git -C "$ANGLE_DIR" status --porcelain)" ]] || fail "Refusing to change a modified ANGLE checkout"
+    # gclient owns dependency revisions, which may differ from the gitlinks.
+    # It checks dependency worktrees for local edits during sync.
+    [[ -z "$(git -C "$ANGLE_DIR" status --porcelain --ignore-submodules=all)" ]] || fail "Refusing to change a modified ANGLE checkout"
     log "Checking out pinned ANGLE commit: $ANGLE_PINNED_COMMIT"
     git -C "$ANGLE_DIR" checkout --detach "$ANGLE_PINNED_COMMIT"
   fi

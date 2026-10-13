@@ -132,7 +132,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runs_on: macos-15-intel
+          # Apple Clang cross-compiles x64 on the faster ARM runner.
+          - runs_on: macos-latest
             classifier: natives-macos
           - runs_on: macos-latest
             classifier: natives-macos-arm64
@@ -187,6 +188,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 tests/test-angle-checkout.py
           python3 tests/test-patch-checkout.py
           for patch in patches/*.patch; do
             git -C build/angle apply --check "$GITHUB_WORKSPACE/$patch"
