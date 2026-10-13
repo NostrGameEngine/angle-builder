@@ -187,6 +187,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 tests/test-patch-checkout.py
           for patch in patches/*.patch; do
             git -C build/angle apply --check "$GITHUB_WORKSPACE/$patch"
             git -C build/angle apply "$GITHUB_WORKSPACE/$patch"
