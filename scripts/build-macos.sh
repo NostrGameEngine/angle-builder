@@ -31,7 +31,9 @@ for target in "${targets[@]}"; do
     build_command+=(-j "$BUILD_JOBS")
   fi
   "${build_command[@]}" $ninja_targets
-  lipo -verify_arch "$arch_dir" "$out_dir/libEGL.dylib" "$out_dir/libGLESv2.dylib"
+  for library in libEGL.dylib libGLESv2.dylib; do
+    lipo "$out_dir/$library" -verify_arch "$arch_dir"
+  done
 
   mkdir -p "$stage_dir"
   build_info_file "$stage_dir"
