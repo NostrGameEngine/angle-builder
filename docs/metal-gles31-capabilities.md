@@ -29,7 +29,7 @@ below concern the macOS internal profile and do not establish iOS conformance.
 | Texture gather | Core float/int/uint/shadow samplers, channels, offsets and array layer selection translate to native Metal gather operations | Optional GPU-shader5 gather forms remain unexposed; complete profile validation |
 | Multisample textures | `TextureMtl::setStorageMultisample` and `textureMultisampleANGLE` exist | 2D MSAA and interpolation covered; multisample arrays/sample shading optional |
 | Limits and queries | Internal caps include 48 texture units, 48 UBO bindings, 44 combined uniform blocks, device-derived workgroup dimensions and 64 KB UBOs on Apple GPUs | Complete mustpass queries on M2; focused profile and device-limit checks on A14 |
-| Packaging | Desktop and iOS manifests verify patched sources, selected profiles, platforms and runtime libraries | Coordinated libJGLIOS application integration remains separate |
+| Packaging | Desktop and iOS manifests verify patched sources, selected profiles, platforms and runtime libraries; libJGLIOS imports the pinned shared series plus iOS overlays | Application-level validation is distinct from the standalone EGL probes |
 
 The native indirect patch adds no public feature gate or context-version
 override. Its white-box tests deliberately use a GLES 3.0 context and native

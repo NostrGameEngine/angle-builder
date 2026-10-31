@@ -3,7 +3,7 @@
 The simulator build uses the same ordered ANGLE patches as macOS. The experimental
 GLES 3.1 build can be selected for native macOS or iOS Simulator. A separate
 [physical-device runner](ios-device-metal-tests.md) builds and tests the same
-profile on a paired iPhone. The libJGLIOS application port remains separate work.
+profile on a paired iPhone. The [libJGLIOS application build](https://github.com/NostrGameEngine/libJGLIOS/tree/GLES31#angle-gles-31-profile) imports the same pinned patches and adds its iOS compatibility overlays; it checks simulator capabilities separately.
 
 ## Build
 
