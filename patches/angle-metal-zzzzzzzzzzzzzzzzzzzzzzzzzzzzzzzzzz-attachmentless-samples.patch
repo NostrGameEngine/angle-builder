@@ -1,0 +1,44 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index ef28d9d..b2d3555 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -835,6 +835,7 @@ bool IsMetalDisplayAvailable()
+ 
+     // MSAA
+     mNativeCaps.maxSamples             = mFormatTable.getMaxSamples();
++    mNativeCaps.maxFramebufferSamples  = mNativeCaps.maxSamples;
+     mNativeCaps.maxSampleMaskWords     = 1;
+     mNativeCaps.maxColorTextureSamples = mNativeCaps.maxSamples;
+     mNativeCaps.maxDepthTextureSamples = mNativeCaps.maxSamples;
+diff --git a/src/libANGLE/renderer/metal/FrameBufferMtl.mm b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+index 5489f53..4ca6ba0 100644
+--- a/src/libANGLE/renderer/metal/FrameBufferMtl.mm
++++ b/src/libANGLE/renderer/metal/FrameBufferMtl.mm
+@@ -1192,6 +1192,14 @@ void RoundValueAndAdjustCorrespondingValue(float a,
+     {
+         desc.defaultWidth  = mState.getDefaultWidth();
+         desc.defaultHeight = mState.getDefaultHeight();
++        desc.rasterSampleCount = std::max(1, mState.getDefaultSamples());
++        // GLES permits a requested count between the native supported counts.
++        // Select the next supported count, just as multisample texture storage does.
++        const auto &device = mtl::GetImpl(context)->getMetalDevice();
++        while (![device supportsTextureSampleCount:desc.rasterSampleCount])
++        {
++            ++desc.rasterSampleCount;
++        }
+     }
+     else
+     {
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+index 72d47f5..72eaf3d 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+@@ -626,7 +626,7 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+     {
+         objCDesc.renderTargetWidth        = defaultWidth;
+         objCDesc.renderTargetHeight       = defaultHeight;
+-        objCDesc.defaultRasterSampleCount = 1;
++        objCDesc.defaultRasterSampleCount = rasterSampleCount;
+     }
+     else
+     {

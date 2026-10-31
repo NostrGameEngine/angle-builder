@@ -1,0 +1,12 @@
+diff --git a/src/libANGLE/renderer/metal/metal_backend.gni b/src/libANGLE/renderer/metal/metal_backend.gni
+index d8ab289..284cdc1 100644
+--- a/src/libANGLE/renderer/metal/metal_backend.gni
++++ b/src/libANGLE/renderer/metal/metal_backend.gni
+@@ -60,6 +60,7 @@ metal_backend_sources = [
+   "mtl_common.mm",
+   "mtl_context_device.h",
+   "mtl_context_device.mm",
++  "mtl_draw_command_conversion.h",
+   "mtl_format_table_autogen.mm",
+   "mtl_format_utils.h",
+   "mtl_format_utils.mm",

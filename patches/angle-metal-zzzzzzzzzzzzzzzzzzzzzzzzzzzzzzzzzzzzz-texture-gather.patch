@@ -1,0 +1,289 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index aae279b..559498e 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -3050,6 +3050,8 @@ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
+     putAngle("textureCubeGradEXT");
+     putAngle("textureCubeLod");
+     putAngle("textureCubeLodEXT");
++    putAngle("textureGather");
++    putAngle("textureGatherOffset");
+     putAngle("textureGrad");
+     putAngle("textureGradOffset");
+     putAngle("textureLod");
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index d633951..1a25f9b 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -176,6 +176,7 @@ class ProgramPrelude : public TIntermTraverser
+     void functionConstants();
+     void arrayVertexID();
+     void textureEnv();
++    void textureGather();
+     void texelFetch_2D();
+     void texelFetch_3D();
+     void texelFetch_2DArray();
+@@ -1530,6 +1531,99 @@ ANGLE_ALWAYS_INLINE uint ANGLE_arrayVertexID(uint nativeID, uint nativeInstance,
+ )",
+                         functionConstants())
+ 
++PROGRAM_PRELUDE_DECLARE(textureGather,
++                        R"(
++template <typename T>
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGatherOffset(
++    thread ANGLE_TextureEnv<metal::texture2d<T>> &env,
++    metal::float2 coord, metal::int2 offset, int comp = 0)
++{
++    switch (comp)
++    {
++        case 1: return env.texture->gather(*env.sampler, coord, offset, metal::component::y);
++        case 2: return env.texture->gather(*env.sampler, coord, offset, metal::component::z);
++        case 3: return env.texture->gather(*env.sampler, coord, offset, metal::component::w);
++        default: return env.texture->gather(*env.sampler, coord, offset, metal::component::x);
++    }
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGather(
++    thread ANGLE_TextureEnv<metal::texture2d<T>> &env,
++    metal::float2 coord, int comp = 0)
++{
++    return ANGLE_textureGatherOffset(env, coord, metal::int2(0), comp);
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGatherOffset(
++    thread ANGLE_TextureEnv<metal::texture2d_array<T>> &env,
++    metal::float3 coord, metal::int2 offset, int comp = 0)
++{
++    switch (comp)
++    {
++        case 1: return env.texture->gather(*env.sampler, coord.xy, uint32_t(metal::clamp(metal::floor(coord.z + 0.5f), 0.0f, float(env.texture->get_array_size()-1u))), offset, metal::component::y);
++        case 2: return env.texture->gather(*env.sampler, coord.xy, uint32_t(metal::clamp(metal::floor(coord.z + 0.5f), 0.0f, float(env.texture->get_array_size()-1u))), offset, metal::component::z);
++        case 3: return env.texture->gather(*env.sampler, coord.xy, uint32_t(metal::clamp(metal::floor(coord.z + 0.5f), 0.0f, float(env.texture->get_array_size()-1u))), offset, metal::component::w);
++        default: return env.texture->gather(*env.sampler, coord.xy, uint32_t(metal::clamp(metal::floor(coord.z + 0.5f), 0.0f, float(env.texture->get_array_size()-1u))), offset, metal::component::x);
++    }
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGather(
++    thread ANGLE_TextureEnv<metal::texture2d_array<T>> &env,
++    metal::float3 coord, int comp = 0)
++{
++    return ANGLE_textureGatherOffset(env, coord, metal::int2(0), comp);
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGather(
++    thread ANGLE_TextureEnv<metal::texturecube<T>> &env,
++    metal::float3 coord, int comp = 0)
++{
++    switch (comp)
++    {
++        case 1: return env.texture->gather(*env.sampler, coord, metal::component::y);
++        case 2: return env.texture->gather(*env.sampler, coord, metal::component::z);
++        case 3: return env.texture->gather(*env.sampler, coord, metal::component::w);
++        default: return env.texture->gather(*env.sampler, coord, metal::component::x);
++    }
++}
++
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGatherOffset(
++    thread ANGLE_TextureEnv<metal::depth2d<float>> &env,
++    metal::float2 coord, float refZ, metal::int2 offset)
++{
++    return env.texture->gather_compare(*env.sampler, coord, refZ, offset);
++}
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGather(
++    thread ANGLE_TextureEnv<metal::depth2d<float>> &env,
++    metal::float2 coord, float refZ)
++{
++    return ANGLE_textureGatherOffset(env, coord, refZ, metal::int2(0));
++}
++
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGatherOffset(
++    thread ANGLE_TextureEnv<metal::depth2d_array<float>> &env,
++    metal::float3 coord, float refZ, metal::int2 offset)
++{
++    return env.texture->gather_compare(*env.sampler, coord.xy, uint32_t(metal::clamp(metal::floor(coord.z + 0.5f), 0.0f, float(env.texture->get_array_size()-1u))), refZ, offset);
++}
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGather(
++    thread ANGLE_TextureEnv<metal::depth2d_array<float>> &env,
++    metal::float3 coord, float refZ)
++{
++    return ANGLE_textureGatherOffset(env, coord, refZ, metal::int2(0));
++}
++
++ANGLE_ALWAYS_INLINE auto ANGLE_textureGather(
++    thread ANGLE_TextureEnv<metal::depthcube<float>> &env,
++    metal::float3 coord, float refZ)
++{
++    return env.texture->gather_compare(*env.sampler, coord, refZ);
++}
++)",
++                        textureEnv())
++
+ PROGRAM_PRELUDE_DECLARE(texelFetch_2D,
+                         R"(
+ template <typename T>
+@@ -3672,6 +3766,8 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+     putBuiltIn("textureCubeGradEXT", EMIT_METHOD(textureCubeGradEXT));
+     putBuiltIn("textureCubeLod", EMIT_METHOD(textureCubeLod));
+     putBuiltIn("textureCubeLodEXT", EMIT_METHOD(textureCubeLodEXT));
++    putBuiltIn("textureGather", EMIT_METHOD(textureGather));
++    putBuiltIn("textureGatherOffset", EMIT_METHOD(textureGather));
+     putBuiltIn("textureGrad", [](ProgramPrelude &pp, const TFunction &func) {
+         switch (func.getParam(0)->getType().getBasicType())
+         {
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index b2d3555..b0cfd8c 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -889,6 +889,8 @@ bool IsMetalDisplayAvailable()
+     // No info from Metal given, use default GLES3 spec values:
+     mNativeCaps.minProgramTexelOffset = -8;
+     mNativeCaps.maxProgramTexelOffset = 7;
++    mNativeCaps.minProgramTextureGatherOffset = -8;
++    mNativeCaps.maxProgramTextureGatherOffset = 7;
+ 
+     // NOTE(hqle): support storage buffer.
+     const uint32_t maxPerStageStorageBuffers                     = 0;
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index cac40cd..107e4f9 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -589,6 +589,35 @@ TEST_F(MSLOutputTest, KeywordConflict)
+     compile(shaderString);
+ }
+ 
++TEST_F(MSLOutputTest, CoreTextureGatherSamplersAndOffsets)
++{
++    compile(R"(#version 310 es
++        precision highp float;
++        precision highp int;
++        uniform highp sampler2D color2D;
++        uniform highp isampler2DArray integerArray;
++        uniform highp usamplerCube integerCube;
++        uniform highp sampler2DShadow depth2D;
++        uniform highp sampler2DArrayShadow depthArray;
++        uniform highp samplerCubeShadow depthCube;
++        out vec4 color;
++        void main() {
++            color = textureGather(color2D,vec2(.3),2)
++                + vec4(textureGather(integerArray,vec3(.3,.7,1),3))
++                + vec4(textureGather(integerCube,vec3(1,0,1),1))
++                + textureGather(depth2D,vec2(.3),.5)
++                + textureGather(depthArray,vec3(.3,.7,1),.5)
++                + textureGather(depthCube,vec3(1,0,1),.5);
++            color += textureGatherOffset(color2D,vec2(.3),ivec2(-8,7),1)
++                + vec4(textureGatherOffset(integerArray,vec3(.3,.7,1),ivec2(7,-8),0))
++                + textureGatherOffset(depth2D,vec2(.3),.5,ivec2(1,-1))
++                + textureGatherOffset(depthArray,vec3(.3,.7,1),.5,ivec2(-1,1));
++        }
++    )");
++    EXPECT_TRUE(foundInCode("ANGLE_textureGatherOffset"));
++    EXPECT_TRUE(foundInCode("gather_compare"));
++}
++
+ // Arrays of vectors retain vector dimensions in the AST. Their constructor
+ // arguments are elements/arrays, never scalar operands for an explicit cast.
+ TEST_F(MSLVertexOutputTest, NestedVectorArrayConstructors)
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index de79e58..c796f8d 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -129,6 +129,97 @@ TEST_P(ComputeDispatchTestMetal, GPUVertexBindingFanoutToConvertedAttributes)
+     }
+ }
+ 
++// Gather uses compute's sampler/texture bindings, not the graphics-stage maps.
++// Check channels, offsets, clamped layers, shadow comparisons and binary reload.
++TEST_P(ComputeDispatchTestMetal, TextureGatherCoreSamplersAndBinary)
++{
++    constexpr char source[] = R"(#version 310 es
++        precision highp float;
++        precision highp int;
++        layout(local_size_x=1) in;
++        layout(binding=0) uniform highp usampler2D colors;
++        layout(binding=1) uniform highp sampler2DArray layers;
++        layout(binding=2) uniform highp sampler2DShadow depths;
++        layout(std430,binding=0) buffer Results {
++            uvec4 prefix[4]; uvec4 values[6]; uvec4 suffix[4];
++        } outputData;
++        void main() {
++            outputData.values[0]=textureGather(colors,vec2(.5),2);
++            outputData.values[1]=textureGatherOffset(colors,vec2(.5),ivec2(1,-1),2);
++            outputData.values[2]=uvec4(textureGather(layers,vec3(.5,.5,1.5),0));
++            outputData.values[3]=uvec4(textureGather(layers,vec3(.5,.5,-1.5),0));
++            outputData.values[4]=uvec4(textureGather(depths,vec2(.5),.5));
++            outputData.values[5]=uvec4(textureGatherOffset(depths,vec2(.5),.5,ivec2(1,-1)));
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLProgram binary;
++    reloadProgram(program, binary);
++    GLTexture colors, layers, depths;
++    const std::array<uint8_t, 16> texels = {1, 11, 21, 31, 2, 12, 22, 32,
++                                            3, 13, 23, 33, 4, 14, 24, 34};
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, colors);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8UI, 2, 2);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, texels.data());
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
++    std::array<float, 32> arrayTexels;
++    for (size_t i = 0; i < 8; ++i)
++    {
++        arrayTexels[i * 4]     = float(i < 4 ? 10 + i : 16 + i);
++        arrayTexels[i * 4 + 1] = 0;
++        arrayTexels[i * 4 + 2] = 0;
++        arrayTexels[i * 4 + 3] = 1;
++    }
++    glActiveTexture(GL_TEXTURE1);
++    glBindTexture(GL_TEXTURE_2D_ARRAY, layers);
++    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA32F, 2, 2, 2);
++    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 2, 2, 2, GL_RGBA, GL_FLOAT,
++                    arrayTexels.data());
++    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    const std::array<float, 4> depthValues = {.125f, .375f, .625f, .875f};
++    glActiveTexture(GL_TEXTURE2);
++    glBindTexture(GL_TEXTURE_2D, depths);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_DEPTH_COMPONENT32F, 2, 2);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_DEPTH_COMPONENT, GL_FLOAT, depthValues.data());
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_FUNC, GL_LESS);
++    const std::array<uint32_t, 24> gathered = {23, 24, 22, 21, 22, 21, 23, 24, 22, 23, 21, 20,
++                                               12, 13, 11, 10, 1,  1,  0,  0,  0,  0,  1,  1};
++    std::array<uint32_t, 56> expected, initial;
++    expected.fill(0xcdcdcdcdu);
++    initial.fill(0xcdcdcdcdu);
++    std::copy(gathered.begin(), gathered.end(), expected.begin() + 16);
++    GLBuffer output;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, output);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, output);
++    for (GLuint active : {program.get(), binary.get()})
++    {
++        SCOPED_TRACE(active);
++        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initial), initial.data(), GL_DYNAMIC_DRAW);
++        glUseProgram(active);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++        ASSERT_GL_NO_ERROR();
++        const auto *actual = static_cast<const uint32_t *>(
++            glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++        ASSERT_NE(actual, nullptr);
++        for (size_t word = 0; word < expected.size(); ++word)
++        {
++            EXPECT_EQ(actual[word], expected[word]) << word;
++        }
++        EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    }
++}
++
+ // A GPU producer supplies std140 graphics uniforms whose native Metal layout
+ // requires matrix transposition, array repacking and boolean normalization.
+ TEST_P(ComputeDispatchTestMetal, GPUWrittenGraphicsUniformConversionAndBinary)

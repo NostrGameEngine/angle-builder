@@ -1,0 +1,565 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 3e84f19..1998e4b 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -225,6 +225,8 @@ class GenMetalTraverser : public TIntermTraverser
+     size_t mUBOArgumentBufferBindingIndex  = 0;
+     bool mRasterOrderGroupsSupported       = false;
+     bool mStorageAccessSupported           = true;
++    bool mEmittingNativeImages             = false;
++    void emitComputeImageInitialization(const TVariable &parameter);
+     std::vector<StorageAggregateLayout> mStorageLayouts;
+     std::unordered_map<std::string, size_t> mStorageLayoutIndices;
+     size_t mStorageLoopIndex     = 0;
+@@ -1087,7 +1089,10 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
+             {
+                 if (IsImage2D(basicType))
+                 {
+-                    mOut << "metal::texture2d<";
++                    mOut << (mCompiler.getShaderType() == GL_COMPUTE_SHADER &&
++                                     !mEmittingNativeImages
++                                 ? "ANGLE_image2d<"
++                                 : "metal::texture2d<");
+                 }
+                 else if (IsImage3D(basicType))
+                 {
+@@ -1398,8 +1403,10 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+             break;
+     }
+ 
+-    if (IsImage(type.getBasicType()))
++    if (IsImage(type.getBasicType()) &&
++        (mCompiler.getShaderType() != GL_COMPUTE_SHADER || mEmittingNativeImages))
+     {
++        const size_t imageSlot = mMainTextureIndex;
+         mOut << " [[";
+         if (type.getLayoutQualifier().rasterOrdered)
+         {
+@@ -1427,6 +1434,21 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+                                             static_cast<int>(mMainTextureIndex));
+         }
+         mMainTextureIndex += type.getArraySizeProduct();
++        if (mEmittingNativeImages && IsImage2D(type.getBasicType()))
++        {
++            // Texture slots 0..3 are images, 4..19 are sampled textures and
++            // 20..23 are alternate 3D handles for non-layered image2D bindings.
++            mOut << ";\n";
++            emitIndentation();
++            TType volumeType(type);
++            volumeType.setBasicType(IsFloatImage(type.getBasicType())     ? EbtImage3D
++                                    : IsIntegerImage(type.getBasicType()) ? EbtIImage3D
++                                                                          : EbtUImage3D);
++            emitType(volumeType, {});
++            mOut << " ";
++            emitNameOf(field);
++            mOut << "_volume [[texture(" << (20 + imageSlot) << ")]]";
++        }
+     }
+ }
+ 
+@@ -1543,8 +1565,21 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+         mOut << "/* byte-addressed storage block */";
+         return;
+     }
++    const bool computeImages = mCompiler.getShaderType() == GL_COMPUTE_SHADER &&
++                               mPipelineStructs.texture.matches(*type.getStruct());
++    if (computeImages && !mEmittingNativeImages)
++    {
++        mEmittingNativeImages = true;
++        emitStructDeclaration(type);
++        mOut << ";\n";
++        mEmittingNativeImages = false;
++    }
+     mOut << "struct ";
+     emitBareTypeName(type, {});
++    if (computeImages && mEmittingNativeImages)
++    {
++        mOut << "_Native";
++    }
+ 
+     mOut << "\n";
+     emitOpenBrace();
+@@ -1608,6 +1643,11 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+         mOut << ";\n";
+     }
+ 
++    if (computeImages && mEmittingNativeImages)
++    {
++        emitIndentation();
++        mOut << "constant uint *ANGLE_imageLayers [[buffer(23)]];\n";
++    }
+     emitCloseBrace();
+ }
+ 
+@@ -2709,6 +2749,15 @@ void GenMetalTraverser::emitFunctionParameter(const TFunction &func, const TVari
+     const TType &type           = param.getType();
+     const TStructure *structure = type.getStruct();
+ 
++    if (isMain && mCompiler.getShaderType() == GL_COMPUTE_SHADER && structure &&
++        mPipelineStructs.texture.matches(*structure))
++    {
++        emitNameOf(*structure);
++        mOut << "_Native ";
++        emitNameOf(param);
++        mOut << "_native";
++        return;
++    }
+     EmitVariableDeclarationConfig evdConfig;
+     evdConfig.isParameter            = true;
+     evdConfig.disableStructSpecifier = true;  // It's invalid to declare a struct in a function arg.
+@@ -2796,7 +2845,29 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+     emitIndentation();
+     emitFunctionSignature(func);
+     mOut << "\n";
++    const TVariable *images = nullptr;
++    if (func.isMain() && mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++    {
++        for (size_t parameter = 0; parameter < func.getParamCount(); ++parameter)
++        {
++            const auto *candidate = func.getParam(parameter);
++            const auto *structure = candidate->getType().getStruct();
++            if (structure && mPipelineStructs.texture.matches(*structure))
++            {
++                images = candidate;
++            }
++        }
++    }
++    if (images)
++    {
++        emitOpenBrace();
++        emitComputeImageInitialization(*images);
++    }
+     body.traverse(this);
++    if (images)
++    {
++        emitCloseBrace();
++    }
+     if (isTraversingVertexMain)
+     {
+         isTraversingVertexMain = false;
+@@ -2804,6 +2875,68 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+     return false;
+ }
+ 
++void GenMetalTraverser::emitComputeImageInitialization(const TVariable &parameter)
++{
++    emitIndentation();
++    emitType(parameter.getType(), {});
++    mOut << " ";
++    emitNameOf(parameter);
++    mOut << ";\n";
++    size_t slot = 0;
++    for (const TField *field : parameter.getType().getStruct()->fields())
++    {
++        const TType &type     = *field->type();
++        const size_t elements = type.getArraySizeProduct();
++        for (size_t element = 0; element < elements; ++element)
++        {
++            std::string indices;
++            size_t remainder = element;
++            for (size_t dimension = type.getNumArraySizes(); dimension > 0; --dimension)
++            {
++                size_t stride = 1;
++                for (size_t inner = 0; inner + 1 < dimension; ++inner)
++                {
++                    stride *= type.getArraySizes()[inner];
++                }
++                indices += "[" + std::to_string(remainder / stride) + "]";
++                remainder %= stride;
++            }
++            auto emitMember = [&](bool native, bool volume) {
++                emitNameOf(parameter);
++                if (native)
++                {
++                    mOut << "_native";
++                }
++                mOut << ".";
++                emitNameOf(*field);
++                if (volume)
++                {
++                    mOut << "_volume";
++                }
++                mOut << indices;
++            };
++            emitIndentation();
++            emitMember(false, false);
++            mOut << " = ";
++            if (IsImage2D(type.getBasicType()))
++            {
++                mOut << "{";
++            }
++            emitMember(true, false);
++            if (IsImage2D(type.getBasicType()))
++            {
++                mOut << ", ";
++                emitMember(true, true);
++                mOut << ", ";
++                emitNameOf(parameter);
++                mOut << "_native.ANGLE_imageLayers[" << slot + element << "]}";
++            }
++            mOut << ";\n";
++        }
++        slot += elements;
++    }
++}
++
+ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
+ {
+     FuncToName map;
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 7d14fc9..68f314a 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -288,6 +288,7 @@ class ProgramPrelude : public TIntermTraverser
+     void textureSize_2DArrayShadow();
+     void textureSize_2DMS();
+     void integerBuiltins();
++    void image2dType();
+     void imageSize();
+     void imageLoad();
+     void imageStore();
+@@ -3123,7 +3124,30 @@ ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x, T y,
+ }
+ )")
+ 
+-PROGRAM_PRELUDE_DECLARE(imageSize, R"(
++PROGRAM_PRELUDE_DECLARE(image2dType, R"(
++template <typename T, metal::access Access>
++struct ANGLE_image2d
++{
++    metal::texture2d<T, Access> planar;
++    metal::texture3d<T, Access> volume;
++    uint layer;
++};
++)")
++
++PROGRAM_PRELUDE_DECLARE(imageSize,
++                        R"(
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const ANGLE_image2d<T, Access> &image)
++{
++    if (!metal::is_null_texture(image.volume))
++    {
++        return image.layer < image.volume.get_depth()
++                   ? metal::int2(image.volume.get_width(), image.volume.get_height())
++                   : metal::int2(0);
++    }
++    if (metal::is_null_texture(image.planar)) return metal::int2(0);
++    return metal::int2(image.planar.get_width(), image.planar.get_height());
++}
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access> &texture)
+ {
+@@ -3151,10 +3175,20 @@ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texturecube<T, Acce
+     if (metal::is_null_texture(texture)) return metal::int2(0);
+     return metal::int2(texture.get_width(), texture.get_height());
+ }
+-)")
++)",
++                        image2dType())
+ 
+ PROGRAM_PRELUDE_DECLARE(imageLoad,
+                         R"(
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const ANGLE_image2d<T, Access> &image, metal::int2 coord)
++{
++    const auto size = ANGLE_imageSize(image);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return metal::vec<T, 4>(0);
++    return metal::is_null_texture(image.volume) ? image.planar.read(uint2(coord))
++                                              : image.volume.read(uint3(uint2(coord), image.layer));
++}
++
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d<T, Access> &texture, metal::int2 coord)
+ {
+@@ -3203,6 +3237,15 @@ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture
+ 
+ PROGRAM_PRELUDE_DECLARE(imageStore,
+                         R"(
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const ANGLE_image2d<T, Access> &image, metal::int2 coord, metal::vec<T, 4> value)
++{
++    const auto size = ANGLE_imageSize(image);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return;
++    if (metal::is_null_texture(image.volume)) image.planar.write(value, uint2(coord));
++    else image.volume.write(value, uint3(uint2(coord), image.layer));
++}
++
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d<T, Access> &texture, metal::int2 coord, metal::vec<T, 4> value)
+ {
+@@ -4376,6 +4419,10 @@ void ProgramPrelude::visitOperator(TOperator op,
+ 
+ void ProgramPrelude::visitVariable(const Name &name, const TType &type)
+ {
++    if (IsImage2D(type.getBasicType()))
++    {
++        image2dType();
++    }
+     if (const TStructure *s = type.getStruct())
+     {
+         const Name typeName(*s);
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index 1714c6c..d2f494d 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -1105,7 +1105,9 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         TextureMtl *texture;
+         const gl::ImageUnit *unit;
+         uint32_t slot;
++        bool planar;
+     };
++    std::array<uint32_t, 4> imageLayers = {};
+     std::vector<StorageImage> storageImages;
+     for (size_t i = 0; i < mExecutable->getImageBindings().size(); ++i)
+     {
+@@ -1118,18 +1120,20 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         for (size_t element = 0; element < binding.boundImageUnits.size(); ++element)
+         {
+             const auto &unit = glState.getImageUnit(binding.boundImageUnits[element]);
++            const bool planar = binding.textureType == gl::TextureType::_2D;
++            ASSERT(slot + element < imageLayers.size());
++            imageLayers[slot + element] = static_cast<uint32_t>(unit.layer);
+             if (!unit.texture.get())
+             {
+-                storageImages.push_back({nullptr, &unit, static_cast<uint32_t>(slot + element)});
++                storageImages.push_back(
++                    {nullptr, &unit, static_cast<uint32_t>(slot + element), planar});
+                 continue;
+             }
+-            ANGLE_CHECK(context, unit.layered || unit.texture->getType() != gl::TextureType::_3D,
+-                        "Non-layered 3D compute images require a shader variant",
+-                        GL_INVALID_OPERATION);
+             TextureMtl *texture = mtl::GetImpl(unit.texture.get());
+             ANGLE_TRY(texture->ensureNativeStorageCreated(glContext, true,
+                                                           ImageMipLevels::EnabledLevels));
+-            storageImages.push_back({texture, &unit, static_cast<uint32_t>(slot + element)});
++            storageImages.push_back(
++                {texture, &unit, static_cast<uint32_t>(slot + element), planar});
+         }
+     }
+     // Texture allocation/uploads can end the current compute encoder. Obtain
+@@ -1173,8 +1177,24 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         ANGLE_TRY(texture.texture->bindToComputeShader(glContext, encoder, texture.sampler,
+                                                        texture.textureSlot, texture.samplerSlot));
+     }
++    encoder->setData(imageLayers, mtl::kComputeImageLayerBuffer);
+     for (const auto &image : storageImages)
+     {
++        if (image.planar)
++        {
++            const uint32_t volumeSlot = mtl::kComputeImageVolumeSlot + image.slot;
++            const bool volume =
++                image.texture && image.unit->texture->getType() == gl::TextureType::_3D;
++            // Both handles are rebound for every dispatch, including null units.
++            encoder->setTexture({}, volume ? image.slot : volumeSlot);
++            if (volume)
++            {
++                ANGLE_TRY(image.texture->bindToComputeImage(glContext, encoder, volumeSlot,
++                                                            image.unit->level, true, 0,
++                                                            image.unit->format));
++                continue;
++            }
++        }
+         if (!image.texture)
+         {
+             // Clear the native slot as well as the GL binding. Guarded image
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 942c840..99092f6 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -35,7 +35,7 @@
+ namespace
+ {
+ constexpr uint32_t kMetalProgramBinaryVersion =
+-    0x4d435037;  // MCP7: reject binaries with unguarded null-image accesses
++    0x4d435038;  // MCP8: native/local image records include aliased 3D slices
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index d6e5de6..2a679e3 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -131,6 +131,9 @@ constexpr uint32_t kMaxShaderImages      = gl::IMPLEMENTATION_MAX_PIXEL_LOCAL_ST
+ // Compute textures and samplers use different native index spaces. Images do
+ // not consume sampler slots and can coexist with all sixteen sampled textures.
+ constexpr uint32_t kMaxComputeTextures = kMaxShaderSamplers + kMaxShaderImages;
++constexpr uint32_t kComputeImageVolumeSlot  = 20;
++constexpr uint32_t kComputeImageLayerBuffer = 23;
++static_assert(kComputeImageVolumeSlot + 4 <= kMaxComputeTextures);
+ 
+ // Restrict in-flight resource usage to 400 MB.
+ // A render pass can use more than 400MB, but the command buffer
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index feecef7..f73c9b9 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -719,6 +719,142 @@ TEST_P(ComputeDispatchTestMetal, NullImagesClearBindingsBinaryAndDeletion)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++// Non-layered image2D bindings must alias the original 3D storage, including
++// writes observed through a second image in the same invocation.
++TEST_P(ComputeDispatchTestMetal, VolumeSliceAliasesArraysAndBinary)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x=1) in;
++        layout(r32ui,binding=0) uniform highp uimage2D views[1][2];
++        layout(r32ui,binding=2) uniform highp uimage3D volume;
++        layout(std430,binding=0) buffer Results { uvec4 words[]; } result;
++        uniform uint phase;
++        uint fetch(highp uimage2D image) { return imageLoad(image,ivec2(0)).x; }
++        uint fetchArray(highp uimage2D images[1][2]) { return fetch(images[0][0]); }
++        void main() {
++            uint base=phase*4u;
++            result.words[base]=uvec4(imageSize(views[0][0]),imageSize(views[0][1]));
++            result.words[base+1u]=uvec4(fetchArray(views),fetch(views[0][1]),0u,0u);
++            imageStore(views[0][0],ivec2(0),uvec4(100u+phase));
++            imageStore(views[0][1],ivec2(0),uvec4(200u+phase));
++            memoryBarrierImage();
++            result.words[base+2u]=uvec4(fetch(views[0][0]),fetch(views[0][1]),
++                                      imageLoad(volume,ivec3(0,0,0)).x,
++                                      imageLoad(volume,ivec3(0,0,1)).x);
++            // Out-of-bounds stores must not cross into a neighboring volume slice.
++            imageStore(views[0][0],ivec2(0,2),uvec4(0xffffffffu));
++            result.words[base+3u]=uvec4(imageSize(volume),0u);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLProgram binary;
++    reloadProgram(program, binary);
++    GLTexture volume, planar;
++    glBindTexture(GL_TEXTURE_3D, volume);
++    glTexStorage3D(GL_TEXTURE_3D, 2, GL_R32UI, 4, 4, 4);
++    std::array<uint32_t, 8> initialVolume;
++    initialVolume.fill(11u);
++    std::fill(initialVolume.begin() + 4, initialVolume.end(), 22u);
++    glTexSubImage3D(GL_TEXTURE_3D, 1, 0, 0, 0, 2, 2, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                    initialVolume.data());
++    glBindTexture(GL_TEXTURE_2D, planar);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 2, 2);
++    const std::array<uint32_t, 4> initialPlanar = {777u, 777u, 777u, 777u};
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                    initialPlanar.data());
++    GLBuffer allocation;
++    std::array<uint32_t, 256> expected;
++    expected.fill(0x13579bdfu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 7 * 64);
++    uint32_t slice0 = 11u, slice1 = 22u, plane = 777u;
++    for (uint32_t phase = 0; phase < 7; ++phase)
++    {
++        SCOPED_TRACE(phase);
++        const GLuint active = phase >= 5 ? binary : program;
++        glUseProgram(active);
++        glUniform1ui(glGetUniformLocation(active, "phase"), phase);
++        // Slice 1/0, 0/1, 1/1, planar/0, null/1, null/1, then deleted/null.
++        const bool firstNull       = phase >= 4;
++        const bool firstPlanar     = phase == 3;
++        const uint32_t firstSlice  = phase == 1 ? 0u : 1u;
++        const uint32_t secondSlice = (phase == 0 || phase == 3) ? 0u : 1u;
++        glBindImageTexture(0,
++                           firstNull     ? 0u
++                           : firstPlanar ? planar.get()
++                                         : volume.get(),
++                           firstPlanar ? 0 : 1, GL_FALSE, firstSlice, GL_READ_WRITE, GL_R32UI);
++        glBindImageTexture(1, volume, 1, GL_FALSE, secondSlice, GL_READ_WRITE, GL_R32UI);
++        glBindImageTexture(2, volume, 1, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++        const uint32_t before0 = firstNull     ? 0u
++                                 : firstPlanar ? plane
++                                 : firstSlice  ? slice1
++                                               : slice0;
++        const uint32_t before1 = secondSlice ? slice1 : slice0;
++        if (phase == 6)
++        {
++            volume.reset();
++            for (GLuint unit = 0; unit < 3; ++unit)
++            {
++                GLint name = -1;
++                glGetIntegeri_v(GL_IMAGE_BINDING_NAME, unit, &name);
++                EXPECT_EQ(name, 0);
++            }
++        }
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        ASSERT_GL_NO_ERROR();
++        if (phase < 6)
++        {
++            if (!firstNull)
++            {
++                if (firstPlanar)
++                {
++                    plane = 100u + phase;
++                }
++                else
++                {
++                    (firstSlice ? slice1 : slice0) = 100u + phase;
++                }
++            }
++            (secondSlice ? slice1 : slice0) = 200u + phase;
++        }
++        const size_t base                     = 64 + phase * 16;
++        const std::array<uint32_t, 16> record = {firstNull ? 0u : 2u,
++                                                 firstNull ? 0u : 2u,
++                                                 phase == 6 ? 0u : 2u,
++                                                 phase == 6 ? 0u : 2u,
++                                                 phase == 6 ? 0u : before0,
++                                                 phase == 6 ? 0u : before1,
++                                                 0u,
++                                                 0u,
++                                                 firstNull     ? 0u
++                                                 : firstPlanar ? plane
++                                                 : firstSlice  ? slice1
++                                                               : slice0,
++                                                 phase == 6    ? 0u
++                                                 : secondSlice ? slice1
++                                                               : slice0,
++                                                 phase == 6 ? 0u : slice0,
++                                                 phase == 6 ? 0u : slice1,
++                                                 phase == 6 ? 0u : 2u,
++                                                 phase == 6 ? 0u : 2u,
++                                                 phase == 6 ? 0u : 2u,
++                                                 0u};
++        std::copy(record.begin(), record.end(), expected.begin() + base);
++    }
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t word = 0; word < expected.size(); ++word)
++    {
++        EXPECT_EQ(actual[word], expected[word]) << "result/guard word " << word;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ // Exercise actual GL compilation, linking, remapping, uniforms, program binary
+ // reload and dispatch. Two SSBO ranges alias one allocation; readback is final.
+ TEST_P(ComputeDispatchTestMetal, StorageRangesUniformsAndBinary)
+diff --git a/src/tests/gl_tests/ComputeShaderTestMetal.mm b/src/tests/gl_tests/ComputeShaderTestMetal.mm
+index 7429072..7fefa17 100644
+--- a/src/tests/gl_tests/ComputeShaderTestMetal.mm
++++ b/src/tests/gl_tests/ComputeShaderTestMetal.mm
+@@ -392,10 +392,12 @@ void runSharedMemory()
+         ASSERT_NE(source, nullptr);
+         context->getComputeCommandEncoder()
+             ->setComputePipelineState(producer.pipeline.get())
++            .setData(std::array<uint32_t, 4>{}, mtl::kComputeImageLayerBuffer)
+             .setTextureForWrite(source, producer.imageBindings[0])
+             .dispatch(MTLSizeMake(4, 1, 1), producer.localSize);
+         context->getComputeCommandEncoder()
+             ->setComputePipelineState(kernel.pipeline.get())
++            .setData(std::array<uint32_t, 4>{}, mtl::kComputeImageLayerBuffer)
+             .setTextureForWrite(result, kernel.imageBindings[0])
+             .setTexture(source, kernel.imageBindings[1])
+             .dispatch(MTLSizeMake(4, 1, 1), kernel.localSize);
+@@ -454,6 +456,7 @@ void runInvocations(bool indirect)
+ 
+         auto *compute = context->getComputeCommandEncoder();
+         compute->setComputePipelineState(kernel.pipeline.get())
++            .setData(std::array<uint32_t, 4>{}, mtl::kComputeImageLayerBuffer)
+             .setTextureForWrite(globalResult, kernel.imageBindings[0])
+             .setTextureForWrite(groupResult, kernel.imageBindings[1]);
+         if (indirect)

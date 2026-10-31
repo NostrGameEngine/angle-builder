@@ -1,0 +1,1086 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 5e5b852..fe3a504 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -130,6 +130,25 @@ class GenMetalTraverser : public TIntermTraverser
+         const EmitVariableDeclarationConfig *evdConfig = nullptr;
+     };
+ 
++    struct StorageAggregateLayout
++    {
++        const TType *type;
++        TLayoutBlockStorage storage;
++        TLayoutMatrixPacking packing;
++        size_t componentStride;
++        bool emitted = false;
++    };
++    static bool needsStorageAggregate(const TType &type, const StorageBufferAccess &access);
++    size_t storageAggregateLayout(const TType &type, const StorageBufferAccess &access);
++    void emitStorageAddress(const StorageBufferAccess &access);
++    void emitStorageAggregateHelpers(TIntermBlock &body);
++    void emitStorageTransfers(const TType &type,
++                              TLayoutBlockStorage storage,
++                              TLayoutMatrixPacking packing,
++                              size_t componentStride,
++                              const std::string &value,
++                              const std::string &address,
++                              bool store);
+     bool emitStorageAccess(TIntermTyped *node);
+     void emitIndentation();
+     void emitOpeningPointerParen();
+@@ -206,6 +225,10 @@ class GenMetalTraverser : public TIntermTraverser
+     size_t mUBOArgumentBufferBindingIndex  = 0;
+     bool mRasterOrderGroupsSupported       = false;
+     bool mStorageAccessSupported           = true;
++    std::vector<StorageAggregateLayout> mStorageLayouts;
++    std::unordered_map<std::string, size_t> mStorageLayoutIndices;
++    size_t mStorageLoopIndex     = 0;
++    bool mStorageArgumentEmitted = false;
+ };
+ }  // anonymous namespace
+ 
+@@ -1099,7 +1122,10 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
+         {
+             if (type.isArray())
+             {
+-                mOut << "metal::array<";
++                for (size_t dimension = 0; dimension < type.getNumArraySizes(); ++dimension)
++                {
++                    mOut << "metal::array<";
++                }
+             }
+         }
+         if (evdConfig.isPointer)
+@@ -1118,7 +1144,10 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
+     {
+         if (type.isArray())
+         {
+-            mOut << "metal::array<";
++            for (size_t dimension = 0; dimension < type.getNumArraySizes(); ++dimension)
++            {
++                mOut << "metal::array<";
++            }
+         }
+     }
+ 
+@@ -1171,9 +1200,8 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
+         {
+             for (auto size : type.getArraySizes())
+             {
+-                mOut << ", " << size;
++                mOut << ", " << size << ">";
+             }
+-            mOut << ">";
+         }
+     }
+ 
+@@ -1194,9 +1222,8 @@ void GenMetalTraverser::emitType(const TType &type, const EmitTypeConfig &etConf
+             {
+                 for (auto size : type.getArraySizes())
+                 {
+-                    mOut << ", " << size;
++                    mOut << ", " << size << ">";
+                 }
+-                mOut << ">";
+             }
+         }
+     }
+@@ -1806,6 +1833,25 @@ void GenMetalTraverser::visitConstantUnion(TIntermConstantUnion *constValueNode)
+ 
+ bool GenMetalTraverser::visitSwizzle(Visit, TIntermSwizzle *swizzleNode)
+ {
++    StorageBufferAccess access;
++    const auto &indices = swizzleNode->getSwizzleOffsets();
++    if (indices.size() > 1 &&
++        GetStorageBufferAccess(swizzleNode->getOperand(), mSymbolEnv, &access))
++    {
++        mOut << "ANGLE_StorageLayout"
++             << storageAggregateLayout(swizzleNode->getOperand()->getType(), access)
++             << "::swizzleLoad<" << indices.size();
++        for (size_t i = 0; i < 4; ++i)
++        {
++            mOut << ", " << (i < indices.size() ? indices[i] : 0);
++        }
++        mOut << ", ";
++        emitType(swizzleNode->getType(), {});
++        mOut << ">(";
++        emitStorageAddress(access);
++        mOut << ")";
++        return false;
++    }
+     if (emitStorageAccess(swizzleNode))
+     {
+         return false;
+@@ -1857,6 +1903,332 @@ const TField &GenMetalTraverser::getDirectField(const TIntermTyped &fieldsNode,
+     return getDirectField(*fieldListCollection, index);
+ }
+ 
++bool GenMetalTraverser::needsStorageAggregate(const TType &type, const StorageBufferAccess &access)
++{
++    return type.isArray() || type.getStruct() || type.isMatrix() ||
++           (type.isVector() && access.componentStride != 4);
++}
++
++size_t GenMetalTraverser::storageAggregateLayout(const TType &type,
++                                                 const StorageBufferAccess &access)
++{
++    const std::string key = std::string(type.getMangledName()) + ":" +
++                            std::to_string(static_cast<int>(access.storage)) + ":" +
++                            std::to_string(static_cast<int>(access.packing)) + ":" +
++                            std::to_string(access.componentStride);
++    auto found            = mStorageLayoutIndices.find(key);
++    if (found != mStorageLayoutIndices.end())
++    {
++        return found->second;
++    }
++    const size_t index = mStorageLayouts.size();
++    mStorageLayouts.push_back({&type, access.storage, access.packing, access.componentStride});
++    mStorageLayoutIndices.emplace(key, index);
++    return index;
++}
++
++void GenMetalTraverser::emitStorageAddress(const StorageBufferAccess &access)
++{
++    mOut << "((";
++    groupedTraverse(*access.base);
++    mOut << ") + " << access.offset << "u";
++    for (const auto &index : access.indices)
++    {
++        mOut << " + size_t(";
++        groupedTraverse(*index.first);
++        mOut << ") * " << index.second << "u";
++    }
++    mOut << ")";
++}
++
++void GenMetalTraverser::emitStorageTransfers(const TType &type,
++                                             TLayoutBlockStorage storage,
++                                             TLayoutMatrixPacking packing,
++                                             size_t componentStride,
++                                             const std::string &value,
++                                             const std::string &address,
++                                             bool store)
++{
++    storage        = Overlay(storage, type);
++    packing        = Overlay(packing, type);
++    const auto add = [](const std::string &base, size_t offset) {
++        return "(" + base + " + " + std::to_string(offset) + "u)";
++    };
++    if (type.isArray())
++    {
++        TType element(type);
++        element.toArrayElementType();
++        const size_t stride     = StorageBufferArrayStride(type, storage, packing);
++        const std::string index = "ANGLE_i" + std::to_string(mStorageLoopIndex++);
++        mOut << "    for (uint " << index << " = 0u; " << index << " < "
++             << type.getOutermostArraySize() << "u; ++" << index << ") {\n";
++        emitStorageTransfers(
++            element, storage, packing, 4, value + "[" + index + "]",
++            "(" + address + " + size_t(" + index + ") * " + std::to_string(stride) + "u)", store);
++        mOut << "    }\n";
++    }
++    else if (const TStructure *structure = type.getStruct())
++    {
++        const auto &fields = structure->fields();
++        for (size_t i = 0; i < fields.size(); ++i)
++        {
++            TInfoSinkBase name;
++            Name(*fields[i]).emit(name, kUserVariableNamePrefix);
++            emitStorageTransfers(
++                *fields[i]->type(), storage, packing, 4, value + "." + name.c_str(),
++                add(address, StorageBufferFieldOffset(fields, i, storage, packing)), store);
++        }
++    }
++    else if (type.isMatrix())
++    {
++        const Layout layout = StorageBufferLayout(type, storage, packing);
++        const bool rowMajor = packing == EmpRowMajor;
++        const size_t stride = layout.sizeOf / (rowMajor ? type.getRows() : type.getCols());
++        const TType scalar(type.getBasicType(), EbpHigh);
++        for (size_t column = 0; column < type.getCols(); ++column)
++        {
++            for (size_t row = 0; row < type.getRows(); ++row)
++            {
++                emitStorageTransfers(
++                    scalar, storage, packing, 4,
++                    value + "[" + std::to_string(column) + "][" + std::to_string(row) + "]",
++                    add(address, rowMajor ? row * stride + column * 4 : column * stride + row * 4),
++                    store);
++            }
++        }
++    }
++    else if (type.isVector())
++    {
++        const TType scalar(type.getBasicType(), EbpHigh);
++        for (size_t i = 0; i < type.getNominalSize(); ++i)
++        {
++            emitStorageTransfers(scalar, storage, packing, 4, value + "[" + std::to_string(i) + "]",
++                                 add(address, i * componentStride), store);
++        }
++    }
++    else
++    {
++        TType physical(type.getBasicType() == EbtBool ? EbtUInt : type.getBasicType(), EbpHigh);
++        mOut << "    ";
++        if (!store)
++        {
++            mOut << value << " = ";
++        }
++        mOut << "(*reinterpret_cast<" << (store ? "device " : "const device ");
++        emitType(physical, {});
++        mOut << " *>(" << address << "))";
++        if (store)
++        {
++            mOut << " = ";
++            emitType(physical, {});
++            mOut << "(" << value << ")";
++        }
++        else if (type.getBasicType() == EbtBool)
++        {
++            mOut << " != 0u";
++        }
++        mOut << ";\n";
++    }
++}
++
++void GenMetalTraverser::emitStorageAggregateHelpers(TIntermBlock &body)
++{
++    class Collector final : public TIntermTraverser
++    {
++      public:
++        Collector(const SymbolEnv &env) : TIntermTraverser(true, false, false), mEnv(env) {}
++        std::vector<TIntermTyped *> nodes;
++
++      private:
++        void add(TIntermTyped *node)
++        {
++            StorageBufferAccess access;
++            auto *parent = getParentNode();
++            auto *unary  = parent ? parent->getAsUnaryNode() : nullptr;
++            const bool increment =
++                unary && (unary->getOp() == EOpPreIncrement || unary->getOp() == EOpPostIncrement ||
++                          unary->getOp() == EOpPreDecrement || unary->getOp() == EOpPostDecrement);
++            auto *call                = parent ? parent->getAsAggregate() : nullptr;
++            const TFunction *function = call ? call->getFunction() : nullptr;
++            const bool storageWrapper = function &&
++                                        function->symbolType() == SymbolType::AngleInternal &&
++                                        (function->name().beginsWith("storage_increment_") ||
++                                         function->name().beginsWith("storage_decrement_") ||
++                                         function->name().beginsWith("storage_swizzle_"));
++            auto *swizzle             = parent ? parent->getAsSwizzleNode() : nullptr;
++            const bool swizzleAccess  = swizzle && swizzle->getSwizzleOffsets().size() > 1;
++            if (!GetStorageBufferAccess(node, mEnv, &access) || access.base == node ||
++                (!needsStorageAggregate(node->getType(), access) && !increment && !storageWrapper &&
++                 !swizzleAccess))
++            {
++                return;
++            }
++            if (node->getType().isArray() && node->getType().getOutermostArraySize() == 0)
++            {
++                return;
++            }
++            auto *binary = parent ? parent->getAsBinaryNode() : nullptr;
++            StorageBufferAccess parentAccess;
++            if (binary && binary->getLeft() == node &&
++                GetStorageBufferAccess(binary, mEnv, &parentAccess))
++            {
++                return;
++            }
++            nodes.push_back(node);
++        }
++        bool visitBinary(Visit, TIntermBinary *node) override
++        {
++            add(node);
++            return true;
++        }
++        bool visitSwizzle(Visit, TIntermSwizzle *node) override
++        {
++            add(node);
++            return true;
++        }
++        const SymbolEnv &mEnv;
++    } collector(mSymbolEnv);
++    body.traverse(&collector);
++    for (TIntermTyped *node : collector.nodes)
++    {
++        StorageBufferAccess access;
++        GetStorageBufferAccess(node, mSymbolEnv, &access);
++        storageAggregateLayout(node->getType(), access);
++    }
++    // ToposortStructs may interleave equality helpers with struct declarations.
++    // Emit layouts only before the function that uses them, after their value
++    // types have been declared, rather than before the first module function.
++    for (size_t i = 0; i < mStorageLayouts.size(); ++i)
++    {
++        auto &layout = mStorageLayouts[i];
++        if (layout.emitted)
++        {
++            continue;
++        }
++        layout.emitted = true;
++        mOut << "struct ANGLE_StorageLayout" << i << " {\n  using Value = ";
++        emitType(*layout.type, {});
++        mOut << ";\n  static Value load(const device uchar *ANGLE_data) {\n    Value value{};\n";
++        emitStorageTransfers(*layout.type, layout.storage, layout.packing, layout.componentStride,
++                             "value", "ANGLE_data", false);
++        mOut << "    return value;\n  }\n  static Value store(device uchar *ANGLE_data, Value "
++                "value) {\n";
++        emitStorageTransfers(*layout.type, layout.storage, layout.packing, layout.componentStride,
++                             "value", "ANGLE_data", true);
++        mOut << "    return value;\n  }\n";
++        const TType &type = *layout.type;
++        if (!type.isArray() && !type.getStruct() && type.getBasicType() != EbtBool)
++        {
++            mOut << "  static Value increment(device uchar *destination, bool post, bool "
++                    "decrement) {\n"
++                    "    Value old = load(destination);\n    Value value = old;\n";
++            const size_t columns = type.isMatrix() ? type.getCols() : 1;
++            const size_t rows    = type.isMatrix() ? type.getRows() : type.getNominalSize();
++            for (size_t column = 0; column < columns; ++column)
++            {
++                for (size_t row = 0; row < rows; ++row)
++                {
++                    const std::string element =
++                        "value" + (type.isMatrix()   ? "[" + std::to_string(column) + "][" +
++                                                           std::to_string(row) + "]"
++                                   : type.isVector() ? "[" + std::to_string(row) + "]"
++                                                     : "");
++                    mOut << "    " << element << " = ";
++                    if (type.getBasicType() == EbtInt)
++                    {
++                        mOut << "as_type<int>(as_type<uint>(" << element
++                             << ") + (decrement ? 0xffffffffu : 1u))";
++                    }
++                    else if (type.getBasicType() == EbtUInt)
++                    {
++                        mOut << element << " + (decrement ? 0xffffffffu : 1u)";
++                    }
++                    else
++                    {
++                        mOut << element << " + (decrement ? -1.0f : 1.0f)";
++                    }
++                    mOut << ";\n";
++                }
++            }
++            mOut << "    store(destination, value);\n    return post ? old : value;\n  }\n";
++        }
++        if (!type.isArray() && type.isVector())
++        {
++            TType physical(type.getBasicType() == EbtBool ? EbtUInt : type.getBasicType(), EbpHigh);
++            mOut << "  template<uint Count, uint A, uint B, uint C, uint D, typename T>\n"
++                    "  static T swizzleLoad(const device uchar *source) {\n"
++                    "    const uint indices[4] = {A,B,C,D};\n    T value{};\n"
++                    "    for(uint i=0u; i<Count; ++i) value[i] = (*reinterpret_cast<const device ";
++            emitType(physical, {});
++            mOut << " *>(source + indices[i] * " << layout.componentStride << "u))";
++            if (type.getBasicType() == EbtBool)
++            {
++                mOut << " != 0u";
++            }
++            mOut << ";\n    return value;\n  }\n"
++                    "  template<uint Count, uint A, uint B, uint C, uint D, typename T>\n"
++                    "  static T swizzleStore(device uchar *destination, T value) {\n"
++                    "    const uint indices[4] = {A,B,C,D};\n"
++                    "    for(uint i=0u; i<Count; ++i) (*reinterpret_cast<device ";
++            emitType(physical, {});
++            mOut << " *>(destination + indices[i] * " << layout.componentStride << "u)) = ";
++            emitType(physical, {});
++            mOut << "(value[i]);\n    return value;\n  }\n";
++            mOut << "  template<uint Count, uint A, uint B, uint C, uint D, typename T>\n"
++                    "  static T swizzleIncrement(device uchar *destination, bool post, bool "
++                    "decrement) {\n"
++                    "    T old = swizzleLoad<Count,A,B,C,D,T>(destination);\n    T value = old;\n"
++                    "    for(uint i=0u; i<Count; ++i) value[i] = ";
++            if (type.getBasicType() == EbtInt)
++            {
++                mOut << "as_type<int>(as_type<uint>(value[i]) + (decrement ? 0xffffffffu : 1u))";
++            }
++            else if (type.getBasicType() == EbtUInt)
++            {
++                mOut << "value[i] + (decrement ? 0xffffffffu : 1u)";
++            }
++            else
++            {
++                mOut << "value[i] + (decrement ? -1.0f : 1.0f)";
++            }
++            mOut << ";\n    swizzleStore<Count,A,B,C,D>(destination,value);\n"
++                    "    return post ? old : value;\n  }\n";
++        }
++        mOut << "};\n\n";
++    }
++    if (!mStorageLayouts.empty() && !mStorageArgumentEmitted)
++    {
++        mStorageArgumentEmitted = true;
++        mOut << R"(
++template <typename Layout>
++struct ANGLE_StorageAggregateArgument
++{
++    using Value = typename Layout::Value;
++    Value value;
++    device uchar *destination;
++    ANGLE_StorageAggregateArgument(device uchar *dest, bool copyIn) : value{}, destination(dest)
++    {
++        if (copyIn) value = Layout::load(dest);
++    }
++    ~ANGLE_StorageAggregateArgument() { Layout::store(destination, value); }
++    operator thread Value &() thread { return value; }
++};
++template <typename Layout, uint Count, uint A, uint B, uint C, uint D, typename T>
++struct ANGLE_StorageSwizzleArgument
++{
++    T value;
++    device uchar *destination;
++    ANGLE_StorageSwizzleArgument(device uchar *dest, bool copyIn) : value{}, destination(dest)
++    {
++        if (copyIn) value = Layout::template swizzleLoad<Count,A,B,C,D,T>(dest);
++    }
++    ~ANGLE_StorageSwizzleArgument() { Layout::template swizzleStore<Count,A,B,C,D>(destination,value); }
++    operator thread T &() thread { return value; }
++};
++)";
++    }
++}
++
+ bool GenMetalTraverser::emitStorageAccess(TIntermTyped *node)
+ {
+     StorageBufferAccess access;
+@@ -1865,13 +2237,17 @@ bool GenMetalTraverser::emitStorageAccess(TIntermTyped *node)
+         return false;
+     }
+     const TType &type = node->getType();
+-    if (type.isArray() || type.getStruct() || type.isMatrix() ||
+-        (type.isVector() && access.componentStride != 4))
++    if (needsStorageAggregate(type, access))
+     {
+-        // Aggregate loads/stores and row-major column values need explicit
+-        // gather/scatter lowering. Never silently use the native Metal layout.
+-        mStorageAccessSupported = false;
+-        mOut << "0 /* unsupported storage aggregate access */";
++        if (type.isArray() && type.getOutermostArraySize() == 0)
++        {
++            mStorageAccessSupported = false;
++            mOut << "0 /* unsized array value has no aggregate representation */";
++            return true;
++        }
++        mOut << "ANGLE_StorageLayout" << storageAggregateLayout(type, access) << "::load(";
++        emitStorageAddress(access);
++        mOut << ")";
+         return true;
+     }
+     auto *parent       = getParentNode();
+@@ -1923,6 +2299,39 @@ bool GenMetalTraverser::emitStorageAccess(TIntermTyped *node)
+ 
+ bool GenMetalTraverser::visitBinary(Visit, TIntermBinary *binaryNode)
+ {
++    StorageBufferAccess destination;
++    auto *swizzle = binaryNode->getLeft()->getAsSwizzleNode();
++    if (binaryNode->getOp() == EOpAssign && swizzle && swizzle->getSwizzleOffsets().size() > 1 &&
++        GetStorageBufferAccess(swizzle->getOperand(), mSymbolEnv, &destination))
++    {
++        const auto &indices = swizzle->getSwizzleOffsets();
++        mOut << "ANGLE_StorageLayout"
++             << storageAggregateLayout(swizzle->getOperand()->getType(), destination)
++             << "::swizzleStore<" << indices.size();
++        for (size_t i = 0; i < 4; ++i)
++        {
++            mOut << ", " << (i < indices.size() ? indices[i] : 0);
++        }
++        mOut << ">(";
++        emitStorageAddress(destination);
++        mOut << ", ";
++        groupedTraverse(*binaryNode->getRight());
++        mOut << ")";
++        return false;
++    }
++    if (binaryNode->getOp() == EOpAssign &&
++        GetStorageBufferAccess(binaryNode->getLeft(), mSymbolEnv, &destination) &&
++        destination.base != binaryNode->getLeft() &&
++        needsStorageAggregate(binaryNode->getLeft()->getType(), destination))
++    {
++        mOut << "ANGLE_StorageLayout"
++             << storageAggregateLayout(binaryNode->getLeft()->getType(), destination) << "::store(";
++        emitStorageAddress(destination);
++        mOut << ", ";
++        groupedTraverse(*binaryNode->getRight());
++        mOut << ")";
++        return false;
++    }
+     if (emitStorageAccess(binaryNode))
+     {
+         return false;
+@@ -2067,6 +2476,28 @@ static bool IsPostfix(TOperator op)
+ 
+ bool GenMetalTraverser::visitUnary(Visit, TIntermUnary *unaryNode)
+ {
++    const TOperator storageOp = unaryNode->getOp();
++    if (storageOp == EOpPreIncrement || storageOp == EOpPostIncrement ||
++        storageOp == EOpPreDecrement || storageOp == EOpPostDecrement)
++    {
++        StorageBufferAccess access;
++        if (GetStorageBufferAccess(unaryNode->getOperand(), mSymbolEnv, &access) &&
++            access.base != unaryNode->getOperand())
++        {
++            mOut << "ANGLE_StorageLayout"
++                 << storageAggregateLayout(unaryNode->getOperand()->getType(), access)
++                 << "::increment(";
++            emitStorageAddress(access);
++            mOut << ", "
++                 << ((storageOp == EOpPostIncrement || storageOp == EOpPostDecrement) ? "true"
++                                                                                      : "false")
++                 << ", "
++                 << ((storageOp == EOpPreDecrement || storageOp == EOpPostDecrement) ? "true"
++                                                                                     : "false")
++                 << ")";
++            return false;
++        }
++    }
+     const TOperator op      = unaryNode->getOp();
+     const TType &resultType = unaryNode->getType();
+ 
+@@ -2341,6 +2772,7 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+ {
+     const TFunction &func = *funcDefNode->getFunction();
+     TIntermBlock &body    = *funcDefNode->getBody();
++    emitStorageAggregateHelpers(body);
+     if (func.isMain())
+     {
+         const TType &returnType     = func.getReturnType();
+@@ -2410,6 +2842,80 @@ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
+ bool GenMetalTraverser::visitAggregate(Visit, TIntermAggregate *aggregateNode)
+ {
+     const TIntermSequence &args = *aggregateNode->getSequence();
++    const TFunction *storageFunction = aggregateNode->getFunction();
++    if (storageFunction && storageFunction->symbolType() == SymbolType::AngleInternal &&
++        (storageFunction->name().beginsWith("storage_increment_") ||
++         storageFunction->name().beginsWith("storage_decrement_")))
++    {
++        TIntermTyped *argument = args[0]->getAsTyped();
++        StorageBufferAccess access;
++        GetStorageBufferAccess(argument, mSymbolEnv, &access);
++        mOut << "ANGLE_StorageLayout" << storageAggregateLayout(argument->getType(), access)
++             << "::increment(";
++        emitStorageAddress(access);
++        const auto &name = storageFunction->name();
++        mOut << ", " << (name.contains("_post") ? "true" : "false") << ", "
++             << (name.beginsWith("storage_decrement_") ? "true" : "false") << ")";
++        return false;
++    }
++    if (storageFunction && storageFunction->symbolType() == SymbolType::AngleInternal &&
++        storageFunction->name().beginsWith("storage_swizzle_"))
++    {
++        TIntermTyped *argument = args[0]->getAsTyped();
++        StorageBufferAccess access;
++        GetStorageBufferAccess(argument, mSymbolEnv, &access);
++        const auto &name = storageFunction->name();
++        if (name.contains("increment_") || name.contains("decrement_"))
++        {
++            mOut << "ANGLE_StorageLayout" << storageAggregateLayout(argument->getType(), access)
++                 << "::swizzleIncrement<" << args.size() - 1;
++            for (size_t i = 0; i < 4; ++i)
++            {
++                mOut << ", "
++                     << (i + 1 < args.size() ? args[i + 1]->getAsConstantUnion()->getIConst(0) : 0);
++            }
++            mOut << ", ";
++            emitType(aggregateNode->getType(), {});
++            mOut << ">(";
++            emitStorageAddress(access);
++            mOut << ", " << (name.contains("_post") ? "true" : "false") << ", "
++                 << (name.contains("decrement_") ? "true" : "false") << ")";
++            return false;
++        }
++        mOut << "ANGLE_StorageSwizzleArgument<ANGLE_StorageLayout"
++             << storageAggregateLayout(argument->getType(), access) << ", " << args.size() - 1;
++        for (size_t i = 0; i < 4; ++i)
++        {
++            mOut << ", "
++                 << (i + 1 < args.size() ? args[i + 1]->getAsConstantUnion()->getIConst(0) : 0);
++        }
++        mOut << ", ";
++        emitType(aggregateNode->getType(), {});
++        mOut << ">(";
++        emitStorageAddress(access);
++        mOut << ", " << (storageFunction->name() == "storage_swizzle_inout" ? "true" : "false")
++             << ")";
++        return false;
++    }
++    if (storageFunction && storageFunction->symbolType() == SymbolType::AngleInternal &&
++        (storageFunction->name().beginsWith("storage_out<") ||
++         storageFunction->name().beginsWith("storage_inout<")) &&
++        args.size() == 1)
++    {
++        TIntermTyped *argument = args[0]->getAsTyped();
++        StorageBufferAccess access;
++        if (GetStorageBufferAccess(argument, mSymbolEnv, &access) &&
++            needsStorageAggregate(argument->getType(), access))
++        {
++            mOut << "ANGLE_StorageAggregateArgument<ANGLE_StorageLayout"
++                 << storageAggregateLayout(argument->getType(), access) << ">(";
++            emitStorageAddress(access);
++            mOut << ", "
++                 << (storageFunction->name().beginsWith("storage_inout<") ? "true" : "false")
++                 << ")";
++            return false;
++        }
++    }
+ 
+     auto emitArgList = [&](const char *open, const char *close) {
+         mOut << open;
+diff --git a/src/compiler/translator/msl/StorageBuffer.cpp b/src/compiler/translator/msl/StorageBuffer.cpp
+index aadaf85..5935dc0 100644
+--- a/src/compiler/translator/msl/StorageBuffer.cpp
++++ b/src/compiler/translator/msl/StorageBuffer.cpp
+@@ -35,6 +35,16 @@ Layout StructLayout(const TFieldList &fields,
+ }
+ }  // namespace
+ 
++size_t StorageBufferFieldOffset(const TFieldList &fields,
++                                size_t index,
++                                TLayoutBlockStorage storage,
++                                TLayoutMatrixPacking packing)
++{
++    const Layout previous = StructLayout(fields, storage, packing, index);
++    const Layout field    = StorageBufferLayout(*fields[index]->type(), storage, packing);
++    return Aligned(previous.sizeOf, field.alignOf);
++}
++
+ size_t StorageBufferArrayStride(const TType &type,
+                                 TLayoutBlockStorage storage,
+                                 TLayoutMatrixPacking packing)
+@@ -261,8 +271,9 @@ class WrapStorageArguments : public TIntermRebuild
+     {
+         const TType &type = node.getLeft()->getType();
+         StorageBufferAccess access;
+-        if (type.isArray() || !type.isVector() || type.getNominalSize() != 3 ||
+-            !GetStorageBufferAccess(node.getLeft(), mEnv, &access))
++        if (!GetStorageBufferAccess(node.getLeft(), mEnv, &access) ||
++            !(type.isMatrix() ||
++              (type.isVector() && (type.getNominalSize() == 3 || access.componentStride != 4))))
+         {
+             return node;
+         }
+@@ -290,6 +301,12 @@ class WrapStorageArguments : public TIntermRebuild
+             case EOpVectorTimesMatrixAssign:
+                 operation = EOpVectorTimesMatrix;
+                 break;
++            case EOpMatrixTimesScalarAssign:
++                operation = EOpMatrixTimesScalar;
++                break;
++            case EOpMatrixTimesMatrixAssign:
++                operation = EOpMatrixTimesMatrix;
++                break;
+             case EOpBitShiftLeftAssign:
+                 operation = EOpBitShiftLeft;
+                 break;
+@@ -314,6 +331,50 @@ class WrapStorageArguments : public TIntermRebuild
+             EOpAssign, node.getLeft(),
+             new TIntermBinary(operation, node.getLeft()->deepCopy(), node.getRight()));
+     }
++    PostResult visitUnaryPost(TIntermUnary &node) override
++    {
++        const char *name = nullptr;
++        switch (node.getOp())
++        {
++            case EOpPreIncrement:
++                name = "storage_increment_pre";
++                break;
++            case EOpPostIncrement:
++                name = "storage_increment_post";
++                break;
++            case EOpPreDecrement:
++                name = "storage_decrement_pre";
++                break;
++            case EOpPostDecrement:
++                name = "storage_decrement_post";
++                break;
++            default:
++                return node;
++        }
++        StorageBufferAccess access;
++        if (!GetStorageBufferAccess(node.getOperand(), mEnv, &access))
++        {
++            auto *swizzle = node.getOperand()->getAsSwizzleNode();
++            if (!swizzle || swizzle->getSwizzleOffsets().size() < 2 ||
++                !GetStorageBufferAccess(swizzle->getOperand(), mEnv, &access))
++            {
++                return node;
++            }
++            auto *args = new TIntermSequence{swizzle->getOperand()};
++            for (uint32_t component : swizzle->getSwizzleOffsets())
++            {
++                args->push_back(CreateIndexNode(static_cast<int>(component)));
++            }
++            return mEnv.callFunctionOverload(
++                Name("storage_swizzle_" + std::string(name + 8), SymbolType::AngleInternal),
++                node.getType(), *args);
++        }
++        // Keep the original storage lvalue until emission; the generic signed
++        // increment pass would otherwise wrap device elements in thread refs.
++        return mEnv.callFunctionOverload(Name(name), node.getType(),
++                                         *new TIntermSequence{node.getOperand()});
++    }
++
+     PostResult visitAggregatePost(TIntermAggregate &node) override
+     {
+         const TFunction *function = node.getFunction();
+@@ -400,10 +461,34 @@ class WrapStorageArguments : public TIntermRebuild
+             }
+             auto *argument = arguments[i]->getAsTyped();
+             StorageBufferAccess access;
++            if (auto *swizzle = argument->getAsSwizzleNode();
++                swizzle && swizzle->getSwizzleOffsets().size() > 1 &&
++                GetStorageBufferAccess(swizzle->getOperand(), mEnv, &access))
++            {
++                auto *args = new TIntermSequence{swizzle->getOperand()};
++                for (uint32_t component : swizzle->getSwizzleOffsets())
++                {
++                    args->push_back(CreateIndexNode(static_cast<int>(component)));
++                }
++                arguments[i] = &mEnv.callFunctionOverload(
++                    Name(qualifier == EvqParamOut ? "storage_swizzle_out"
++                                                  : "storage_swizzle_inout"),
++                    argument->getType(), *args);
++                continue;
++            }
+             if (!GetStorageBufferAccess(argument, mEnv, &access))
+             {
+                 continue;
+             }
++            if (argument->getType().isArray())
++            {
++                // The emitter supplies the layout's complete array value type.
++                // SymbolEnv's scalar template spelling cannot represent arrays.
++                arguments[i] = &mEnv.callFunctionOverload(
++                    Name(qualifier == EvqParamOut ? "storage_out<>" : "storage_inout<>"),
++                    argument->getType(), *new TIntermSequence{argument});
++                continue;
++            }
+             TemplateArg type(argument->getType());
+             arguments[i] = &mEnv.callFunctionOverload(
+                 Name(qualifier == EvqParamOut ? "storage_out" : "storage_inout"),
+diff --git a/src/compiler/translator/msl/StorageBuffer.h b/src/compiler/translator/msl/StorageBuffer.h
+index 24021d7..5d9db5c 100644
+--- a/src/compiler/translator/msl/StorageBuffer.h
++++ b/src/compiler/translator/msl/StorageBuffer.h
+@@ -73,6 +73,10 @@ bool LowerStorageArrayLength(TCompiler &compiler,
+ Layout StorageBufferLayout(const TType &type,
+                            TLayoutBlockStorage storage,
+                            TLayoutMatrixPacking packing);
++size_t StorageBufferFieldOffset(const TFieldList &fields,
++                                size_t index,
++                                TLayoutBlockStorage storage,
++                                TLayoutMatrixPacking packing);
+ size_t StorageBufferArrayStride(const TType &type,
+                                 TLayoutBlockStorage storage,
+                                 TLayoutMatrixPacking packing);
+diff --git a/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp b/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp
+index b52c1fd..9e93228 100644
+--- a/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp
++++ b/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp
+@@ -101,6 +101,7 @@ class Rewriter : public TIntermRebuild
+             // unnecessary and incompatible.
+             if (func && func->symbolType() == SymbolType::AngleInternal &&
+                 (func->name() == "swizzle_ref" || func->name() == "elem_ref" ||
++                 func->name().beginsWith("storage_swizzle_") ||
+                  func->name().beginsWith("storage_out<") ||
+                  func->name().beginsWith("storage_inout<")))
+             {
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index 38b96e5..d068d2c 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -157,17 +157,15 @@ TEST_F(MSLComputeOutputTest, AnonymousStorageBlock)
+     EXPECT_TRUE(foundInCode("* 16u"));
+ }
+ 
+-TEST_F(MSLComputeOutputTest, RejectUnsupportedStorageAggregate)
++TEST_F(MSLComputeOutputTest, StorageMatrixGatherScatter)
+ {
+-    const std::string source = R"(#version 310 es
++    compile(R"(#version 310 es
+         layout(local_size_x = 1) in;
+-        layout(std430, binding = 0) buffer Data { mat2 value; } data;
++        layout(std430, row_major, binding = 0) buffer Data { mat2 value; } data;
+         void main() { data.value = data.value * 2.0; }
+-    )";
+-    std::string log;
+-    EXPECT_FALSE(compileTestShader(GL_COMPUTE_SHADER, SH_GLES3_1_SPEC, SH_MSL_METAL_OUTPUT, source,
+-                                   defaultOptions(), nullptr, &log));
+-    EXPECT_NE(log.find("gather/scatter"), std::string::npos) << log;
++    )");
++    EXPECT_TRUE(foundInCode("::load("));
++    EXPECT_TRUE(foundInCode("::store("));
+ }
+ 
+ TEST_F(MSLComputeOutputTest, StorageBlockArrayDescriptors)
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 28722ca..72ec334 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -744,6 +744,266 @@ TEST_P(ComputeDispatchTestMetal, AtomicCounterInvalidatesVertexConversion)
+     EXPECT_PIXEL_RECT_EQ(0, 0, 16, 16, GLColor::green);
+ }
+ 
++TEST_P(ComputeDispatchTestMetal, StorageAggregatesPreserveLayoutsAndPadding)
++{
++    const std::string prefix = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        struct Record { vec3 direction; float weight; bool flag; mat2 matrix; };
++        layout(std430, row_major, binding = 0) readonly buffer InputData {
++            Record records[2]; float values[3]; mat2x3 matrix;
++        } inputData;
++        layout(std140, )";
++    const std::string suffix = R"(, binding = 1) buffer OutputData {
++            Record records[2]; float values[3]; mat2x3 matrix;
++        } outputData;
++        void copyValues(in float source[3], out float destination[3]) {
++            destination = source;
++        }
++        void tweak(inout Record value) {
++            value.direction += vec3(10,20,30); value.weight += 2.0;
++            value.flag = !value.flag; value.matrix += mat2(1);
++            value.matrix[0][1] += 3.0;
++        }
++        void twice(inout mat2 value) { value *= 2.0; }
++        void fillColumn(out vec3 value) { value = vec3(41,42,43); }
++        void addColumn(inout vec3 value) { value += vec3(1,2,3); }
++        void fillPair(out vec2 value) { value = vec2(70,80); }
++        void bumpPair(inout vec2 value) { value += vec2(4,5); }
++        void main() {
++            outputData.records = inputData.records;
++            Record value = inputData.records[1];
++            outputData.records[0] = value;
++            outputData.records[1] = inputData.records[0];
++            tweak(outputData.records[0]);
++            twice(outputData.records[1].matrix);
++            ++outputData.records[1].matrix;
++            mat2 before = outputData.records[1].matrix--;
++            copyValues(inputData.values, outputData.values);
++            outputData.values[0] = before[0][0];
++            outputData.matrix = inputData.matrix;
++            fillColumn(outputData.matrix[1]); addColumn(outputData.matrix[1]);
++            outputData.matrix[0] += vec3(1);
++            vec3 old = outputData.matrix[0]++;
++            outputData.values[1] = old.z;
++            outputData.matrix[0].yx = vec2(50,60);
++            outputData.matrix[0].xz += vec2(2,3);
++            fillPair(outputData.matrix[0].zy);
++            bumpPair(outputData.matrix[0].xz);
++            vec2 previous = outputData.matrix[0].zx++;
++            --outputData.matrix[0].yz;
++            outputData.values[2] = previous.x + previous.y;
++        }
++    )";
++    for (bool rowMajor : {false, true})
++    {
++        const std::string shader = prefix + (rowMajor ? "row_major" : "column_major") + suffix;
++        ANGLE_GL_COMPUTE_PROGRAM(program, shader.c_str());
++        GLBuffer allocation;
++        std::array<uint32_t, 1024> expected;
++        expected.fill(0xcdcdcdcdu);
++        const auto put = [&expected](size_t bytes, float value) {
++            std::memcpy(&expected[bytes / 4], &value, sizeof(value));
++        };
++        for (size_t i = 0; i < 2; ++i)
++        {
++            const size_t record = 256 + i * 48;
++            for (size_t j = 0; j < 3; ++j)
++            {
++                put(record + j * 4, static_cast<float>(i * 10 + 1 + j));
++            }
++            put(record + 12, static_cast<float>(i * 10 + 4));
++            expected[(record + 16) / 4] = i == 0 ? 0xffffffffu : 0u;
++            for (size_t c = 0; c < 2; ++c)
++            {
++                for (size_t r = 0; r < 2; ++r)
++                {
++                    put(record + 24 + r * 8 + c * 4, static_cast<float>(i * 10 + 5 + c * 2 + r));
++                }
++            }
++        }
++        for (size_t i = 0; i < 3; ++i)
++        {
++            put(256 + 96 + i * 4, static_cast<float>(19 + i * 4 + (i == 2 ? 2 : 0)));
++        }
++        for (size_t c = 0; c < 2; ++c)
++        {
++            for (size_t r = 0; r < 3; ++r)
++            {
++                put(256 + 112 + r * 8 + c * 4, static_cast<float>(31 + c * 3 + r));
++            }
++        }
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 256);
++        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, allocation, 1024, 256);
++        GLProgram restored;
++        reloadProgram(program, restored);
++        glUseProgram(restored);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++        ASSERT_GL_NO_ERROR();
++        const std::array<std::array<float, 3>, 2> directions = {{{21, 32, 43}, {1, 2, 3}}};
++        const std::array<float, 2> weights                   = {16, 4};
++        const std::array<std::array<float, 4>, 2> matrices = {{{16, 19, 17, 19}, {10, 12, 14, 16}}};
++        for (size_t i = 0; i < 2; ++i)
++        {
++            const size_t record = 1024 + i * 64;
++            for (size_t j = 0; j < 3; ++j)
++            {
++                put(record + j * 4, directions[i][j]);
++            }
++            put(record + 12, weights[i]);
++            expected[(record + 16) / 4] = 1;
++            for (size_t c = 0; c < 2; ++c)
++            {
++                for (size_t r = 0; r < 2; ++r)
++                {
++                    put(record + 32 + (rowMajor ? r * 16 + c * 4 : c * 16 + r * 4),
++                        matrices[i][c * 2 + r]);
++                }
++            }
++        }
++        put(1024 + 128, 11);
++        put(1024 + 144, 34);
++        put(1024 + 160, 141);
++        const std::array<std::array<float, 3>, 2> matrix = {{{67, 79, 75}, {42, 44, 46}}};
++        for (size_t c = 0; c < 2; ++c)
++        {
++            for (size_t r = 0; r < 3; ++r)
++            {
++                put(1024 + 176 + (rowMajor ? r * 16 + c * 4 : c * 16 + r * 4), matrix[c][r]);
++            }
++        }
++        const auto *actual = static_cast<const uint32_t *>(
++            glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++        ASSERT_NE(actual, nullptr);
++        for (size_t i = 0; i < expected.size(); ++i)
++        {
++            EXPECT_EQ(actual[i], expected[i]) << "row_major=" << rowMajor << ", word=" << i;
++        }
++        EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++        ASSERT_GL_NO_ERROR();
++    }
++}
++
++TEST_P(ComputeDispatchTestMetal, NestedStorageArrays)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) readonly buffer Input { uint values[2][3]; } inputData;
++        layout(std140, binding = 1) buffer Output { uint values[2][3]; } outputData;
++        void update(inout uint values[2][3]) { values[1][2] += 7u; }
++        void main() {
++            uint values[2][3] = inputData.values;
++            values[0][1] += 9u;
++            outputData.values = values;
++            update(outputData.values);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer allocation;
++    std::array<uint32_t, 512> expected;
++    expected.fill(0xcdcdcdcdu);
++    for (size_t i = 0; i < 6; ++i)
++    {
++        expected[256 / 4 + i] = static_cast<uint32_t>(i + 1);
++    }
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 24);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, allocation, 1024, 96);
++    glUseProgram(program);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    for (size_t r = 0; r < 2; ++r)
++    {
++        for (size_t c = 0; c < 3; ++c)
++        {
++            expected[(1024 + r * 48 + c * 16) / 4] = static_cast<uint32_t>(1 + r * 3 + c);
++        }
++    }
++    expected[(1024 + 16) / 4]      = 11;
++    expected[(1024 + 48 + 32) / 4] = 13;
++    const auto *actual             = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, PartialStorageWritesAndSignedIncrement)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 64) in;
++        layout(std430, row_major, binding = 0) coherent buffer Data {
++            mat2x3 values[32]; ivec3 signedValues; int tail; ivec4 returned;
++        } data;
++        void main() {
++            uint i = gl_LocalInvocationIndex;
++            uint record = i % 32u;
++            for (uint value=1u; value<=64u; ++value) {
++                if (i<32u) data.values[record][0].xy = vec2(value,value+1u);
++                else data.values[record][0].z = float(value+2u);
++                memoryBarrierBuffer();
++            }
++            if(i==0u) {
++                data.tail = 2147483647;
++                int oldTail = data.tail++;
++                int preTail = --data.tail;
++                data.signedValues = ivec3(2147483647,5,(-2147483647-1));
++                ivec2 old = data.signedValues.zx++;
++                --data.signedValues.xy;
++                data.returned = ivec4(old,oldTail,preTail);
++            }
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer allocation;
++    std::array<uint32_t, 256> expected;
++    expected.fill(0xcdcdcdcdu);
++    for (size_t i = 0; i < 192; ++i)
++    {
++        expected[i] = 0;
++    }
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    glUseProgram(program);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    for (size_t i = 0; i < 32; ++i)
++    {
++        for (size_t component = 0; component < 3; ++component)
++        {
++            const float value = static_cast<float>(64 + component);
++            std::memcpy(&expected[i * 6 + component * 2], &value, sizeof(value));
++        }
++    }
++    expected[192]      = 0x7fffffffu;
++    expected[193]      = 4;
++    expected[194]      = 0x80000001u;
++    expected[195]      = 0x7fffffffu;
++    expected[196]      = 0x80000000u;
++    expected[197]      = 0x7fffffffu;
++    expected[198]      = 0x7fffffffu;
++    expected[199]      = 0x7fffffffu;
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ TEST_P(ComputeDispatchTestMetal, ZeroDispatchAndFrontendValidation)
+ {
+     constexpr char source[] = R"(#version 310 es

@@ -1,0 +1,512 @@
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 1e657f2..de23be9 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -460,7 +460,17 @@ class ContextMtl : public ContextImpl, public mtl::Context
+                                                    size_t argumentOffset,
+                                                    const mtl::BufferRef &indices,
+                                                    size_t indexBytes,
+-                                                   mtl::BufferSlice *converted);
++                                                   mtl::BufferSlice *converted,
++                                                   size_t sourceByteOffset = 0);
++    angle::Result drawConvertedDirect(const gl::Context *context,
++                                      gl::PrimitiveMode mode,
++                                      GLint first,
++                                      GLsizei count,
++                                      gl::DrawElementsType type,
++                                      const void *indices,
++                                      GLsizei instances,
++                                      GLint baseVertex,
++                                      GLuint baseInstance);
+     angle::Result prepareIndirectLineLoop(const mtl::BufferRef &arguments,
+                                           size_t argumentOffset,
+                                           const mtl::BufferSlice &indices,
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 2d713c0..61a5ed9 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -279,9 +279,9 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+     mLineLoopIndexBuffer.initialize(this, 0, mtl::kIndexBufferOffsetAlignment,
+                                     kMaxTriFanLineLoopBuffersPerFrame,
+                                     mtl::TrackBufferInContext::Yes);
+-    mLineLoopLastSegmentIndexBuffer.initialize(
+-        this, 2 * sizeof(uint32_t), mtl::kIndexBufferOffsetAlignment,
+-        kMaxTriFanLineLoopBuffersPerFrame, mtl::TrackBufferInContext::Yes);
++    mLineLoopLastSegmentIndexBuffer.initialize(this, 64 * 1024, mtl::kIndexBufferOffsetAlignment,
++                                               kMaxTriFanLineLoopBuffersPerFrame,
++                                               mtl::TrackBufferInContext::Yes);
+ 
+     mContextDevice.set(mDisplay->getMetalDevice());
+ 
+@@ -532,6 +532,20 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+     {
+         return angle::Result::Continue;
+     }
++    const GLsizei minimumCount = mode == gl::PrimitiveMode::Points ? 1
++                                 : gl::IsPolygonMode(mode)         ? 3
++                                                                   : 2;
++    if (count < minimumCount)
++    {
++        return angle::Result::Continue;
++    }
++    if (!mState.isTransformFeedbackActiveUnpaused() &&
++        (mode == gl::PrimitiveMode::TriangleFan || mode == gl::PrimitiveMode::LineLoop ||
++         requiresIndexRewrite(context->getState(), mode)))
++    {
++        return drawConvertedDirect(context, mode, first, count, gl::DrawElementsType::InvalidEnum,
++                                   nullptr, instances, 0, baseInstance);
++    }
+     if (requiresIndexRewrite(context->getState(), mode))
+     {
+         return drawArraysProvokingVertexImpl(context, mode, first, count, instances, baseInstance);
+@@ -839,6 +853,22 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+         return angle::Result::Continue;
+     }
+ 
++    const GLsizei minimumCount = mode == gl::PrimitiveMode::Points ? 1
++                                 : gl::IsPolygonMode(mode)         ? 3
++                                                                   : 2;
++    if (count < minimumCount)
++    {
++        return angle::Result::Continue;
++    }
++    const bool strip =
++        mode == gl::PrimitiveMode::LineStrip || mode == gl::PrimitiveMode::TriangleStrip;
++    if (mode == gl::PrimitiveMode::TriangleFan || mode == gl::PrimitiveMode::LineLoop ||
++        getState().isPrimitiveRestartEnabled() || requiresIndexRewrite(getState(), mode) ||
++        (type == gl::DrawElementsType::UnsignedShort && strip))
++    {
++        return drawConvertedDirect(context, mode, 0, count, type, indices, instances, baseVertex,
++                                   baseInstance);
++    }
+     if (mode == gl::PrimitiveMode::TriangleFan)
+     {
+         return drawTriFanElements(context, count, type, indices, instanceCount, baseVertex,
+@@ -995,16 +1025,80 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+     return drawElementsImpl(context, mode, count, type, indices, 0, baseVertex, 0);
+ }
+ 
++angle::Result ContextMtl::drawConvertedDirect(const gl::Context *context,
++                                              gl::PrimitiveMode mode,
++                                              GLint first,
++                                              GLsizei count,
++                                              gl::DrawElementsType type,
++                                              const void *indices,
++                                              GLsizei instances,
++                                              GLint baseVertex,
++                                              GLuint baseInstance)
++{
++    ASSERT(!getState().isTransformFeedbackActiveUnpaused());
++    const bool arrays = type == gl::DrawElementsType::InvalidEnum;
++    const auto *elementBuffer =
++        arrays ? nullptr : getState().getVertexArray()->getElementArrayBuffer();
++    const size_t indexBytes        = arrays ? 0 : size_t(count) * gl::GetDrawElementsTypeSize(type);
++    const size_t clientBytes       = !arrays && !elementBuffer ? indexBytes : 0;
++    constexpr size_t kCommandBytes = 5 * sizeof(uint32_t);
++    mtl::BufferSlice packet;
++    mLineLoopLastSegmentIndexBuffer.releaseInFlightBuffers(this);
++    ANGLE_TRY(mLineLoopLastSegmentIndexBuffer.allocate(this, kCommandBytes + clientBytes, &packet));
++    auto upload = packet.buffer()->mapWithOpt(this, false, true, packet.offset(),
++                                              kCommandBytes + clientBytes);
++    const std::array<uint32_t, 5> command = {
++        static_cast<uint32_t>(count), static_cast<uint32_t>(instances ? instances : 1), 0,
++        static_cast<uint32_t>(arrays ? first : baseVertex), baseInstance};
++    std::memcpy(upload.data(), command.data(), kCommandBytes);
++    if (clientBytes)
++    {
++        std::memcpy(upload.data() + kCommandBytes, indices, clientBytes);
++    }
++    packet.buffer()->unmap(this);
++    ANGLE_TRY(mLineLoopLastSegmentIndexBuffer.commit(this));
++
++    mtl::BufferRef source = packet.buffer();
++    size_t offset         = packet.offset() + kCommandBytes;
++    size_t available      = arrays ? size_t(count) : clientBytes;
++    if (elementBuffer)
++    {
++        const auto *buffer = mtl::GetImpl(elementBuffer);
++        source             = buffer->getCurrentBuffer();
++        offset             = reinterpret_cast<uintptr_t>(indices);
++        available = offset <= buffer->size() ? std::min(indexBytes, buffer->size() - offset) : 0;
++    }
++    mtl::BufferSlice converted;
++    ANGLE_TRY(prepareIndexedIndirectConversion(mode, type, packet.buffer(), packet.offset(), source,
++                                               available, &converted, offset));
++    bool noOp = false;
++    // Attribute streaming/conversion must see the original API range, not the
++    // generated list. Transform feedback retains its existing dedicated path.
++    ANGLE_TRY(setupDraw(context, first, count, instances, type, indices, false, &noOp));
++    if (!noOp)
++    {
++        const MTLPrimitiveType primitive = mode == gl::PrimitiveMode::Points ? MTLPrimitiveTypePoint
++                                           : gl::IsPolygonMode(mode) ? MTLPrimitiveTypeTriangle
++                                                                     : MTLPrimitiveTypeLine;
++        mRenderEncoder.drawIndexedIndirect(primitive, MTLIndexTypeUInt32, converted.buffer(),
++                                           converted.offset() + 8 * sizeof(uint32_t),
++                                           converted.buffer(), converted.offset());
++    }
++    return angle::Result::Continue;
++}
++
+ angle::Result ContextMtl::prepareIndexedIndirectConversion(gl::PrimitiveMode mode,
+                                                            gl::DrawElementsType type,
+                                                            const mtl::BufferRef &arguments,
+                                                            size_t argumentOffset,
+                                                            const mtl::BufferRef &indices,
+                                                            size_t indexBytes,
+-                                                           mtl::BufferSlice *converted)
++                                                           mtl::BufferSlice *converted,
++                                                           size_t sourceByteOffset)
+ {
+-    const size_t indexSize = gl::GetDrawElementsTypeSize(type);
+-    const size_t capacity  = indexBytes / indexSize;
++    const size_t indexSize =
++        type == gl::DrawElementsType::InvalidEnum ? 0 : gl::GetDrawElementsTypeSize(type);
++    const size_t capacity  = indexSize ? indexBytes / indexSize : indexBytes;
+     const size_t expansion = mode == gl::PrimitiveMode::Points ? 1
+                              : gl::IsPolygonMode(mode)         ? 3
+                                                                : 2;
+@@ -1017,11 +1111,14 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+ #include <metal_stdlib>
+ using namespace metal;
+ 
+-uint sourceIndex(const device uchar *indices, uint index, uint size)
++uint sourceIndex(const device uchar *indices, uint index, uint size, ulong offset)
+ {
+-    if (size == 1u) return indices[index];
+-    if (size == 2u) return reinterpret_cast<const device ushort *>(indices)[index];
+-    return reinterpret_cast<const device uint *>(indices)[index];
++    if (size == 0u) return index;
++    const ulong address = offset + ulong(index) * size;
++    uint value = 0u;
++    for (uint byte = 0u; byte < size; ++byte)
++        value |= uint(indices[address + byte]) << (8u * byte);
++    return value;
+ }
+ 
+ void emitLine(device uint *indices, thread uint &count, uint a, uint b, bool last)
+@@ -1043,14 +1140,15 @@ void emitTriangle(device uint *indices, thread uint &count, uint a, uint b, uint
+ kernel void main0(const device uint *source [[buffer(0)]],
+                   device uint *destination [[buffer(1)]],
+                   const device uchar *input [[buffer(2)]],
+-                  constant uint4 &params [[buffer(3)]])
+-{
+-    const uint capacity = params.x;
+-    const uint indexSize = params.y;
+-    const uint mode = params.z;
+-    const bool restart = (params.w & 1u) != 0u;
+-    const bool last = (params.w & 2u) != 0u;
+-    const bool first = (params.w & 4u) != 0u;
++                  constant uint *params [[buffer(3)]])
++{
++    const uint capacity = params[0];
++    const uint indexSize = params[1];
++    const uint mode = params[2];
++    const bool restart = (params[3] & 1u) != 0u;
++    const bool last = (params[3] & 2u) != 0u;
++    const bool first = (params[3] & 4u) != 0u;
++    const ulong sourceOffset = ulong(params[4]) | (ulong(params[5]) << 32);
+     const uint sentinel = indexSize == 1u ? 0xffu : indexSize == 2u ? 0xffffu : 0xffffffffu;
+     const uint begin = source[2];
+     const uint count = source[1] != 0u && begin < capacity
+@@ -1061,7 +1159,7 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     uint written = 0u, segment = 0u, origin = 0u, previous = 0u, older = 0u;
+     for (uint i = 0u; i < count; ++i)
+     {
+-        const uint value = sourceIndex(input, begin + i, indexSize);
++        const uint value = sourceIndex(input, begin + i, indexSize, sourceOffset);
+         if (restart && value == sentinel)
+         {
+             if (mode == 2u && segment > 1u)
+@@ -1136,7 +1234,7 @@ kernel void main0(const device uint *source [[buffer(0)]],
+                                                          &mIndirectIndexConversionBuffer));
+     }
+     *converted     = mtl::BufferSlice(mIndirectIndexConversionBuffer);
+-    uint32_t flags = getState().isPrimitiveRestartEnabled() ? 1u : 0u;
++    uint32_t flags = indexSize && getState().isPrimitiveRestartEnabled() ? 1u : 0u;
+     if (mExecutable->hasFlatAttribute())
+     {
+         flags |=
+@@ -1144,9 +1242,12 @@ kernel void main0(const device uint *source [[buffer(0)]],
+                 ? 2u
+                 : 4u;
+     }
+-    const std::array<uint32_t, 4> params = {static_cast<uint32_t>(capacity),
+-                                            static_cast<uint32_t>(indexSize), gl::ToGLenum(mode),
+-                                            flags};
++    const std::array<uint32_t, 6> params = {static_cast<uint32_t>(capacity),
++                                            static_cast<uint32_t>(indexSize),
++                                            gl::ToGLenum(mode),
++                                            flags,
++                                            static_cast<uint32_t>(sourceByteOffset),
++                                            static_cast<uint32_t>(sourceByteOffset >> 32)};
+     // End the previous render encoder before overwriting this scratch buffer.
+     // Draws and conversions are ordered on the same queue, so MDI needs one
+     // scratch allocation per context rather than one allocation per command.
+diff --git a/src/tests/gl_tests/IndirectCommandTestMetal.mm b/src/tests/gl_tests/IndirectCommandTestMetal.mm
+index 5985c6b..79c8626 100644
+--- a/src/tests/gl_tests/IndirectCommandTestMetal.mm
++++ b/src/tests/gl_tests/IndirectCommandTestMetal.mm
+@@ -6,6 +6,11 @@
+ // not establish public GLES compute or multi-draw-indirect support.
+ 
+ #include "test_utils/ANGLETest.h"
++#include "test_utils/gl_raii.h"
++
++#include <algorithm>
++#include <array>
++#include <vector>
+ 
+ #include <cstddef>
+ #include <cstring>
+@@ -237,6 +242,250 @@ void runCommands(bool replaceStorage)
+     }
+ };
+ 
++// Ordinary GLES 3.0 draws must use the specified provoking vertex even when
++// their topology or index representation needs emulation. The reference uses
++// independent primitive-list assembly, never the fan/loop backend being tested.
++TEST_P(IndirectCommandTestMetal, DirectPrimitiveConversionAndIncompleteDraws)
++{
++    ASSERT_TRUE(EnsureGLExtensionEnabled("GL_ANGLE_provoking_vertex"));
++    constexpr char vertex[]   = R"(#version 300 es
++        layout(location=0) in vec2 position;
++        uniform bool buffered;
++        flat out int identity;
++        void main() {
++            int i=(gl_VertexID==255 || gl_VertexID==65535) ? 11 : gl_VertexID;
++            vec2 p=vec2(float(i%4)*.5-.75,float((i/4)%4)*.5-.75);
++            gl_Position=vec4((buffered ? position : p)+vec2(float(gl_InstanceID)*.03,0),0,1);
++            gl_PointSize=1.; identity=i;
++        }
++    )";
++    constexpr char fragment[] = R"(#version 300 es
++        precision highp float;
++        flat in int identity;
++        out vec4 color;
++        void main() { color=vec4(float(identity&3)/3.,float((identity>>2)&3)/3.,1,.5); }
++    )";
++    ANGLE_GL_PROGRAM(program, vertex, fragment);
++    glUseProgram(program);
++    GLTexture color;
++    GLFramebuffer framebuffer;
++    glBindTexture(GL_TEXTURE_2D, color);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 16, 16);
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color, 0);
++    ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++    glViewport(0, 0, 16, 16);
++    glEnable(GL_BLEND);
++    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++    glEnable(GL_CULL_FACE);
++    glCullFace(GL_BACK);
++    GLBuffer source, reference, vertices;
++    std::vector<float> positions(2 * 65536);
++    for (size_t index = 0; index < 65536; ++index)
++    {
++        const size_t identity    = (index == 255 || index == 65535) ? 11 : index;
++        positions[2 * index]     = float(identity % 4) * .5f - .75f;
++        positions[2 * index + 1] = float((identity / 4) % 4) * .5f - .75f;
++    }
++    glBindBuffer(GL_ARRAY_BUFFER, vertices);
++    glBufferData(GL_ARRAY_BUFFER, positions.size() * sizeof(float), positions.data(),
++                 GL_STATIC_DRAW);
++    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
++    constexpr std::array<uint32_t, 14> pattern = {
++        UINT32_MAX, 1, 2, 3, UINT32_MAX, UINT32_MAX, 5, 6, 7, 8, UINT32_MAX, 9, 10, UINT32_MAX};
++    size_t compared = 0;
++    for (bool buffered : {false, true})
++    {
++        for (GLenum mode : {GL_POINTS, GL_LINES, GL_LINE_LOOP, GL_LINE_STRIP, GL_TRIANGLES,
++                            GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN})
++        {
++            for (uint32_t representation = 0; representation < 7; ++representation)
++            {
++                for (bool restarting : {false, true})
++                {
++                    for (bool last : {false, true})
++                    {
++                        glUniform1i(glGetUniformLocation(program, "buffered"), buffered ? 1 : 0);
++                        if (buffered)
++                        {
++                            glEnableVertexAttribArray(0);
++                        }
++                        else
++                        {
++                            glDisableVertexAttribArray(0);
++                        }
++                        const bool arrays       = representation == 0;
++                        const bool client       = representation >= 4;
++                        const uint32_t width    = arrays ? 0u : 1u << ((representation - 1) % 3);
++                        const GLenum type       = width == 1   ? GL_UNSIGNED_BYTE
++                                                  : width == 2 ? GL_UNSIGNED_SHORT
++                                                               : GL_UNSIGNED_INT;
++                        const uint32_t sentinel = width == 1   ? 0xffu
++                                                  : width == 2 ? 0xffffu
++                                                               : UINT32_MAX;
++                        std::vector<uint32_t> input;
++                        const size_t prefix = client ? 3u : 3u * width;
++                        std::vector<uint8_t> bytes(prefix + 14 * width + 5, 0xcdu);
++                        for (size_t i = 0; i < pattern.size(); ++i)
++                        {
++                            uint32_t value = arrays ? static_cast<uint32_t>(i) + 3u : pattern[i];
++                            if (!arrays && value == UINT32_MAX)
++                            {
++                                value = restarting || width < 4 ? sentinel : 12u;
++                            }
++                            input.push_back(value);
++                            for (uint32_t byte = 0; byte < width; ++byte)
++                            {
++                                bytes[prefix + i * width + byte] =
++                                    static_cast<uint8_t>(value >> (8 * byte));
++                            }
++                        }
++                        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, source);
++                        glBufferData(GL_ELEMENT_ARRAY_BUFFER, bytes.size(), bytes.data(),
++                                     GL_STATIC_DRAW);
++                        for (GLsizei count : {0, 1, 2, 3, 4, 14})
++                        {
++                            for (GLsizei instances : {1, 2})
++                            {
++                                SCOPED_TRACE(testing::Message()
++                                             << "mode=" << mode << " buffered=" << buffered
++                                             << " source=" << representation
++                                             << " restart=" << restarting << " last=" << last
++                                             << " count=" << count << " instances=" << instances);
++                                std::vector<uint32_t> list, segment;
++                                auto emitSegment = [&]() {
++                                    auto line = [&](uint32_t a, uint32_t b) {
++                                        list.push_back(last ? b : a);
++                                        list.push_back(last ? a : b);
++                                    };
++                                    auto triangle = [&](uint32_t a, uint32_t b, uint32_t c,
++                                                        uint32_t provoking) {
++                                        const uint32_t vertices[3] = {a, b, c};
++                                        for (uint32_t corner = 0; corner < 3; ++corner)
++                                        {
++                                            list.push_back(vertices[(provoking + corner) % 3]);
++                                        }
++                                    };
++                                    for (size_t i = 0; i < segment.size(); ++i)
++                                    {
++                                        switch (mode)
++                                        {
++                                            case GL_POINTS:
++                                                list.push_back(segment[i]);
++                                                break;
++                                            case GL_LINES:
++                                                if (i % 2)
++                                                {
++                                                    line(segment[i - 1], segment[i]);
++                                                }
++                                                break;
++                                            case GL_LINE_LOOP:
++                                            case GL_LINE_STRIP:
++                                                if (i)
++                                                {
++                                                    line(segment[i - 1], segment[i]);
++                                                }
++                                                break;
++                                            case GL_TRIANGLES:
++                                                if (i % 3 == 2)
++                                                {
++                                                    triangle(segment[i - 2], segment[i - 1],
++                                                             segment[i], last ? 2u : 0u);
++                                                }
++                                                break;
++                                            case GL_TRIANGLE_STRIP:
++                                                if (i >= 2)
++                                                {
++                                                    triangle(segment[i % 2 ? i - 1 : i - 2],
++                                                             segment[i % 2 ? i - 2 : i - 1],
++                                                             segment[i],
++                                                             last    ? 2u
++                                                             : i % 2 ? 1u
++                                                                     : 0u);
++                                                }
++                                                break;
++                                            case GL_TRIANGLE_FAN:
++                                                if (i >= 2)
++                                                {
++                                                    triangle(segment[0], segment[i - 1], segment[i],
++                                                             last ? 2u : 1u);
++                                                }
++                                                break;
++                                        }
++                                    }
++                                    if (mode == GL_LINE_LOOP && segment.size() > 1)
++                                    {
++                                        line(segment.back(), segment.front());
++                                    }
++                                    segment.clear();
++                                };
++                                for (GLsizei i = 0; i < count; ++i)
++                                {
++                                    if (!arrays && restarting && input[i] == sentinel)
++                                    {
++                                        emitSegment();
++                                    }
++                                    else
++                                    {
++                                        segment.push_back(input[i]);
++                                    }
++                                }
++                                emitSegment();
++                                glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
++                                glProvokingVertexANGLE(GL_FIRST_VERTEX_CONVENTION_ANGLE);
++                                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, reference);
++                                glBufferData(GL_ELEMENT_ARRAY_BUFFER,
++                                             std::max<size_t>(4, list.size() * 4),
++                                             list.empty() ? nullptr : list.data(), GL_STATIC_DRAW);
++                                glClearColor(0, 0, 1, 1);
++                                glClear(GL_COLOR_BUFFER_BIT);
++                                const GLenum nativeMode = mode == GL_POINTS      ? GL_POINTS
++                                                          : mode >= GL_TRIANGLES ? GL_TRIANGLES
++                                                                                 : GL_LINES;
++                                if (!list.empty())
++                                {
++                                    glDrawElementsInstanced(nativeMode, list.size(),
++                                                            GL_UNSIGNED_INT, nullptr, instances);
++                                }
++                                std::array<GLColor, 256> expected, actual;
++                                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE,
++                                             expected.data());
++                                glClear(GL_COLOR_BUFFER_BIT);
++                                if (restarting)
++                                {
++                                    glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
++                                }
++                                glProvokingVertexANGLE(last ? GL_LAST_VERTEX_CONVENTION_ANGLE
++                                                            : GL_FIRST_VERTEX_CONVENTION_ANGLE);
++                                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, client ? 0u : source.get());
++                                if (arrays)
++                                {
++                                    glDrawArraysInstanced(mode, 3, count, instances);
++                                }
++                                else
++                                {
++                                    glDrawElementsInstanced(
++                                        mode, count, type,
++                                        client ? static_cast<const void *>(bytes.data() + prefix)
++                                               : reinterpret_cast<const void *>(prefix),
++                                        instances);
++                                }
++                                ASSERT_GL_NO_ERROR();
++                                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE,
++                                             actual.data());
++                                ASSERT_EQ(actual, expected);
++                                ++compared;
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++    RecordProperty("ComparedDirectFrames", compared);
++    EXPECT_EQ(compared, 4704u);
++}
++
+ TEST_P(IndirectCommandTestMetal, ReuseGPUGeneratedArguments)
+ {
+     runCommands(false);

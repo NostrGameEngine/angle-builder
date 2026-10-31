@@ -1,0 +1,2155 @@
+diff --git a/src/compiler.gni b/src/compiler.gni
+index c4bffb7..d4d0533 100644
+--- a/src/compiler.gni
++++ b/src/compiler.gni
+@@ -380,6 +380,8 @@ angle_translator_lib_msl_sources = [
+   "src/compiler/translator/msl/RewritePipelines.cpp",
+   "src/compiler/translator/msl/RewritePipelines.h",
+   "src/compiler/translator/msl/SkippingTraverser.h",
++  "src/compiler/translator/msl/StorageBuffer.cpp",
++  "src/compiler/translator/msl/StorageBuffer.h",
+   "src/compiler/translator/msl/SymbolEnv.cpp",
+   "src/compiler/translator/msl/SymbolEnv.h",
+   "src/compiler/translator/msl/ToposortStructs.cpp",
+diff --git a/src/compiler/translator/msl/DriverUniformMetal.cpp b/src/compiler/translator/msl/DriverUniformMetal.cpp
+index 85a71f7..3ef26ff 100644
+--- a/src/compiler/translator/msl/DriverUniformMetal.cpp
++++ b/src/compiler/translator/msl/DriverUniformMetal.cpp
+@@ -8,6 +8,7 @@
+ //
+ 
+ #include "compiler/translator/msl/DriverUniformMetal.h"
++#include "compiler/translator/msl/StorageBuffer.h"
+ #include "compiler/translator/tree_util/BuiltIn.h"
+ #include "compiler/translator/tree_util/DriverUniform.h"
+ #include "compiler/translator/tree_util/IntermNode_util.h"
+@@ -60,6 +61,21 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
+     return driverFieldList;
+ }
+ 
++TFieldList *DriverUniformMetal::createComputeUniformFields(TSymbolTable *symbolTable)
++{
++    auto *fields = DriverUniform::createComputeUniformFields(symbolTable);
++    auto *sizes  = new TType(EbtUInt, EbpHigh, EvqGlobal);
++    sizes->makeArray(kMetalComputeStorageBuffers);
++    fields->push_back(new TField(sizes, ImmutableString("storageBufferSizes"), TSourceLoc(),
++                                 SymbolType::AngleInternal));
++    return fields;
++}
++
++TIntermTyped *DriverUniformMetal::getStorageBufferSizes() const
++{
++    return createDriverUniformRef("storageBufferSizes");
++}
++
+ TIntermTyped *DriverUniformMetal::getCoverageMaskField() const
+ {
+     return createDriverUniformRef(kCoverageMask);
+diff --git a/src/compiler/translator/msl/DriverUniformMetal.h b/src/compiler/translator/msl/DriverUniformMetal.h
+index 638a83f..3df899b 100644
+--- a/src/compiler/translator/msl/DriverUniformMetal.h
++++ b/src/compiler/translator/msl/DriverUniformMetal.h
+@@ -25,9 +25,11 @@ class DriverUniformMetal : public DriverUniformExtended
+     ~DriverUniformMetal() override {}
+ 
+     TIntermTyped *getCoverageMaskField() const;
++    TIntermTyped *getStorageBufferSizes() const;
+ 
+   protected:
+     TFieldList *createUniformFields(TSymbolTable *symbolTable) override;
++    TFieldList *createComputeUniformFields(TSymbolTable *symbolTable) override;
+ };
+ 
+ }  // namespace sh
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 14ef7f7..adcc9ae 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -87,6 +87,7 @@ class GenMetalTraverser : public TIntermTraverser
+                       SymbolEnv &symbolEnv,
+                       const ShCompileOptions &compileOptions);
+ 
++    bool storageAccessSupported() const { return mStorageAccessSupported; }
+     void visitSymbol(TIntermSymbol *) override;
+     void visitConstantUnion(TIntermConstantUnion *) override;
+     bool visitSwizzle(Visit, TIntermSwizzle *) override;
+@@ -129,6 +130,7 @@ class GenMetalTraverser : public TIntermTraverser
+         const EmitVariableDeclarationConfig *evdConfig = nullptr;
+     };
+ 
++    bool emitStorageAccess(TIntermTyped *node);
+     void emitIndentation();
+     void emitOpeningPointerParen();
+     void emitClosingPointerParen();
+@@ -203,6 +205,7 @@ class GenMetalTraverser : public TIntermTraverser
+     size_t mDriverUniformsBindingIndex     = 0;
+     size_t mUBOArgumentBufferBindingIndex  = 0;
+     bool mRasterOrderGroupsSupported       = false;
++    bool mStorageAccessSupported           = true;
+ };
+ }  // anonymous namespace
+ 
+@@ -1478,6 +1481,11 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+     ASSERT(type.getBasicType() == TBasicType::EbtStruct);
+     ASSERT(type.isStructSpecifier());
+ 
++    if (mSymbolEnv.isStorageBlock(*type.getStruct()))
++    {
++        mOut << "/* byte-addressed storage block */";
++        return;
++    }
+     mOut << "struct ";
+     emitBareTypeName(type, {});
+ 
+@@ -1554,6 +1562,18 @@ void GenMetalTraverser::emitOrdinaryVariableDeclaration(
+     etConfig.evdConfig = &evdConfig;
+ 
+     const TType &type = decl.type();
++    const auto *storage = decl.isField() ? mSymbolEnv.getStorageBuffer(decl.field())
++                                         : mSymbolEnv.getStorageBuffer(decl.variable());
++    if (storage)
++    {
++        mOut << (storage->readonly ? "const device uchar * " : "device uchar * ");
++        emitNameOf(decl);
++        if (evdConfig.isMainParameter)
++        {
++            mOut << " [[buffer(" << storage->index << ")]]";
++        }
++        return;
++    }
+     if (type.getQualifier() == TQualifier::EvqShared)
+     {
+         ASSERT(!evdConfig.isParameter);
+@@ -1760,6 +1780,10 @@ void GenMetalTraverser::visitConstantUnion(TIntermConstantUnion *constValueNode)
+ 
+ bool GenMetalTraverser::visitSwizzle(Visit, TIntermSwizzle *swizzleNode)
+ {
++    if (emitStorageAccess(swizzleNode))
++    {
++        return false;
++    }
+     groupedTraverse(*swizzleNode->getOperand());
+     mOut << ".";
+ 
+@@ -1807,8 +1831,76 @@ const TField &GenMetalTraverser::getDirectField(const TIntermTyped &fieldsNode,
+     return getDirectField(*fieldListCollection, index);
+ }
+ 
++bool GenMetalTraverser::emitStorageAccess(TIntermTyped *node)
++{
++    StorageBufferAccess access;
++    if (!GetStorageBufferAccess(node, mSymbolEnv, &access) || access.base == node)
++    {
++        return false;
++    }
++    const TType &type = node->getType();
++    if (type.isArray() || type.getStruct() || type.isMatrix() ||
++        (type.isVector() && access.componentStride != 4))
++    {
++        // Aggregate loads/stores and row-major column values need explicit
++        // gather/scatter lowering. Never silently use the native Metal layout.
++        mStorageAccessSupported = false;
++        mOut << "0 /* unsupported storage aggregate access */";
++        return true;
++    }
++    auto *parent       = getParentNode();
++    const auto *binary = parent ? parent->getAsBinaryNode() : nullptr;
++    const bool write   = binary && binary->getLeft() == node && IsAssignment(binary->getOp());
++    const bool vector3 = type.isVector() && type.getNominalSize() == 3;
++    auto *call         = parent ? parent->getAsAggregate() : nullptr;
++    const TFunction *function   = call ? call->getFunction() : nullptr;
++    const bool storageReference = function && function->symbolType() == SymbolType::AngleInternal &&
++                                  (function->name().beginsWith("storage_out<") ||
++                                   function->name().beginsWith("storage_inout<"));
++    const bool cast = (vector3 || type.getBasicType() == EbtBool) && !write && !storageReference &&
++                      !(parent && parent->getAsSwizzleNode());
++    if (cast)
++    {
++        emitType(type, {});
++        mOut << "(";
++    }
++    mOut << "(*reinterpret_cast<";
++    if (access.buffer->readonly)
++    {
++        mOut << "const ";
++    }
++    mOut << "device ";
++    TType memoryType(type);
++    if (memoryType.getBasicType() == EbtBool)
++    {
++        memoryType.setBasicType(EbtUInt);
++    }
++    EmitVariableDeclarationConfig config;
++    config.isPacked = vector3;
++    emitType(memoryType, EmitTypeConfig{&config});
++    mOut << " *>((";
++    groupedTraverse(*access.base);
++    mOut << ") + " << access.offset << "u";
++    for (const auto &index : access.indices)
++    {
++        mOut << " + size_t(";
++        groupedTraverse(*index.first);
++        mOut << ") * " << index.second << "u";
++    }
++    mOut << "))";
++    if (cast)
++    {
++        mOut << ")";
++    }
++    return true;
++}
++
+ bool GenMetalTraverser::visitBinary(Visit, TIntermBinary *binaryNode)
+ {
++    if (emitStorageAccess(binaryNode))
++    {
++        return false;
++    }
+     const TOperator op      = binaryNode->getOp();
+     TIntermTyped &leftNode  = *binaryNode->getLeft();
+     TIntermTyped &rightNode = *binaryNode->getRight();
+@@ -2881,6 +2973,12 @@ bool sh::EmitMetal(TCompiler &compiler,
+         GenMetalTraverser gen(compiler, outWrapper, idGen, pipelineStructs, symbolEnv,
+                               compileOptions);
+         root.traverse(&gen);
++        if (!gen.storageAccessSupported())
++        {
++            compiler.getInfoSink().info << "Metal storage aggregate loads/stores require "
++                                           "gather/scatter lowering.\n";
++            return false;
++        }
+     }
+ 
+     out << "\n";
+diff --git a/src/compiler/translator/msl/Pipeline.cpp b/src/compiler/translator/msl/Pipeline.cpp
+index 4ed6164..279c964 100644
+--- a/src/compiler/translator/msl/Pipeline.cpp
++++ b/src/compiler/translator/msl/Pipeline.cpp
+@@ -157,7 +157,14 @@ bool Pipeline::uses(const TVariable &var) const
+                     return false;
+             }
+ 
++        case Type::StorageBuffers:
++            return symbolEnv && symbolEnv->getStorageBuffer(var);
++
+         case Type::UniformBuffer:
++            if (symbolEnv && symbolEnv->getStorageBuffer(var))
++            {
++                return false;
++            }
+             switch (qualifier)
+             {
+                 case TQualifier::EvqBuffer:
+@@ -218,6 +225,9 @@ Name Pipeline::getStructTypeName(Variant variant) const
+         case Type::SharedGlobals:
+             name = VARIANT_NAME(variant, "SharedGlobals");
+             break;
++        case Type::StorageBuffers:
++            name = VARIANT_NAME(variant, "StorageBuffers");
++            break;
+         case Type::Texture:
+             name = VARIANT_NAME(variant, "TextureEnvs");
+             break;
+@@ -274,6 +284,9 @@ Name Pipeline::getStructInstanceName(Variant variant) const
+         case Type::SharedGlobals:
+             name = VARIANT_NAME(variant, "sharedGlobals");
+             break;
++        case Type::StorageBuffers:
++            name = VARIANT_NAME(variant, "storageBuffers");
++            break;
+         case Type::Texture:
+             name = VARIANT_NAME(variant, "textureEnvs");
+             break;
+@@ -311,6 +324,7 @@ static bool AllowPadding(Pipeline::Type type)
+         case Type::InvocationComputeGlobals:
+             return true;
+ 
++        case Type::StorageBuffers:
+         case Type::SharedGlobals:
+         case Type::UserUniforms:
+         case Type::Texture:
+@@ -446,6 +460,7 @@ ModifyStructConfig Pipeline::externalStructModifyConfig() const
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
+         case Type::InvocationComputeGlobals:
++        case Type::StorageBuffers:
+         case Type::SharedGlobals:
+         case Type::Texture:
+         case Type::Image:
+@@ -474,6 +489,7 @@ bool Pipeline::alwaysRequiresLocalVariableDeclarationInMain() const
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
+         case Type::InvocationComputeGlobals:
++        case Type::StorageBuffers:
+         case Type::SharedGlobals:
+         case Type::Texture:
+         case Type::InstanceId:
+@@ -493,6 +509,7 @@ bool Pipeline::isPipelineOut() const
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
+         case Type::InvocationComputeGlobals:
++        case Type::StorageBuffers:
+         case Type::SharedGlobals:
+         case Type::Texture:
+         case Type::Image:
+@@ -513,6 +530,7 @@ AddressSpace Pipeline::externalAddressSpace() const
+         case Type::SharedGlobals:
+             return AddressSpace::Threadgroup;
+ 
++        case Type::StorageBuffers:
+         case Type::VertexIn:
+         case Type::FragmentIn:
+         case Type::NonConstantGlobals:
+@@ -547,6 +565,7 @@ bool PipelineStructs::matches(const TStructure &s, bool internal, bool external)
+         invocationFragmentGlobals,
+         invocationComputeGlobals,
+         sharedGlobals,
++        storageBuffers,
+         uniformBuffers,
+         texture,
+         instanceId,
+diff --git a/src/compiler/translator/msl/Pipeline.h b/src/compiler/translator/msl/Pipeline.h
+index f3a7dd4..83c5c96 100644
+--- a/src/compiler/translator/msl/Pipeline.h
++++ b/src/compiler/translator/msl/Pipeline.h
+@@ -61,6 +61,7 @@ class Pipeline
+         InvocationFragmentGlobals,
+         InvocationComputeGlobals,
+         SharedGlobals,
++        StorageBuffers,
+         UniformBuffer,
+         Texture,
+         Image,
+@@ -84,6 +85,7 @@ class Pipeline
+     // Non-null if a global instance of the pipeline struct already exists.
+     // If non-null struct splitting should not be needed.
+     const TVariable *globalInstanceVar;
++    const SymbolEnv *symbolEnv = nullptr;
+ 
+   public:
+     // Returns true iff the variable belongs to the pipeline.
+@@ -122,6 +124,7 @@ struct PipelineStructs : angle::NonCopyable
+     PipelineScoped<TStructure> invocationFragmentGlobals;
+     PipelineScoped<TStructure> invocationComputeGlobals;
+     PipelineScoped<TStructure> sharedGlobals;
++    PipelineScoped<TStructure> storageBuffers;
+     PipelineScoped<TStructure> uniformBuffers;
+     PipelineScoped<TStructure> texture;
+     PipelineScoped<TStructure> image;
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 072ad74..9366c74 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -290,6 +290,7 @@ class ProgramPrelude : public TIntermTraverser
+     void imageLoad();
+     void imageStore();
+     void memoryBarrierImage();
++    void storageArgument();
+     void barrier();
+     void interpolateAtCenter();
+     void interpolateAtCentroid();
+@@ -1156,6 +1157,34 @@ ANGLE_ALWAYS_INLINE ANGLE_SwizzleRef<T, N, 4> ANGLE_swizzle_ref(thread metal::ve
+ )",
+                         vectorElemRef())
+ 
++// Copy in/out through thread storage without changing the device allocation's
++// GLSL layout. Logical can be a native vector/bool while Physical is packed/uint.
++PROGRAM_PRELUDE_DECLARE(storageArgument, R"(
++template <typename Logical, typename Physical>
++struct ANGLE_StorageArgument
++{
++    Logical value;
++    device Physical &destination;
++    ANGLE_StorageArgument(device Physical &dest, bool copyIn)
++        : value{}, destination(dest)
++    {
++        if (copyIn) value = Logical(dest);
++    }
++    ~ANGLE_StorageArgument() { destination = Physical(value); }
++    operator thread Logical &() thread { return value; }
++};
++template <typename Logical, typename Physical>
++ANGLE_ALWAYS_INLINE ANGLE_StorageArgument<Logical, Physical> ANGLE_storage_out(device Physical &dest)
++{
++    return ANGLE_StorageArgument<Logical, Physical>(dest, false);
++}
++template <typename Logical, typename Physical>
++ANGLE_ALWAYS_INLINE ANGLE_StorageArgument<Logical, Physical> ANGLE_storage_inout(device Physical &dest)
++{
++    return ANGLE_StorageArgument<Logical, Physical>(dest, true);
++}
++)")
++
+ PROGRAM_PRELUDE_DECLARE(out, R"(
+ template <typename T>
+ struct ANGLE_Out
+@@ -3039,6 +3068,8 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+     putAngle("flatten", EMIT_METHOD(flattenArray));
+     putAngle("inout", EMIT_METHOD(inout));
+     putAngle("out", EMIT_METHOD(out));
++    putAngle("storage_out<>", EMIT_METHOD(storageArgument));
++    putAngle("storage_inout<>", EMIT_METHOD(storageArgument));
+     putAngle("swizzle_ref", EMIT_METHOD(swizzleRef));
+ 
+     putBuiltIn("texelFetch", [](ProgramPrelude &pp, const TFunction &func) {
+diff --git a/src/compiler/translator/msl/RewritePipelines.cpp b/src/compiler/translator/msl/RewritePipelines.cpp
+index a7dbf56..e4a1f11 100644
+--- a/src/compiler/translator/msl/RewritePipelines.cpp
++++ b/src/compiler/translator/msl/RewritePipelines.cpp
+@@ -148,6 +148,7 @@ class GeneratePipelineStruct : private TIntermRebuild
+         // Shared storage has no external ABI and must never be copied into per-thread storage.
+         const bool modified =
+             mPipeline.type != Pipeline::Type::SharedGlobals &&
++            mPipeline.type != Pipeline::Type::StorageBuffers &&
+             TryCreateModifiedStruct(mCompiler, mSymbolEnv, mIdGen,
+                                     mPipeline.externalStructModifyConfig(), pipelineStruct,
+                                     mPipeline.getStructTypeName(Pipeline::Variant::Modified),
+@@ -313,6 +314,10 @@ class GeneratePipelineStruct : private TIntermRebuild
+                         type.setInvariant(true);
+                     }
+                     auto *field = new TField(&type, var->name(), kNoSourceLoc, var->symbolType());
++                    if (const auto *storage = mSymbolEnv.getStorageBuffer(*var))
++                    {
++                        mSymbolEnv.markStorageBuffer(*field, *storage);
++                    }
+                     fields.push_back(field);
+                 }
+             }
+@@ -488,6 +493,19 @@ class PipelineFunctionEnv
+                 }
+                 newFunc = &CloneFunctionAndAppendParams(mSymbolTable, nullptr, func, variables);
+             }
++            else if (isMain && mPipeline.type == Pipeline::Type::StorageBuffers)
++            {
++                std::vector<const TVariable *> variables;
++                for (const TField *field : mPipelineStruct.external->fields())
++                {
++                    const Name name = mIdGen.createNewName({field->name()});
++                    auto *var       = new TVariable(&mSymbolTable, name.rawName(), field->type(),
++                                                    name.symbolType());
++                    mSymbolEnv.markStorageBuffer(*var, *mSymbolEnv.getStorageBuffer(*field));
++                    variables.push_back(var);
++                }
++                newFunc = &CloneFunctionAndAppendParams(mSymbolTable, nullptr, func, variables);
++            }
+             else if (isMain && mPipeline.type == Pipeline::Type::Texture)
+             {
+                 std::vector<const TVariable *> variables;
+@@ -823,7 +841,25 @@ class UpdatePipelineFunctions : private TIntermRebuild
+             ASSERT(mPipelineMainLocalVar.isTotallyFull());
+ 
+             auto *newBody = new TIntermBlock();
+-            newBody->appendStatement(new TIntermDeclaration{mPipelineMainLocalVar.internal});
++            if (mPipeline.type == Pipeline::Type::StorageBuffers)
++            {
++                auto *arguments = new TIntermSequence;
++                size_t index    = mEnv.getFirstParamIdxInMainFn();
++                for (const TField *field : mPipelineStruct.internal->fields())
++                {
++                    (void)field;
++                    arguments->push_back(new TIntermSymbol(func.getParam(index++)));
++                }
++                auto *constructor = TIntermAggregate::CreateConstructor(
++                    TType(mPipelineStruct.internal, false), arguments);
++                newBody->appendStatement(new TIntermDeclaration{new TIntermBinary(
++                    EOpInitialize, new TIntermSymbol(mPipelineMainLocalVar.internal),
++                    constructor)});
++            }
++            else
++            {
++                newBody->appendStatement(new TIntermDeclaration{mPipelineMainLocalVar.internal});
++            }
+ 
+             if (mPipeline.type == Pipeline::Type::InvocationVertexGlobals)
+             {
+@@ -1048,7 +1084,28 @@ bool RewritePipeline(TCompiler &compiler,
+         return false;
+     }
+ 
+-    if (!pipeline.globalInstanceVar)
++    if (pipeline.globalInstanceVar && compiler.getShaderType() == GL_COMPUTE_SHADER)
++    {
++        // Graphics historically relies on textual driver-uniform renaming.
++        // Compute keeps AST reference validation enabled and must use the actual
++        // parameter variable, including references introduced for storage lengths.
++        if (!MapSymbols(compiler, root,
++                        [&](const TFunction *owner, TIntermSymbol &symbol) -> TIntermNode & {
++                            if (!owner || &symbol.variable() != pipeline.globalInstanceVar)
++                            {
++                                return symbol;
++                            }
++                            const TVariable *instance =
++                                owner->isMain() && pipelineMainLocalVar.internal
++                                    ? pipelineMainLocalVar.internal
++                                    : owner->getParam(0);
++                            return *new TIntermSymbol(instance);
++                        }))
++        {
++            return false;
++        }
++    }
++    else if (!pipeline.globalInstanceVar)
+     {
+         if (!UpdatePipelineSymbols(pipeline.type, compiler, root, symbolEnv, psi.pipelineVariables,
+                                    pipelineMainLocalVar))
+@@ -1091,6 +1148,7 @@ bool sh::RewritePipelines(TCompiler &compiler,
+         {Pipeline::Type::Image, outStructs.texture, nullptr, nullptr},
+         {Pipeline::Type::NonConstantGlobals, outStructs.nonConstantGlobals, nullptr, nullptr},
+         {Pipeline::Type::SharedGlobals, outStructs.sharedGlobals, nullptr, nullptr},
++        {Pipeline::Type::StorageBuffers, outStructs.storageBuffers, nullptr, nullptr},
+         {Pipeline::Type::AngleUniforms, outStructs.angleUniforms,
+          angleUniformsGlobalInstanceVar.getDriverUniformsVariable(), nullptr},
+         {Pipeline::Type::UserUniforms, outStructs.userUniforms, nullptr, nullptr},
+@@ -1124,7 +1182,7 @@ bool sh::RewritePipelines(TCompiler &compiler,
+             continue;
+         }
+ 
+-        Pipeline pipeline{info.pipelineType, info.globalInstanceVar};
++        Pipeline pipeline{info.pipelineType, info.globalInstanceVar, &symbolEnv};
+         if (!RewritePipeline(compiler, root, idGen, pipeline, symbolEnv, info.variableInfo,
+                              info.outStruct))
+         {
+diff --git a/src/compiler/translator/msl/StorageBuffer.cpp b/src/compiler/translator/msl/StorageBuffer.cpp
+new file mode 100644
+index 0000000..c10cbb1
+--- /dev/null
++++ b/src/compiler/translator/msl/StorageBuffer.cpp
+@@ -0,0 +1,350 @@
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "compiler/translator/msl/StorageBuffer.h"
++#include <limits>
++#include "compiler/translator/IntermRebuild.h"
++#include "compiler/translator/msl/DriverUniformMetal.h"
++#include "compiler/translator/msl/SymbolEnv.h"
++#include "compiler/translator/tree_util/IntermNode_util.h"
++
++namespace sh
++{
++namespace
++{
++size_t Aligned(size_t size, size_t alignment)
++{
++    return (size + alignment - 1) / alignment * alignment;
++}
++
++Layout StructLayout(const TFieldList &fields,
++                    TLayoutBlockStorage storage,
++                    TLayoutMatrixPacking packing,
++                    size_t count)
++{
++    Layout result = {0, storage == EbsStd140 ? 16u : 1u};
++    for (size_t i = 0; i < count; ++i)
++    {
++        Layout field   = StorageBufferLayout(*fields[i]->type(), storage, packing);
++        result.sizeOf  = Aligned(result.sizeOf, field.alignOf) + field.sizeOf;
++        result.alignOf = std::max(result.alignOf, field.alignOf);
++    }
++    return result;
++}
++}  // namespace
++
++size_t StorageBufferArrayStride(const TType &type,
++                                TLayoutBlockStorage storage,
++                                TLayoutMatrixPacking packing)
++{
++    TType element(type);
++    element.toArrayElementType();
++    Layout layout    = StorageBufferLayout(element, storage, packing);
++    size_t alignment = storage == EbsStd140 ? std::max(size_t(16), layout.alignOf) : layout.alignOf;
++    return Aligned(layout.sizeOf, alignment);
++}
++
++Layout StorageBufferLayout(const TType &type,
++                           TLayoutBlockStorage storage,
++                           TLayoutMatrixPacking packing)
++{
++    storage = Overlay(storage, type);
++    packing = Overlay(packing, type);
++    if (type.isArray())
++    {
++        TType element(type);
++        element.toArrayElementType();
++        Layout layout = StorageBufferLayout(element, storage, packing);
++        if (storage == EbsStd140)
++        {
++            layout.alignOf = std::max(size_t(16), layout.alignOf);
++        }
++        layout.sizeOf = Aligned(layout.sizeOf, layout.alignOf) * type.getOutermostArraySize();
++        return layout;
++    }
++    if (const TStructure *structure = type.getStruct())
++    {
++        Layout layout =
++            StructLayout(structure->fields(), storage, packing, structure->fields().size());
++        layout.sizeOf = Aligned(layout.sizeOf, layout.alignOf);
++        return layout;
++    }
++    if (type.isMatrix())
++    {
++        size_t width     = packing == EmpRowMajor ? type.getCols() : type.getRows();
++        size_t vectors   = packing == EmpRowMajor ? type.getRows() : type.getCols();
++        size_t alignment = width == 2 ? 8 : 16;
++        if (storage == EbsStd140)
++        {
++            alignment = 16;
++        }
++        return {vectors * Aligned(width * 4, alignment), alignment};
++    }
++    size_t width = type.getNominalSize();
++    // vec3 occupies 12 bytes, but starts at a 16-byte boundary. Treating its
++    // size as 16 would move a following scalar and break storage aliasing.
++    return {width * 4, width == 3 ? 16 : width * 4};
++}
++
++bool GetStorageBufferAccess(TIntermTyped *node, const SymbolEnv &env, StorageBufferAccess *access)
++{
++    if (auto *swizzle = node->getAsSwizzleNode())
++    {
++        if (swizzle->getSwizzleOffsets().size() != 1 ||
++            !GetStorageBufferAccess(swizzle->getOperand(), env, access))
++        {
++            return false;
++        }
++        access->offset += swizzle->getSwizzleOffsets()[0] * access->componentStride;
++        access->componentStride = 4;
++        return true;
++    }
++    if (auto *symbol = node->getAsSymbolNode())
++    {
++        if (const auto *info = env.getStorageBuffer(symbol->variable()))
++        {
++            access->buffer  = info;
++            access->base    = node;
++            access->storage = info->storage;
++            access->packing = info->packing;
++            return true;
++        }
++        return false;
++    }
++    auto *binary = node->getAsBinaryNode();
++    if (!binary)
++    {
++        return false;
++    }
++    TOperator op = binary->getOp();
++    if (op != EOpIndexDirectStruct && op != EOpIndexDirectInterfaceBlock && op != EOpIndexDirect &&
++        op != EOpIndexIndirect)
++    {
++        return false;
++    }
++    const TType &leftType = binary->getLeft()->getType();
++    if (op == EOpIndexDirectStruct)
++    {
++        const auto &fields = leftType.getStruct()->fields();
++        size_t index       = binary->getRight()->getAsConstantUnion()->getIConst(0);
++        if (const auto *info = env.getStorageBuffer(*fields[index]))
++        {
++            access->buffer  = info;
++            access->base    = node;
++            access->storage = info->storage;
++            access->packing = info->packing;
++            return true;
++        }
++    }
++    if (!GetStorageBufferAccess(binary->getLeft(), env, access))
++    {
++        return false;
++    }
++    if (op == EOpIndexDirectStruct || op == EOpIndexDirectInterfaceBlock)
++    {
++        const auto &fields = op == EOpIndexDirectStruct ? leftType.getStruct()->fields()
++                                                        : leftType.getInterfaceBlock()->fields();
++        size_t index       = binary->getRight()->getAsConstantUnion()->getIConst(0);
++        const TType &field = *fields[index]->type();
++        Layout previous    = StructLayout(fields, access->storage, access->packing, index);
++        Layout layout      = StorageBufferLayout(field, access->storage, access->packing);
++        access->offset += Aligned(previous.sizeOf, layout.alignOf);
++        access->storage = Overlay(access->storage, field);
++        access->packing = Overlay(access->packing, field);
++    }
++    else
++    {
++        size_t stride;
++        if (leftType.isArray())
++        {
++            stride = StorageBufferArrayStride(leftType, access->storage, access->packing);
++        }
++        else if (leftType.isMatrix())
++        {
++            Layout layout = StorageBufferLayout(leftType, access->storage, access->packing);
++            if (access->packing == EmpRowMajor)
++            {
++                stride                  = 4;
++                access->componentStride = layout.sizeOf / leftType.getRows();
++            }
++            else
++            {
++                stride = layout.sizeOf / leftType.getCols();
++            }
++        }
++        else
++        {
++            stride                  = access->componentStride;
++            access->componentStride = 4;
++        }
++        access->indices.emplace_back(binary->getRight(), stride);
++    }
++    return true;
++}
++namespace
++{
++class LowerArrayLength : public TIntermRebuild
++{
++  public:
++    LowerArrayLength(TCompiler &compiler, SymbolEnv &env, DriverUniformMetal &uniforms)
++        : TIntermRebuild(compiler, true, true), mEnv(env), mUniforms(uniforms)
++    {}
++    bool valid() const { return mValid; }
++
++  private:
++    PostResult visitUnaryPost(TIntermUnary &node) override
++    {
++        if (node.getOp() != EOpArrayLength)
++        {
++            return node;
++        }
++        StorageBufferAccess access;
++        if (!GetStorageBufferAccess(node.getOperand(), mEnv, &access))
++        {
++            return node;
++        }
++        auto *size = new TIntermBinary(EOpIndexDirect, mUniforms.getStorageBufferSizes(),
++                                       CreateIndexNode(static_cast<int>(access.buffer->index)));
++        const size_t stride =
++            StorageBufferArrayStride(node.getOperand()->getType(), access.storage, access.packing);
++        if (!stride || stride > std::numeric_limits<unsigned int>::max() ||
++            access.offset > std::numeric_limits<unsigned int>::max())
++        {
++            mCompiler.getInfoSink().info << "Metal storage array range exceeds 32-bit metadata.\n";
++            mValid = false;
++            return node;
++        }
++        auto *length = new TIntermBinary(
++            EOpDiv,
++            new TIntermBinary(EOpSub, size->deepCopy(),
++                              CreateUIntNode(static_cast<unsigned int>(access.offset))),
++            CreateUIntNode(static_cast<unsigned int>(stride)));
++        auto *clamped = new TIntermTernary(
++            new TIntermBinary(EOpGreaterThanEqual, size,
++                              CreateUIntNode(static_cast<unsigned int>(access.offset))),
++            length, CreateUIntNode(0));
++        return *TIntermAggregate::CreateConstructor(TType(EbtInt, EbpHigh),
++                                                    new TIntermSequence{clamped});
++    }
++    bool mValid = true;
++    SymbolEnv &mEnv;
++    DriverUniformMetal &mUniforms;
++};
++}  // namespace
++
++namespace
++{
++class WrapStorageArguments : public TIntermRebuild
++{
++  public:
++    WrapStorageArguments(TCompiler &compiler, SymbolEnv &env)
++        : TIntermRebuild(compiler, false, true), mEnv(env)
++    {}
++
++  private:
++    PostResult visitBinaryPost(TIntermBinary &node) override
++    {
++        const TType &type = node.getLeft()->getType();
++        StorageBufferAccess access;
++        if (type.isArray() || !type.isVector() || type.getNominalSize() != 3 ||
++            !GetStorageBufferAccess(node.getLeft(), mEnv, &access))
++        {
++            return node;
++        }
++        TOperator operation;
++        switch (node.getOp())
++        {
++            case EOpAddAssign:
++                operation = EOpAdd;
++                break;
++            case EOpSubAssign:
++                operation = EOpSub;
++                break;
++            case EOpMulAssign:
++                operation = EOpMul;
++                break;
++            case EOpDivAssign:
++                operation = EOpDiv;
++                break;
++            case EOpIModAssign:
++                operation = EOpIMod;
++                break;
++            case EOpVectorTimesScalarAssign:
++                operation = EOpVectorTimesScalar;
++                break;
++            case EOpVectorTimesMatrixAssign:
++                operation = EOpVectorTimesMatrix;
++                break;
++            case EOpBitShiftLeftAssign:
++                operation = EOpBitShiftLeft;
++                break;
++            case EOpBitShiftRightAssign:
++                operation = EOpBitShiftRight;
++                break;
++            case EOpBitwiseAndAssign:
++                operation = EOpBitwiseAnd;
++                break;
++            case EOpBitwiseOrAssign:
++                operation = EOpBitwiseOr;
++                break;
++            case EOpBitwiseXorAssign:
++                operation = EOpBitwiseXor;
++                break;
++            default:
++                return node;
++        }
++        // SeparateCompoundExpressions has already hoisted index side effects.
++        // Read as a logical vector and assign back to the packed device value.
++        return *new TIntermBinary(
++            EOpAssign, node.getLeft(),
++            new TIntermBinary(operation, node.getLeft()->deepCopy(), node.getRight()));
++    }
++    PostResult visitAggregatePost(TIntermAggregate &node) override
++    {
++        const TFunction *function = node.getFunction();
++        if (!function || function->symbolType() == SymbolType::AngleInternal)
++        {
++            return node;
++        }
++        auto &arguments = *node.getSequence();
++        for (size_t i = 0; i < arguments.size(); ++i)
++        {
++            TQualifier qualifier = function->getParam(i)->getType().getQualifier();
++            if (qualifier != EvqParamOut && qualifier != EvqParamInOut)
++            {
++                continue;
++            }
++            auto *argument = arguments[i]->getAsTyped();
++            StorageBufferAccess access;
++            if (!GetStorageBufferAccess(argument, mEnv, &access))
++            {
++                continue;
++            }
++            TemplateArg type(argument->getType());
++            arguments[i] = &mEnv.callFunctionOverload(
++                Name(qualifier == EvqParamOut ? "storage_out" : "storage_inout"),
++                argument->getType(), *new TIntermSequence{argument}, 1, &type);
++        }
++        return node;
++    }
++    SymbolEnv &mEnv;
++};
++}  // namespace
++
++bool WrapStorageOutArguments(TCompiler &compiler, TIntermBlock &root, SymbolEnv &env)
++{
++    WrapStorageArguments wrap(compiler, env);
++    return wrap.rebuildRoot(root);
++}
++
++bool LowerStorageArrayLength(TCompiler &compiler,
++                             TIntermBlock &root,
++                             SymbolEnv &env,
++                             DriverUniformMetal &uniforms)
++{
++    LowerArrayLength lower(compiler, env, uniforms);
++    return lower.rebuildRoot(root) && lower.valid();
++}
++
++}  // namespace sh
+diff --git a/src/compiler/translator/msl/StorageBuffer.h b/src/compiler/translator/msl/StorageBuffer.h
+new file mode 100644
+index 0000000..0f6b547
+--- /dev/null
++++ b/src/compiler/translator/msl/StorageBuffer.h
+@@ -0,0 +1,57 @@
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPILER_TRANSLATOR_MSL_STORAGEBUFFER_H_
++#define COMPILER_TRANSLATOR_MSL_STORAGEBUFFER_H_
++
++#include "compiler/translator/IntermNode.h"
++#include "compiler/translator/msl/Layout.h"
++
++namespace sh
++{
++class SymbolEnv;
++class TCompiler;
++class DriverUniformMetal;
++
++// Compute reserves slots 0..7 for storage, 19/17 for default/driver uniforms,
++// and 24 for the UBO argument buffer. GL binding points are resolved at link time.
++constexpr size_t kMetalComputeStorageBuffers = 8;
++
++struct StorageBufferInfo
++{
++    size_t index;
++    TLayoutBlockStorage storage;
++    TLayoutMatrixPacking packing;
++    bool readonly;
++    std::string blockName;
++};
++
++struct StorageBufferAccess
++{
++    const StorageBufferInfo *buffer = nullptr;
++    TIntermTyped *base              = nullptr;
++    size_t offset                   = 0;
++    std::vector<std::pair<TIntermTyped *, size_t>> indices;
++    TLayoutBlockStorage storage  = EbsStd430;
++    TLayoutMatrixPacking packing = EmpColumnMajor;
++    // A row-major matrix column is not contiguous, unlike a GLSL vector.
++    size_t componentStride = 4;
++};
++
++bool WrapStorageOutArguments(TCompiler &compiler, TIntermBlock &root, SymbolEnv &env);
++
++bool LowerStorageArrayLength(TCompiler &compiler,
++                             TIntermBlock &root,
++                             SymbolEnv &env,
++                             DriverUniformMetal &uniforms);
++
++Layout StorageBufferLayout(const TType &type,
++                           TLayoutBlockStorage storage,
++                           TLayoutMatrixPacking packing);
++size_t StorageBufferArrayStride(const TType &type,
++                                TLayoutBlockStorage storage,
++                                TLayoutMatrixPacking packing);
++bool GetStorageBufferAccess(TIntermTyped *node, const SymbolEnv &env, StorageBufferAccess *access);
++}  // namespace sh
++#endif
+diff --git a/src/compiler/translator/msl/SymbolEnv.h b/src/compiler/translator/msl/SymbolEnv.h
+index bc9f84c..c022591 100644
+--- a/src/compiler/translator/msl/SymbolEnv.h
++++ b/src/compiler/translator/msl/SymbolEnv.h
+@@ -13,6 +13,7 @@
+ #include "compiler/translator/Name.h"
+ #include "compiler/translator/Types.h"
+ #include "compiler/translator/msl/Reference.h"
++#include "compiler/translator/msl/StorageBuffer.h"
+ 
+ namespace sh
+ {
+@@ -146,6 +147,21 @@ class SymbolEnv
+ 
+     TSymbolTable &symbolTable() { return mSymbolTable; }
+ 
++    void markStorageBuffer(VarField field, const StorageBufferInfo &info)
++    {
++        mStorageBuffers.emplace(field, info);
++    }
++    const StorageBufferInfo *getStorageBuffer(VarField field) const
++    {
++        auto it = mStorageBuffers.find(field);
++        return it == mStorageBuffers.end() ? nullptr : &it->second;
++    }
++    bool isStorageBlock(const TStructure &structure) const
++    {
++        return mStorageBlocks.count(&structure) != 0;
++    }
++    void markStorageBlock(const TStructure &structure) { mStorageBlocks.insert(&structure); }
++
+     // There exist Angle rewrites that can lead to incoherent structs
+     //
+     // Example
+@@ -219,6 +235,8 @@ class SymbolEnv
+     std::unordered_map<VarField, AddressSpace> mReferences;
+     std::unordered_set<const TField *> mPackedFields;
+     std::unordered_set<VarField> mUboFields;
++    std::unordered_map<VarField, StorageBufferInfo> mStorageBuffers;
++    std::unordered_set<const TStructure *> mStorageBlocks;
+ };
+ 
+ Name GetTextureTypeName(TBasicType samplerType);
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index d50079a..9696f24 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -1344,8 +1344,62 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         return false;
+     }
+ 
+-    if (!ReduceInterfaceBlocks(*this, *root,
+-                               [&idGen]() { return idGen.createNewName().rawName(); }))
++    size_t storageIndex   = 0;
++    bool storageSupported = true;
++    if (!ReduceInterfaceBlocks(
++            *this, *root, [&idGen]() { return idGen.createNewName().rawName(); },
++            [&](const TVariable &oldVar, const TVariable &newVar) {
++                const TType &type = oldVar.getType();
++                if (type.getQualifier() != EvqBuffer)
++                {
++                    return;
++                }
++                if (getShaderType() != GL_COMPUTE_SHADER || type.isArray() ||
++                    storageIndex >= kMetalComputeStorageBuffers)
++                {
++                    getInfoSink().info << "Metal storage blocks currently require a compute stage, "
++                                          "at most eight blocks, and non-array block instances.\n";
++                    storageSupported = false;
++                    return;
++                }
++                StorageBufferInfo info{storageIndex++, type.getLayoutQualifier().blockStorage,
++                                       type.getLayoutQualifier().matrixPacking,
++                                       type.getMemoryQualifier().readonly,
++                                       type.getInterfaceBlock()->name().data()};
++                // Shared/packed layouts use the backend's deterministic std430 layout.
++                if (info.storage != EbsStd140)
++                {
++                    info.storage = EbsStd430;
++                }
++                if (info.packing == EmpUnspecified)
++                {
++                    info.packing = EmpColumnMajor;
++                }
++                const auto &fields = type.getInterfaceBlock()->fields();
++                info.readonly = info.readonly ||
++                                std::all_of(fields.begin(), fields.end(), [](const TField *field) {
++                                    return field->type()->getMemoryQualifier().readonly;
++                                });
++                symbolEnv.markStorageBuffer(newVar, info);
++                symbolEnv.markStorageBlock(*newVar.getType().getStruct());
++                translatorMetalReflection.addStorageBufferBinding(info.blockName, info.index);
++            }))
++    {
++        return false;
++    }
++
++    if (storageIndex && (compileOptions.metal.defaultUniformsBindingIndex <
++                             static_cast<int>(kMetalComputeStorageBuffers) ||
++                         compileOptions.metal.driverUniformsBindingIndex <
++                             static_cast<int>(kMetalComputeStorageBuffers) ||
++                         compileOptions.metal.UBOArgumentBufferBindingIndex <
++                             static_cast<int>(kMetalComputeStorageBuffers)))
++    {
++        getInfoSink().info
++            << "Metal compute uniform bindings overlap the reserved storage slots.\n";
++        return false;
++    }
++    if (!storageSupported || !LowerStorageArrayLength(*this, *root, symbolEnv, *driverUniforms))
+     {
+         return false;
+     }
+@@ -1385,7 +1439,8 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         return false;
+     }
+ 
+-    if (!RewriteUnaddressableReferences(*this, *root, symbolEnv))
++    if (!WrapStorageOutArguments(*this, *root, symbolEnv) ||
++        !RewriteUnaddressableReferences(*this, *root, symbolEnv))
+     {
+         return false;
+     }
+@@ -1421,6 +1476,7 @@ bool TranslatorMSL::translate(TIntermBlock *root,
+         return false;
+     }
+ 
++    translatorMetalReflection.resetStorageBufferBindings();
+     // TODO: refactor the code in TranslatorMSL to not issue raw function calls.
+     // http://anglebug.com/42264589#comment3
+     mValidateASTOptions.validateNoRawFunctionCalls = false;
+diff --git a/src/compiler/translator/msl/TranslatorMSL.h b/src/compiler/translator/msl/TranslatorMSL.h
+index 9f84040..13f7c2b 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.h
++++ b/src/compiler/translator/msl/TranslatorMSL.h
+@@ -145,6 +145,15 @@ class TranslatorMetalReflection
+         return {.bindIndex = std::numeric_limits<size_t>::max(),
+                 .arraySize = std::numeric_limits<size_t>::max()};
+     }
++    void resetStorageBufferBindings() { storageBufferBindings.clear(); }
++    void addStorageBufferBinding(const std::string &name, size_t index)
++    {
++        storageBufferBindings.emplace(name, index);
++    }
++    const std::unordered_map<std::string, size_t> &getStorageBufferBindings() const
++    {
++        return storageBufferBindings;
++    }
+     void reset()
+     {
+         hasUBOs              = false;
+@@ -158,6 +167,7 @@ class TranslatorMetalReflection
+         rwTextureBindings.clear();
+         userUniformBufferBindings.clear();
+         uniformBufferBindings.clear();
++        storageBufferBindings.clear();
+     }
+ 
+     bool hasUBOs              = false;
+@@ -167,6 +177,7 @@ class TranslatorMetalReflection
+     bool hasAttributeAliasing = false;
+ 
+   private:
++    std::unordered_map<std::string, size_t> storageBufferBindings;
+     originalNamesMap originalNames;
+     samplerBindingMap samplerBindings;
+     textureBindingMap textureBindings;
+diff --git a/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.cpp b/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.cpp
+index 8d821f4..07acf72 100644
+--- a/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.cpp
++++ b/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.cpp
+@@ -28,10 +28,15 @@ class Reducer : public TIntermRebuild
+     std::unordered_map<const TInterfaceBlock *, const TVariable *> mLiftedMap;
+     std::unordered_map<const TVariable *, const TVariable *> mInstanceMap;
+     InterfaceBlockInstanceVarNameGen &mInstanceVarNameGen;
++    std::function<void(const TVariable &, const TVariable &)> mOnReduce;
+ 
+   public:
+-    Reducer(TCompiler &compiler, InterfaceBlockInstanceVarNameGen &instanceVarNameGen)
+-        : TIntermRebuild(compiler, true, false), mInstanceVarNameGen(instanceVarNameGen)
++    Reducer(TCompiler &compiler,
++            InterfaceBlockInstanceVarNameGen &instanceVarNameGen,
++            std::function<void(const TVariable &, const TVariable &)> onReduce)
++        : TIntermRebuild(compiler, true, false),
++          mInstanceVarNameGen(instanceVarNameGen),
++          mOnReduce(std::move(onReduce))
+     {}
+ 
+     PreResult visitDeclarationPre(TIntermDeclaration &declNode) override
+@@ -60,13 +65,19 @@ class Reducer : public TIntermRebuild
+                     CreateInstanceVariable(mSymbolTable, structure, newInstanceVarName,
+                                            TQualifier::EvqBuffer, &type.getArraySizes());
+ 
++                if (mOnReduce)
++                {
++                    mOnReduce(var, instanceVar);
++                }
++
+                 if (isEmptySymbol)
+                 {
+                     mLiftedMap[interfaceBlock] = &instanceVar;
+                 }
+                 else
+                 {
+-                    ASSERT(type.getQualifier() == TQualifier::EvqUniform);
++                    ASSERT(type.getQualifier() == TQualifier::EvqUniform ||
++                           type.getQualifier() == TQualifier::EvqBuffer);
+                     mInstanceMap[&var] = &instanceVar;
+                 }
+ 
+@@ -108,9 +119,10 @@ class Reducer : public TIntermRebuild
+ 
+ bool sh::ReduceInterfaceBlocks(TCompiler &compiler,
+                                TIntermBlock &root,
+-                               InterfaceBlockInstanceVarNameGen nameGen)
++                               InterfaceBlockInstanceVarNameGen nameGen,
++                               std::function<void(const TVariable &, const TVariable &)> onReduce)
+ {
+-    Reducer reducer(compiler, nameGen);
++    Reducer reducer(compiler, nameGen, std::move(onReduce));
+     if (!reducer.rebuildRoot(root))
+     {
+         return false;
+diff --git a/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.h b/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.h
+index 6f3bb43..0b041a2 100644
+--- a/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.h
++++ b/src/compiler/translator/tree_ops/ReduceInterfaceBlocks.h
+@@ -26,9 +26,11 @@ using InterfaceBlockInstanceVarNameGen = std::function<ImmutableString()>;
+ //  struct Foo { int x; }; uniform Foo x;
+ //
+ 
+-[[nodiscard]] bool ReduceInterfaceBlocks(TCompiler &compiler,
+-                                         TIntermBlock &root,
+-                                         InterfaceBlockInstanceVarNameGen nameGen);
++[[nodiscard]] bool ReduceInterfaceBlocks(
++    TCompiler &compiler,
++    TIntermBlock &root,
++    InterfaceBlockInstanceVarNameGen nameGen,
++    std::function<void(const TVariable &, const TVariable &)> onReduce = {});
+ 
+ }  // namespace sh
+ 
+diff --git a/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp b/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp
+index 0e6d5ba..b52c1fd 100644
+--- a/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp
++++ b/src/compiler/translator/tree_ops/msl/RewriteOutArgs.cpp
+@@ -100,7 +100,9 @@ class Rewriter : public TIntermRebuild
+             // ANGLE_inout and ANGLE_out overloads in ProgramPrelude are both
+             // unnecessary and incompatible.
+             if (func && func->symbolType() == SymbolType::AngleInternal &&
+-                (func->name() == "swizzle_ref" || func->name() == "elem_ref"))
++                (func->name() == "swizzle_ref" || func->name() == "elem_ref" ||
++                 func->name().beginsWith("storage_out<") ||
++                 func->name().beginsWith("storage_inout<")))
+             {
+                 return true;
+             }
+diff --git a/src/compiler/translator/tree_util/DriverUniform.cpp b/src/compiler/translator/tree_util/DriverUniform.cpp
+index 669d852..8c2502f 100644
+--- a/src/compiler/translator/tree_util/DriverUniform.cpp
++++ b/src/compiler/translator/tree_util/DriverUniform.cpp
+@@ -45,26 +45,8 @@ constexpr const char kDriverUniformsVarNameMSL[] = "ANGLE_angleUniforms";
+ // Class DriverUniform
+ void DriverUniform::addComputeDriverUniformsToShader(TIntermBlock *root, TSymbolTable *symbolTable)
+ {
+-    constexpr size_t kNumComputeDriverUniforms                                               = 1;
+-    constexpr std::array<const char *, kNumComputeDriverUniforms> kComputeDriverUniformNames = {
+-        {kAcbBufferOffsets}};
+-
+     ASSERT(!mDriverUniforms);
+-    // This field list mirrors the structure of ComputeDriverUniforms in ContextVk.cpp.
+-    TFieldList *driverFieldList = new TFieldList;
+-
+-    const std::array<TType *, kNumComputeDriverUniforms> kDriverUniformTypes = {{
+-        new TType(EbtUInt, EbpHigh, EvqGlobal, 4),
+-    }};
+-
+-    for (size_t uniformIndex = 0; uniformIndex < kNumComputeDriverUniforms; ++uniformIndex)
+-    {
+-        TField *driverUniformField =
+-            new TField(kDriverUniformTypes[uniformIndex],
+-                       ImmutableString(kComputeDriverUniformNames[uniformIndex]), TSourceLoc(),
+-                       SymbolType::AngleInternal);
+-        driverFieldList->push_back(driverUniformField);
+-    }
++    TFieldList *driverFieldList = createComputeUniformFields(symbolTable);
+ 
+     // Define a driver uniform block "ANGLEUniformBlock" with instance name "ANGLEUniforms".
+     TLayoutQualifier layoutQualifier = TLayoutQualifier::Create();
+@@ -89,6 +71,31 @@ void DriverUniform::addComputeDriverUniformsToShader(TIntermBlock *root, TSymbol
+     }
+ }
+ 
++TFieldList *DriverUniform::createComputeUniformFields(TSymbolTable *symbolTable)
++{
++    constexpr size_t kNumComputeDriverUniforms                                               = 1;
++    constexpr std::array<const char *, kNumComputeDriverUniforms> kComputeDriverUniformNames = {
++        {kAcbBufferOffsets}};
++
++    // This field list mirrors the structure of ComputeDriverUniforms in ContextVk.cpp.
++    TFieldList *driverFieldList = new TFieldList;
++
++    const std::array<TType *, kNumComputeDriverUniforms> kDriverUniformTypes = {{
++        new TType(EbtUInt, EbpHigh, EvqGlobal, 4),
++    }};
++
++    for (size_t uniformIndex = 0; uniformIndex < kNumComputeDriverUniforms; ++uniformIndex)
++    {
++        TField *driverUniformField =
++            new TField(kDriverUniformTypes[uniformIndex],
++                       ImmutableString(kComputeDriverUniformNames[uniformIndex]), TSourceLoc(),
++                       SymbolType::AngleInternal);
++        driverFieldList->push_back(driverUniformField);
++    }
++
++    return driverFieldList;
++}
++
+ TFieldList *DriverUniform::createUniformFields(TSymbolTable *symbolTable)
+ {
+     constexpr size_t kNumGraphicsDriverUniforms                                                = 6;
+diff --git a/src/compiler/translator/tree_util/DriverUniform.h b/src/compiler/translator/tree_util/DriverUniform.h
+index b5ec361..9c94411 100644
+--- a/src/compiler/translator/tree_util/DriverUniform.h
++++ b/src/compiler/translator/tree_util/DriverUniform.h
+@@ -88,6 +88,7 @@ class DriverUniform
+   protected:
+     TIntermTyped *createDriverUniformRef(const char *fieldName) const;
+     virtual TFieldList *createUniformFields(TSymbolTable *symbolTable);
++    virtual TFieldList *createComputeUniformFields(TSymbolTable *symbolTable);
+     const TType *createEmulatedDepthRangeType(TSymbolTable *symbolTable);
+ 
+     const DriverUniformMode mMode;
+diff --git a/src/libANGLE/ProgramLinkedResources.cpp b/src/libANGLE/ProgramLinkedResources.cpp
+index eb925a7..95cad17 100644
+--- a/src/libANGLE/ProgramLinkedResources.cpp
++++ b/src/libANGLE/ProgramLinkedResources.cpp
+@@ -1763,7 +1763,8 @@ void ProgramLinkedResourcesLinker::linkResources(const ProgramState &programStat
+     resources.uniformBlockLinker.linkBlocks(getUniformBlockSize, getUniformBlockMemberInfo);
+ 
+     // Gather storage buffer interface block info.
+-    InterfaceBlockInfo shaderStorageBlockInfo(mCustomEncoderFactory);
++    InterfaceBlockInfo shaderStorageBlockInfo(mStorageEncoderFactory ? mStorageEncoderFactory
++                                                                     : mCustomEncoderFactory);
+     for (const ShaderType shaderType : AllShaderTypes())
+     {
+         const SharedCompiledShaderState &shader = programState.getAttachedShader(shaderType);
+diff --git a/src/libANGLE/ProgramLinkedResources.h b/src/libANGLE/ProgramLinkedResources.h
+index 0e8ee0d..254441d 100644
+--- a/src/libANGLE/ProgramLinkedResources.h
++++ b/src/libANGLE/ProgramLinkedResources.h
+@@ -337,8 +337,9 @@ class CustomBlockLayoutEncoderFactory : angle::NonCopyable
+ class ProgramLinkedResourcesLinker final : angle::NonCopyable
+ {
+   public:
+-    ProgramLinkedResourcesLinker(CustomBlockLayoutEncoderFactory *customEncoderFactory)
+-        : mCustomEncoderFactory(customEncoderFactory)
++    ProgramLinkedResourcesLinker(CustomBlockLayoutEncoderFactory *customEncoderFactory,
++                                 CustomBlockLayoutEncoderFactory *storageEncoderFactory = nullptr)
++        : mCustomEncoderFactory(customEncoderFactory), mStorageEncoderFactory(storageEncoderFactory)
+     {}
+ 
+     void linkResources(const ProgramState &programState,
+@@ -349,6 +350,7 @@ class ProgramLinkedResourcesLinker final : angle::NonCopyable
+                                        std::map<int, unsigned int> &sizeMapOut) const;
+ 
+     CustomBlockLayoutEncoderFactory *mCustomEncoderFactory;
++    CustomBlockLayoutEncoderFactory *mStorageEncoderFactory;
+ };
+ 
+ using ShaderInterfaceBlock = std::pair<ShaderType, const sh::InterfaceBlock *>;
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+index 2d239d8..0414f8b 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+@@ -125,6 +125,14 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+     angle::Result load(ContextMtl *contextMtl, gl::BinaryInputStream *stream);
+     void save(gl::BinaryOutputStream *stream);
+ 
++    void installLinkedShaders(gl::ShaderMap<mtl::TranslatedShaderInfo> shaders);
++    const mtl::TranslatedShaderInfo &getComputeShaderInfo() const
++    {
++        return mMslShaderTranslateInfo[gl::ShaderType::Compute];
++    }
++    angle::Result getComputePipeline(ContextMtl *context,
++                                     angle::ObjCPtr<id<MTLComputePipelineState>> *pipelineOut);
++
+     void setUniform1fv(GLint location, GLsizei count, const GLfloat *v) override;
+     void setUniform2fv(GLint location, GLsizei count, const GLfloat *v) override;
+     void setUniform3fv(GLint location, GLsizei count, const GLfloat *v) override;
+@@ -261,6 +269,8 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+ 
+     // Translated metal shaders:
+     gl::ShaderMap<mtl::TranslatedShaderInfo> mMslShaderTranslateInfo;
++    angle::ObjCPtr<id<MTLFunction>> mComputeFunction;
++    angle::ObjCPtr<id<MTLComputePipelineState>> mComputePipeline;
+ 
+     // Translated metal version for transform feedback only vertex shader:
+     // - Metal doesn't allow vertex shader to write to both buffers and to stage output
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index 189e2a6..f4b7efb 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -440,7 +440,9 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+         var.reset(context);
+     }
+ 
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    mComputeFunction = nil;
++    mComputePipeline = nil;
++    for (gl::ShaderType shaderType : gl::AllShaderTypes())
+     {
+         if (mDefaultUniformBufferPools[shaderType])
+         {
+@@ -452,6 +454,8 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+ 
+ angle::Result ProgramExecutableMtl::load(ContextMtl *contextMtl, gl::BinaryInputStream *stream)
+ {
++    mComputeFunction = nil;
++    mComputePipeline = nil;
+     loadTranslatedShaders(stream);
+     loadShaderInternalInfo(stream);
+     ANGLE_TRY(loadDefaultUniformBlocksInfo(contextMtl, stream));
+@@ -562,6 +566,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+         {
+             stream->writeInt<uint32_t>(uboBinding);
+         }
++        stream->writeVector(mMslShaderTranslateInfo[shaderType].actualSSBOBindings);
+         stream->writeBool(mMslShaderTranslateInfo[shaderType].hasInvariant);
+     }
+     for (size_t xfbBindIndex = 0; xfbBindIndex < mtl::kMaxShaderXFBs; xfbBindIndex++)
+@@ -616,6 +621,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+         {
+             uboBinding = stream->readInt<uint32_t>();
+         }
++        stream->readVector(&mMslShaderTranslateInfo[shaderType].actualSSBOBindings);
+         mMslShaderTranslateInfo[shaderType].hasInvariant = stream->readBool();
+     }
+ 
+@@ -695,6 +701,10 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     const gl::SharedCompiledShaderState &vertexShader)
+ {
+     mProgramHasFlatAttributes = false;
++    if (!vertexShader)
++    {
++        return;
++    }
+ 
+     const auto &programInputs = mExecutable->getProgramInputs();
+     for (auto &attribute : programInputs)
+@@ -726,7 +736,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     gl::ShaderMap<size_t> requiredBufferSize;
+     requiredBufferSize.fill(0);
+ 
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
+         const gl::SharedCompiledShaderState &shader = shaders[shaderType];
+         if (shader)
+@@ -761,7 +771,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+ 
+                 bool found = false;
+ 
+-                for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++                for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+                 {
+                     auto it = layoutMap[shaderType].find(uniformName);
+                     if (it != layoutMap[shaderType].end())
+@@ -775,7 +785,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+             }
+         }
+ 
+-        for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++        for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+         {
+             mDefaultUniformBlocks[shaderType].uniformLayout.push_back(layoutInfo[shaderType]);
+         }
+@@ -788,7 +798,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     mtl::Context *context,
+     const gl::ShaderMap<size_t> &requiredBufferSize)
+ {
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
+         if (requiredBufferSize[shaderType] > 0)
+         {
+@@ -888,6 +898,38 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     return pool.get();
+ }
+ 
++void ProgramExecutableMtl::installLinkedShaders(gl::ShaderMap<mtl::TranslatedShaderInfo> shaders)
++{
++    mMslShaderTranslateInfo     = std::move(shaders);
++    mMslXfbOnlyVertexShaderInfo = mMslShaderTranslateInfo[gl::ShaderType::Vertex];
++    mComputeFunction            = nil;
++    mComputePipeline            = nil;
++}
++
++angle::Result ProgramExecutableMtl::getComputePipeline(
++    ContextMtl *context,
++    angle::ObjCPtr<id<MTLComputePipelineState>> *pipelineOut)
++{
++    ANGLE_CHECK(context, mExecutable->hasLinkedShaderStage(gl::ShaderType::Compute),
++                "Program has no linked compute stage", GL_INVALID_OPERATION);
++    if (!mComputePipeline)
++    {
++        auto &info = mMslShaderTranslateInfo[gl::ShaderType::Compute];
++        if (!info.metalLibrary)
++        {
++            ANGLE_TRY(CreateMslShaderLib(context, mExecutable->getInfoLog(), &info, {}));
++        }
++        mComputeFunction =
++            angle::adoptObjCPtr([info.metalLibrary.get() newFunctionWithName:@"main0"]);
++        ANGLE_CHECK(context, mComputeFunction, "Metal compute entry point is missing",
++                    GL_INVALID_OPERATION);
++        ANGLE_TRY(context->getPipelineCache().getComputePipeline(context, mComputeFunction.get(),
++                                                                 &mComputePipeline));
++    }
++    *pipelineOut = mComputePipeline;
++    return angle::Result::Continue;
++}
++
+ angle::Result ProgramExecutableMtl::setupDraw(const gl::Context *glContext,
+                                               mtl::RenderCommandEncoder *cmdEncoder,
+                                               const mtl::RenderPipelineDesc &pipelineDesc,
+@@ -1075,7 +1117,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+ angle::Result ProgramExecutableMtl::commitUniforms(ContextMtl *context,
+                                                    mtl::RenderCommandEncoder *cmdEncoder)
+ {
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
+         if (!mDefaultUniformBlocksDirty[shaderType] || !mCurrentShaderVariants[shaderType])
+         {
+@@ -1126,7 +1168,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     const auto &glState                             = glContext->getState();
+     const gl::ActiveTexturesCache &completeTextures = glState.getActiveTexturesCache();
+ 
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
+         if ((!mSamplerBindingsDirty[shaderType] && !forceUpdate) ||
+             !mCurrentShaderVariants[shaderType])
+@@ -1226,7 +1268,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+ 
+     const gl::State &glState = context->getState();
+ 
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
+         if (!mCurrentShaderVariants[shaderType])
+         {
+@@ -1510,7 +1552,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+ 
+     if (linkedUniform.getType() == entryPointType)
+     {
+-        for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++        for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+         {
+             DefaultUniformBlockMtl &uniformBlock  = mDefaultUniformBlocks[shaderType];
+             const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+@@ -1532,7 +1574,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     }
+     else
+     {
+-        for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++        for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+         {
+             DefaultUniformBlockMtl &uniformBlock  = mDefaultUniformBlocks[shaderType];
+             const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+@@ -1689,7 +1731,7 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     const gl::VariableLocation &locationInfo = mExecutable->getUniformLocations()[location];
+     const gl::LinkedUniform &linkedUniform   = mExecutable->getUniforms()[locationInfo.index];
+ 
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
+         DefaultUniformBlockMtl &uniformBlock  = mDefaultUniformBlocks[shaderType];
+         const sh::BlockMemberInfo &layoutInfo = uniformBlock.uniformLayout[location];
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 8ad80b5..f567222 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -34,6 +34,7 @@
+ 
+ namespace
+ {
++constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435031;  // MCP1
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+@@ -45,6 +46,12 @@
+     sh::BlockLayoutEncoder *makeEncoder() override { return new sh::Std140BlockEncoder(); }
+ };
+ 
++class Std430BlockLayoutEncoderFactory : public gl::CustomBlockLayoutEncoderFactory
++{
++  public:
++    sh::BlockLayoutEncoder *makeEncoder() override { return new sh::Std430BlockEncoder(); }
++};
++
+ class CompileMslTask final : public LinkSubTask, public mtl::Context
+ {
+   public:
+@@ -222,6 +229,11 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+                                egl::CacheGetResult *resultOut)
+ {
+ 
++    if (stream->readInt<uint32_t>() != kMetalProgramBinaryVersion || stream->error())
++    {
++        *resultOut = egl::CacheGetResult::Rejected;
++        return angle::Result::Continue;
++    }
+     ContextMtl *contextMtl = mtl::GetImpl(context);
+     // NOTE(hqle): No transform feedbacks for now, since we only support ES 2.0 atm
+ 
+@@ -240,6 +252,7 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+ 
+ void ProgramMtl::save(const gl::Context *context, gl::BinaryOutputStream *stream)
+ {
++    stream->writeInt<uint32_t>(kMetalProgramBinaryVersion);
+     getExecutable()->save(stream);
+ }
+ 
+@@ -288,11 +301,10 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+     gl::ShaderMap<std::string> shaderSources;
+     mtl::MSLGetShaderSource(mState, resources, &shaderSources);
+ 
++    gl::ShaderMap<mtl::TranslatedShaderInfo> linkedShaders;
+     ANGLE_TRY(mtl::MTLGetMSL(context->getDisplay()->getFeatures(), mState.getExecutable(),
+-                             shaderSources, mAttachedShaders,
+-                             &executableMtl->mMslShaderTranslateInfo));
+-    executableMtl->mMslXfbOnlyVertexShaderInfo =
+-        executableMtl->mMslShaderTranslateInfo[gl::ShaderType::Vertex];
++                             shaderSources, mAttachedShaders, &linkedShaders));
++    executableMtl->installLinkedShaders(std::move(linkedShaders));
+ 
+     return compileMslShaderLibs(context, subTasksOut);
+ }
+@@ -309,7 +321,7 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+     bool asyncCompile = displayMtl->getFeatures().enableParallelMtlLibraryCompilation.enabled;
+     mtl::LibraryCache &libraryCache = displayMtl->getLibraryCache();
+ 
+-    for (gl::ShaderType shaderType : gl::kAllGLES2ShaderTypes)
++    for (gl::ShaderType shaderType : mState.getExecutable().getLinkedShaderStages())
+     {
+         mtl::TranslatedShaderInfo *translateInfo =
+             &executableMtl->mMslShaderTranslateInfo[shaderType];
+@@ -340,7 +352,8 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+ void ProgramMtl::linkResources(const gl::ProgramLinkedResources &resources)
+ {
+     Std140BlockLayoutEncoderFactory std140EncoderFactory;
+-    gl::ProgramLinkedResourcesLinker linker(&std140EncoderFactory);
++    Std430BlockLayoutEncoderFactory std430EncoderFactory;
++    gl::ProgramLinkedResourcesLinker linker(&std140EncoderFactory, &std430EncoderFactory);
+ 
+     linker.linkResources(mState, resources);
+ }
+diff --git a/src/libANGLE/renderer/metal/ShaderMtl.mm b/src/libANGLE/renderer/metal/ShaderMtl.mm
+index 5e2b44a..71ea02d 100644
+--- a/src/libANGLE/renderer/metal/ShaderMtl.mm
++++ b/src/libANGLE/renderer/metal/ShaderMtl.mm
+@@ -60,7 +60,9 @@ void postTranslate(ShHandle compiler, const gl::CompiledShaderState &compiledSta
+ 
+     // TODO(jcunningham): Remove this workaround once correct fix to move validation to the very end
+     // is in place. https://bugs.webkit.org/show_bug.cgi?id=224991
+-    options->validateAST = false;
++    // The compute translator preserves variable identities through pipeline
++    // rewriting. Keep its final AST validation enabled during integration.
++    options->validateAST = mState.getShaderType() == gl::ShaderType::Compute;
+ 
+     options->simplifyLoopConditions = true;
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index 6045eb5..40c3d3c 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -86,6 +86,16 @@ namespace mtl
+ {
+ 
+ // NOTE(hqle): support variable max number of vertex attributes
++// Must match DriverUniformMetal::createComputeUniformFields. Sizes describe
++// GL-visible storage ranges, not the remaining bytes in a Metal allocation.
++constexpr size_t kMaxComputeStorageBuffers = 8;
++struct alignas(16) ComputeDriverUniforms
++{
++    std::array<uint32_t, 4> acbBufferOffsets                           = {};
++    std::array<uint32_t, kMaxComputeStorageBuffers> storageBufferSizes = {};
++};
++static_assert(sizeof(ComputeDriverUniforms) == 48);
++
+ constexpr uint32_t kMaxVertexAttribs = gl::MAX_VERTEX_ATTRIBS;
+ // Note: This is the max number of render targets the backend supports.
+ // It is NOT how many the device supports which may be lower. If you
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.h b/src/libANGLE/renderer/metal/mtl_msl_utils.h
+index aedf999..68e085b 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.h
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.h
+@@ -34,6 +34,7 @@ struct SamplerBinding
+ 
+ struct TranslatedShaderInfo
+ {
++    TranslatedShaderInfo() { reset(); }
+     void reset();
+     // Translated Metal source code
+     std::shared_ptr<const std::string> metalShaderSource;
+@@ -43,6 +44,7 @@ struct TranslatedShaderInfo
+     std::array<int, kMaxShaderImages> actualImageBindings;
+     std::array<uint32_t, kMaxGLUBOBindings> actualUBOBindings;
+     std::array<uint32_t, kMaxShaderXFBs> actualXFBBindings;
++    std::vector<uint32_t> actualSSBOBindings;
+     bool hasUBOArgumentBuffer;
+     bool hasIsnanOrIsinf;
+     bool hasInvariant;
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.mm b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+index 4e5be37..f0f831a 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+@@ -138,6 +138,7 @@
+ 
+ void TranslatedShaderInfo::reset()
+ {
++    actualSSBOBindings.clear();
+     metalShaderSource    = nullptr;
+     metalLibrary         = nil;
+     hasUBOArgumentBuffer = false;
+@@ -630,7 +631,7 @@ void GenerateTransformFeedbackEmulationOutputs(
+         originalSamplerBindings[mappedSamplerName].push_back(
+             {textureIndex, static_cast<uint32_t>(samplerBinding.textureUnitsCount)});
+     }
+-    for (gl::ShaderType type : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
++    for (gl::ShaderType type : executable.getLinkedShaderStages())
+     {
+         std::string source;
+         if (type == gl::ShaderType::Vertex)
+@@ -653,6 +654,10 @@ void GenerateTransformFeedbackEmulationOutputs(
+                 }
+             }
+         }
++        else if (type == gl::ShaderType::Compute)
++        {
++            source = shaderSources[type];
++        }
+         else
+         {
+             ASSERT(type == gl::ShaderType::Fragment);
+@@ -663,6 +668,18 @@ void GenerateTransformFeedbackEmulationOutputs(
+             std::make_shared<const std::string>(std::move(source));
+         const sh::TranslatorMetalReflection *reflection =
+             &shadersState[type]->translatorMetalReflection;
++        const auto &storageBlocks = executable.getShaderStorageBlocks();
++        auto &storageBindings     = mslShaderInfoOut->at(type).actualSSBOBindings;
++        storageBindings.assign(storageBlocks.size(), kMaxShaderBuffers);
++        for (size_t i = 0; i < storageBlocks.size(); ++i)
++        {
++            const auto &map = reflection->getStorageBufferBindings();
++            auto binding    = map.find(storageBlocks[i].name);
++            if (binding != map.end())
++            {
++                storageBindings[i] = static_cast<uint32_t>(binding->second);
++            }
++        }
+         if (reflection->hasUBOs)
+         {
+             (*mslShaderInfoOut)[type].hasUBOArgumentBuffer = true;
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index 3e6ec87..5190f3e 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -55,7 +55,18 @@ class MSLVertexOutputTest : public MSLOutputTestBase
+ class MSLComputeOutputTest : public MSLOutputTestBase
+ {
+   public:
+-    MSLComputeOutputTest() : MSLOutputTestBase(GL_COMPUTE_SHADER) {}
++    MSLComputeOutputTest() : MSLOutputTestBase(GL_COMPUTE_SHADER)
++    {
++        setDefaultCompileOptions(defaultOptions());
++    }
++    static ShCompileOptions defaultOptions()
++    {
++        auto options                                = MSLOutputTestBase::defaultOptions();
++        options.metal.defaultUniformsBindingIndex   = 19;
++        options.metal.driverUniformsBindingIndex    = 17;
++        options.metal.UBOArgumentBufferBindingIndex = 24;
++        return options;
++    }
+ };
+ 
+ TEST_F(MSLComputeOutputTest, EmptyKernel)
+@@ -112,6 +123,81 @@ TEST_F(MSLComputeOutputTest, SharedMemoryInHelpers)
+     EXPECT_TRUE(notFoundInCode("simdgroup_barrier"));
+ }
+ 
++TEST_F(MSLComputeOutputTest, StorageBufferScalarAndVectorAccess)
++{
++    compile(R"(#version 310 es
++        layout(local_size_x = 8) in;
++        layout(std430, binding = 0) buffer Data {
++            vec3 normal;
++            uint count;
++            float weights[];
++        } data;
++        void storeValue(uint index, float value) { data.weights[index] = value; }
++        void main() {
++            uint index = gl_GlobalInvocationID.x;
++            vec3 value = data.normal;
++            storeValue(index, value.x + float(data.count) + float(data.weights.length()));
++            if (index == 0u) data.normal = value * 2.0;
++        }
++    )");
++    EXPECT_TRUE(foundInCode("device uchar *"));
++    EXPECT_TRUE(foundInCode("reinterpret_cast<device"));
++    EXPECT_TRUE(foundInCode("[[buffer(0)]]"));
++    EXPECT_TRUE(notFoundInCode("constant Data"));
++}
++
++TEST_F(MSLComputeOutputTest, AnonymousStorageBlock)
++{
++    compile(R"(#version 310 es
++        layout(local_size_x = 4) in;
++        layout(std140, binding = 0) buffer Data { uint values[]; };
++        void main() { values[gl_GlobalInvocationID.x] = gl_GlobalInvocationID.x; }
++    )");
++    EXPECT_TRUE(foundInCode("device uchar *"));
++    EXPECT_TRUE(foundInCode("* 16u"));
++}
++
++TEST_F(MSLComputeOutputTest, RejectUnsupportedStorageAggregate)
++{
++    const std::string source = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Data { mat2 value; } data;
++        void main() { data.value = data.value * 2.0; }
++    )";
++    std::string log;
++    EXPECT_FALSE(compileTestShader(GL_COMPUTE_SHADER, SH_GLES3_1_SPEC, SH_MSL_METAL_OUTPUT, source,
++                                   defaultOptions(), nullptr, &log));
++    EXPECT_NE(log.find("gather/scatter"), std::string::npos) << log;
++}
++
++TEST_F(MSLComputeOutputTest, RejectUnsupportedStorageBlockArray)
++{
++    const std::string source = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Data { uint value; } data[2];
++        void main() { data[1].value = data[0].value; }
++    )";
++    std::string log;
++    EXPECT_FALSE(compileTestShader(GL_COMPUTE_SHADER, SH_GLES3_1_SPEC, SH_MSL_METAL_OUTPUT, source,
++                                   defaultOptions(), nullptr, &log));
++    EXPECT_NE(log.find("non-array block instances"), std::string::npos) << log;
++}
++
++TEST_F(MSLComputeOutputTest, RejectOverlappingComputeResourceSlots)
++{
++    const std::string source                 = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Data { uint value; } data;
++        void main() { data.value = 7u; }
++    )";
++    auto options                             = defaultOptions();
++    options.metal.driverUniformsBindingIndex = 0;
++    std::string log;
++    EXPECT_FALSE(compileTestShader(GL_COMPUTE_SHADER, SH_GLES3_1_SPEC, SH_MSL_METAL_OUTPUT, source,
++                                   options, nullptr, &log));
++    EXPECT_NE(log.find("overlap"), std::string::npos) << log;
++}
++
+ // Test that having dynamic indexing of a vector inside the right hand side of logical or doesn't
+ // trigger asserts in MSL output.
+ TEST_F(MSLOutputTest, DynamicIndexingOfVectorOnRightSideOfLogicalOr)
+diff --git a/src/tests/gl_tests/ComputeShaderTestMetal.mm b/src/tests/gl_tests/ComputeShaderTestMetal.mm
+index 2c98e9d..7429072 100644
+--- a/src/tests/gl_tests/ComputeShaderTestMetal.mm
++++ b/src/tests/gl_tests/ComputeShaderTestMetal.mm
+@@ -9,7 +9,10 @@
+ #    pragma allow_unsafe_buffers
+ #endif
+ 
++#include "common/BinaryStream.h"
++#include "libANGLE/renderer/metal/ProgramExecutableMtl.h"
+ #include "test_utils/ANGLETest.h"
++#include "test_utils/gl_raii.h"
+ 
+ #include <cstring>
+ #include <memory>
+@@ -55,8 +58,11 @@ void main() {
+ constexpr char kDispatchProducer[] = R"(#version 310 es
+ precision highp int;
+ layout(local_size_x = 1) in;
+-layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D result;
+-void main() { imageStore(result, ivec2(0), uvec4(3, 2, 2, 0)); }
++layout(std430, binding = 0) buffer DispatchArguments {
++    uint prefix[64];
++    uint x; uint y; uint z; uint reserved;
++} arguments;
++void main() { arguments.x = 3u; arguments.y = 2u; arguments.z = 2u; arguments.reserved = 0u; }
+ )";
+ 
+ constexpr char kSharedProducer[] = R"(#version 310 es
+@@ -97,12 +103,58 @@ void main() {
+ }
+ )";
+ 
++constexpr char kStorageShader[] = R"(#version 310 es
++precision highp float;
++precision highp int;
++layout(local_size_x = 8) in;
++struct Record { vec3 direction; uint tag; };
++layout(std430, binding = 0) readonly buffer InputData {
++    uint prefix;
++    bool enabled;
++    vec3 normal;
++    float weight;
++    float coefficients[3];
++    mat2x3 matrix;
++    Record records[2];
++    uint values[];
++} inputData;
++layout(std140, binding = 1) buffer OutputData {
++    uvec3 header;
++    bool tag;
++    mat2 matrix;
++    uint values[];
++} outputData;
++vec3 normal() { return inputData.normal; }
++void storeValue(uint index, uint value) { outputData.values[index] = value; }
++void fillHeader(out uvec3 value) { value = uvec3(7, 8, 9); }
++void increment(inout uint value) { value += 3u; }
++void setFlag(out bool value) { value = true; }
++void main() {
++    uint index = gl_LocalInvocationIndex;
++    bool rangesMatch = inputData.values.length() == 8 && outputData.values.length() == 8;
++    uint value = inputData.prefix + (inputData.enabled ? 9u : 0u) + uint(dot(normal(), vec3(1))) +
++                 uint(inputData.weight) + uint(inputData.coefficients[index % 3u]) +
++                 uint(inputData.matrix[1][2]) + inputData.records[index % 2u].tag +
++                 inputData.values[index];
++    storeValue(index, rangesMatch ? value : 0xffffffffu);
++    increment(outputData.values[index]);
++    if (index == 0u) {
++        fillHeader(outputData.header);
++        outputData.header += uvec3(1, 2, 3);
++        setFlag(outputData.tag);
++        outputData.matrix[0][0] = inputData.matrix[0][0];
++        outputData.matrix[1][0] = inputData.matrix[1][2];
++    }
++}
++)";
++
+ struct ComputeKernel
+ {
+     angle::ObjCPtr<id<MTLLibrary>> library;
+     angle::ObjCPtr<id<MTLComputePipelineState>> pipeline;
+     MTLSize localSize;
+     std::array<int, 8> imageBindings;
++    std::unordered_map<std::string, size_t> storageBindings;
+ };
+ 
+ class ComputeShaderTestMetal : public ANGLETest<>
+@@ -114,14 +166,16 @@ void main() {
+         setWindowHeight(8);
+     }
+ 
+-    ContextMtl *contextMtl()
++    gl::Context *glContext()
+     {
+         auto *display    = static_cast<egl::Display *>(getEGLWindow()->getDisplay());
+         gl::ContextID id = {
+             static_cast<GLuint>(reinterpret_cast<uintptr_t>(getEGLWindow()->getContext()))};
+-        return mtl::GetImpl(display->getContext(id));
++        return display->getContext(id);
+     }
+ 
++    ContextMtl *contextMtl() { return mtl::GetImpl(glContext()); }
++
+     void compileKernel(const char *source, ComputeKernel *result)
+     {
+         ASSERT_TRUE(sh::Initialize());
+@@ -133,6 +187,9 @@ void compileKernel(const char *source, ComputeKernel *result)
+             sh::Destruct);
+         ASSERT_NE(compiler, nullptr);
+         ShCompileOptions options                     = {};
++        options.metal.defaultUniformsBindingIndex    = mtl::kDefaultUniformsBindingIndex;
++        options.metal.driverUniformsBindingIndex     = mtl::kDriverUniformsBindingIndex;
++        options.metal.UBOArgumentBufferBindingIndex  = mtl::kUBOArgumentBufferBindingIndex;
+         options.objectCode                           = true;
+         options.validateAST                          = true;
+         options.rescopeGlobalVariables               = true;
+@@ -151,6 +208,8 @@ void compileKernel(const char *source, ComputeKernel *result)
+ 
+         auto *translator = static_cast<sh::TShHandleBase *>(compiler.get())->getAsTranslatorMSL();
+         ASSERT_NE(translator, nullptr);
++        result->storageBindings =
++            translator->getTranslatorMetalReflection()->getStorageBufferBindings();
+         for (size_t binding = 0; binding < result->imageBindings.size(); ++binding)
+         {
+             result->imageBindings[binding] =
+@@ -170,11 +229,47 @@ void compileKernel(const char *source, ComputeKernel *result)
+             << msl;
+         auto function = angle::adoptObjCPtr([result->library.get() newFunctionWithName:@"main0"]);
+         ASSERT_NE(function.get(), nil);
+-        result->pipeline = angle::adoptObjCPtr([contextMtl()->getMetalDevice()
+-            newComputePipelineStateWithFunction:function.get()
+-                                          error:&error]);
+-        ASSERT_NE(result->pipeline.get(), nil)
+-            << (error ? error.localizedDescription.UTF8String : "");
++        // Exercise the program backend's stage selection, library/pipeline cache
++        // and binary serialization, without advertising a partial GL profile.
++        gl::InfoLog infoLog;
++        auto destroy = [this](gl::ProgramExecutable *executable) {
++            executable->destroy(glContext());
++            delete executable;
++        };
++        std::unique_ptr<gl::ProgramExecutable, decltype(destroy)> executable(
++            new gl::ProgramExecutable(contextMtl(), &infoLog), destroy);
++        executable->setLinkedShaderStages(gl::ShaderType::Compute);
++        gl::ShaderMap<std::string> sources;
++        sources[gl::ShaderType::Compute] = msl;
++        gl::ShaderMap<SharedCompiledShaderStateMtl> shaders;
++        shaders[gl::ShaderType::Compute] = std::make_shared<CompiledShaderStateMtl>();
++        shaders[gl::ShaderType::Compute]->translatorMetalReflection =
++            *translator->getTranslatorMetalReflection();
++        gl::ShaderMap<mtl::TranslatedShaderInfo> linked;
++        ASSERT_EQ(mtl::MTLGetMSL(contextMtl()->getDisplay()->getFeatures(), *executable, sources,
++                                 shaders, &linked),
++                  angle::Result::Continue);
++        auto *backend = static_cast<ProgramExecutableMtl *>(executable->getImplementation());
++        backend->installLinkedShaders(std::move(linked));
++        ASSERT_EQ(backend->getComputePipeline(contextMtl(), &result->pipeline),
++                  angle::Result::Continue)
++            << infoLog.str();
++        angle::ObjCPtr<id<MTLComputePipelineState>> cached;
++        ASSERT_EQ(backend->getComputePipeline(contextMtl(), &cached), angle::Result::Continue);
++        EXPECT_EQ(cached.get(), result->pipeline.get());
++        gl::BinaryOutputStream binary;
++        backend->save(&binary);
++        gl::BinaryInputStream input(binary);
++        ASSERT_EQ(backend->load(contextMtl(), &input), angle::Result::Continue);
++        ASSERT_FALSE(input.error());
++        ASSERT_EQ(backend->getComputePipeline(contextMtl(), &result->pipeline),
++                  angle::Result::Continue)
++            << infoLog.str();
++        for (size_t i = 0; i < result->imageBindings.size(); ++i)
++        {
++            EXPECT_EQ(backend->getComputeShaderInfo().actualImageBindings[i],
++                      result->imageBindings[i]);
++        }
+     }
+ 
+     mtl::TextureRef image(size_t width, size_t height)
+@@ -190,6 +285,94 @@ void compileKernel(const char *source, ComputeKernel *result)
+         return mtl::Texture::MakeFromMetal(texture.get());
+     }
+ 
++    void runStorageLayout(bool rowMajor = false)
++    {
++        ComputeKernel kernel;
++        std::string source = kStorageShader;
++        if (rowMajor)
++        {
++            for (const std::string type : {"mat2x3", "mat2"})
++            {
++                std::string field = type + " matrix;";
++                source.replace(source.find(field), field.size(), "layout(row_major) " + field);
++            }
++        }
++        ASSERT_NO_FATAL_FAILURE(compileKernel(source.c_str(), &kernel));
++        const auto inputSlot  = kernel.storageBindings.at("InputData");
++        const auto outputSlot = kernel.storageBindings.at("OutputData");
++        ASSERT_NE(inputSlot, outputSlot);
++        ASSERT_LT(inputSlot, mtl::kMaxComputeStorageBuffers);
++        ASSERT_LT(outputSlot, mtl::kMaxComputeStorageBuffers);
++        ContextMtl *context = contextMtl();
++        mtl::BufferRef allocation;
++        ASSERT_EQ(mtl::Buffer::MakeBuffer(context, 2048, &allocation), angle::Result::Continue);
++        constexpr size_t kInput  = 256;
++        constexpr size_t kOutput = 768;
++        std::array<uint8_t, 2048> expected;
++        expected.fill(0xcd);
++        auto putInput = [&](size_t offset, auto value) {
++            std::memcpy(expected.data() + kInput + offset, &value, sizeof(value));
++        };
++        // Independent std430 offsets: vec3 at 16, following float at 28,
++        // scalar array stride 4, matrix columns stride 16, record stride 16.
++        putInput(0, uint32_t(5));
++        putInput(4, uint32_t(1));
++        putInput(16, 1.0f);
++        putInput(20, 2.0f);
++        putInput(24, 3.0f);
++        putInput(28, 4.0f);
++        putInput(32, 10.0f);
++        putInput(36, 20.0f);
++        putInput(40, 30.0f);
++        putInput(48, 11.0f);
++        putInput(rowMajor ? 68 : 72, 17.0f);
++        putInput(92, uint32_t(100));
++        putInput(108, uint32_t(200));
++        for (uint32_t i = 0; i < 8; ++i)
++        {
++            putInput(112 + i * 4, uint32_t(300 + i));
++        }
++        auto initial = allocation->map(context);
++        ASSERT_GE(initial.size(), expected.size());
++        std::memcpy(initial.data(), expected.data(), expected.size());
++        allocation->unmap(context);
++        mtl::ComputeDriverUniforms driver;
++        driver.storageBufferSizes[inputSlot]  = 144;
++        driver.storageBufferSizes[outputSlot] = 176;
++        context->getComputeCommandEncoder()
++            ->setComputePipelineState(kernel.pipeline.get())
++            .setBuffer(allocation, kInput, inputSlot)
++            .setBufferForWrite(allocation, kOutput, outputSlot)
++            .setData(driver, mtl::kDriverUniformsBindingIndex)
++            .dispatch(MTLSizeMake(1, 1, 1), kernel.localSize);
++        auto putOutput = [&](size_t offset, auto value) {
++            std::memcpy(expected.data() + kOutput + offset, &value, sizeof(value));
++        };
++        // Independent std140 offsets: vec3+scalar share a 16-byte slot;
++        // mat2 column stride and trailing scalar array stride are both 16.
++        putOutput(0, uint32_t(8));
++        putOutput(4, uint32_t(10));
++        putOutput(8, uint32_t(12));
++        putOutput(12, uint32_t(1));
++        putOutput(16, 11.0f);
++        putOutput(rowMajor ? 20 : 32, 17.0f);
++        for (uint32_t i = 0; i < 8; ++i)
++        {
++            putOutput(48 + 16 * i, uint32_t(5 + 9 + 6 + 4 + 10 * (i % 3 + 1) + 17 +
++                                            100 * (i % 2 + 1) + 300 + i + 3));
++        }
++        // This is the only GPU result readback. Verify source and guard/padding
++        // bytes as well as outputs; both bindings alias the same allocation.
++        auto actual = allocation->mapReadOnly(context);
++        ASSERT_GE(actual.size(), expected.size());
++        for (size_t i = 0; i < expected.size(); ++i)
++        {
++            EXPECT_EQ(actual[i], expected[i]) << "byte " << i;
++        }
++        allocation->unmap(context);
++        EXPECT_EQ(context->checkCommandBufferError(), angle::Result::Continue);
++    }
++
+     void runSharedMemory()
+     {
+         ComputeKernel kernel, producer;
+@@ -258,18 +441,15 @@ void runInvocations(bool indirect)
+         {
+             ComputeKernel producer;
+             ASSERT_NO_FATAL_FAILURE(compileKernel(kDispatchProducer, &producer));
+-            ASSERT_GE(producer.imageBindings[0], 0);
+-            auto dispatchImage = image(1, 1);
++            const auto argumentSlot = producer.storageBindings.at("DispatchArguments");
++            ASSERT_LT(argumentSlot, mtl::kMaxComputeStorageBuffers);
+             ASSERT_EQ(mtl::Buffer::MakeBufferWithStorageMode(context, MTLStorageModePrivate, 512,
+                                                              &arguments),
+                       angle::Result::Continue);
+             context->getComputeCommandEncoder()
+                 ->setComputePipelineState(producer.pipeline.get())
+-                .setTextureForWrite(dispatchImage, producer.imageBindings[0])
++                .setBufferForWrite(arguments, 0, argumentSlot)
+                 .dispatch(MTLSizeMake(1, 1, 1), producer.localSize);
+-            context->getBlitCommandEncoder()->copyTextureToBuffer(
+-                dispatchImage, 0, mtl::MipmapNativeLevel(0), MTLOriginMake(0, 0, 0),
+-                MTLSizeMake(1, 1, 1), arguments, 256, 256, 256, MTLBlitOptionNone);
+         }
+ 
+         auto *compute = context->getComputeCommandEncoder();
+@@ -322,6 +502,58 @@ void runInvocations(bool indirect)
+     }
+ };
+ 
++TEST_P(ComputeShaderTestMetal, GraphicsUniformAndBinaryRegression)
++{
++    constexpr char vertex[]   = R"(#version 300 es
++        in vec4 position;
++        uniform float offset;
++        void main() { gl_Position = vec4(position.xy + vec2(offset), 0, 1); }
++    )";
++    constexpr char fragment[] = R"(#version 300 es
++        precision highp float;
++        uniform vec4 color;
++        out vec4 result;
++        void main() { result = color; }
++    )";
++    ANGLE_GL_PROGRAM(program, vertex, fragment);
++    glUseProgram(program);
++    glUniform1f(glGetUniformLocation(program, "offset"), 0);
++    glUniform4f(glGetUniformLocation(program, "color"), 0, 1, 0, 1);
++    drawQuad(program, "position", 0);
++    ASSERT_GL_NO_ERROR();
++    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::green);
++    GLint length = 0;
++    glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &length);
++    ASSERT_GT(length, 0);
++    std::vector<uint8_t> bytes(length);
++    GLenum format   = 0;
++    GLsizei written = 0;
++    glGetProgramBinary(program, length, &written, &format, bytes.data());
++    ASSERT_GL_NO_ERROR();
++    ASSERT_GT(written, 0);
++    GLProgram loaded;
++    glProgramBinary(loaded, format, bytes.data(), written);
++    GLint status = 0;
++    glGetProgramiv(loaded, GL_LINK_STATUS, &status);
++    ASSERT_EQ(status, GL_TRUE);
++    glUseProgram(loaded);
++    glUniform1f(glGetUniformLocation(loaded, "offset"), 0);
++    glUniform4f(glGetUniformLocation(loaded, "color"), 1, 0, 0, 1);
++    drawQuad(loaded, "position", 0);
++    ASSERT_GL_NO_ERROR();
++    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::red);
++}
++
++TEST_P(ComputeShaderTestMetal, GLSLStorageRowMajorLayoutAndRanges)
++{
++    runStorageLayout(true);
++}
++
++TEST_P(ComputeShaderTestMetal, GLSLStorageLayoutAndRanges)
++{
++    runStorageLayout();
++}
++
+ TEST_P(ComputeShaderTestMetal, GLSLSharedMemoryAcrossSIMDGroups)
+ {
+     runSharedMemory();

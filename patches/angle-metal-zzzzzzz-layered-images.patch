@@ -1,0 +1,630 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index d21a31e..60ebb7f 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -1075,22 +1075,29 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
+             }
+             else if (IsImage(basicType))
+             {
+-                mOut << "metal::texture2d<";
+-                switch (type.getBasicType())
++                if (IsImage2D(basicType))
+                 {
+-                    case EbtImage2D:
+-                        mOut << "float";
+-                        break;
+-                    case EbtIImage2D:
+-                        mOut << "int";
+-                        break;
+-                    case EbtUImage2D:
+-                        mOut << "uint";
+-                        break;
+-                    default:
+-                        UNIMPLEMENTED();
+-                        break;
++                    mOut << "metal::texture2d<";
++                }
++                else if (IsImage3D(basicType))
++                {
++                    mOut << "metal::texture3d<";
++                }
++                else if (IsImage2DArray(basicType))
++                {
++                    mOut << "metal::texture2d_array<";
++                }
++                else if (IsImageCube(basicType))
++                {
++                    mOut << "metal::texturecube<";
++                }
++                else
++                {
++                    UNIMPLEMENTED();
+                 }
++                mOut << (IsFloatImage(basicType)     ? "float"
++                         : IsIntegerImage(basicType) ? "int"
++                                                     : "uint");
+                 if (type.getMemoryQualifier().readonly)
+                 {
+                     mOut << ", metal::access::read>";
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 2a86836..aae26d2 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -3024,28 +3024,121 @@ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access
+ {
+     return metal::int2(texture.get_width(), texture.get_height());
+ }
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture3d<T, Access> &texture)
++{
++    return metal::int3(texture.get_width(), texture.get_height(), texture.get_depth());
++}
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d_array<T, Access> &texture)
++{
++    return metal::int3(texture.get_width(), texture.get_height(), texture.get_array_size());
++}
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texturecube<T, Access> &texture)
++{
++    return metal::int2(texture.get_width(), texture.get_height());
++}
+ )")
+ 
+-PROGRAM_PRELUDE_DECLARE(imageLoad, R"(
++PROGRAM_PRELUDE_DECLARE(imageLoad,
++                        R"(
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+-    thread const metal::texture2d<T, Access> &texture,
+-    metal::int2 coord)
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d<T, Access> &texture, metal::int2 coord)
+ {
++    const auto size = ANGLE_imageSize(texture);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return metal::vec<T, 4>(0);
++    }
+     return texture.read(uint2(coord));
+ }
+-)")
+ 
+-PROGRAM_PRELUDE_DECLARE(imageStore, R"(
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE auto ANGLE_imageStore(
+-    thread const metal::texture2d<T, Access> &texture,
+-    metal::int2 coord,
+-    metal::vec<T, 4> value)
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture3d<T, Access> &texture, metal::int3 coord)
+ {
+-    return texture.write(value, uint2(coord));
++    const auto size = ANGLE_imageSize(texture);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return metal::vec<T, 4>(0);
++    }
++    return texture.read(uint3(coord));
+ }
+-)")
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d_array<T, Access> &texture, metal::int3 coord)
++{
++    const auto size = ANGLE_imageSize(texture);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return metal::vec<T, 4>(0);
++    }
++    return texture.read(uint2(coord.xy), uint(coord.z));
++}
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texturecube<T, Access> &texture, metal::int3 coord)
++{
++    const auto size = metal::int3(ANGLE_imageSize(texture), 6);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return metal::vec<T, 4>(0);
++    }
++    return texture.read(uint2(coord.xy), uint(coord.z));
++}
++)",
++                        imageSize())
++
++PROGRAM_PRELUDE_DECLARE(imageStore,
++                        R"(
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d<T, Access> &texture, metal::int2 coord, metal::vec<T, 4> value)
++{
++    const auto size = ANGLE_imageSize(texture);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return;
++    }
++    texture.write(value, uint2(coord));
++}
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture3d<T, Access> &texture, metal::int3 coord, metal::vec<T, 4> value)
++{
++    const auto size = ANGLE_imageSize(texture);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return;
++    }
++    texture.write(value, uint3(coord));
++}
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d_array<T, Access> &texture, metal::int3 coord, metal::vec<T, 4> value)
++{
++    const auto size = ANGLE_imageSize(texture);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return;
++    }
++    texture.write(value, uint2(coord.xy), uint(coord.z));
++}
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texturecube<T, Access> &texture, metal::int3 coord, metal::vec<T, 4> value)
++{
++    const auto size = metal::int3(ANGLE_imageSize(texture), 6);
++    if (metal::any(coord < 0) || metal::any(coord >= size))
++    {
++        return;
++    }
++    texture.write(value, uint2(coord.xy), uint(coord.z));
++}
++)",
++                        imageSize())
+ 
+ // Memory-only GLSL barriers must be legal in divergent control flow. A Metal
+ // threadgroup_barrier or simdgroup_barrier would add an execution rendezvous.
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index a67a4f7..d2fcd3d 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -1071,8 +1071,11 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+         for (size_t element = 0; element < binding.boundImageUnits.size(); ++element)
+         {
+             const auto &unit = glState.getImageUnit(binding.boundImageUnits[element]);
+-            ANGLE_CHECK(context, unit.texture.get() && !unit.layered,
+-                        "Compute image requires a bound non-layered texture", GL_INVALID_OPERATION);
++            ANGLE_CHECK(context,
++                        unit.texture.get() &&
++                            (unit.layered || unit.texture->getType() != gl::TextureType::_3D),
++                        "Non-layered 3D compute images require a shader variant",
++                        GL_INVALID_OPERATION);
+             TextureMtl *texture = mtl::GetImpl(unit.texture.get());
+             ANGLE_TRY(texture->ensureNativeStorageCreated(glContext, true,
+                                                           ImageMipLevels::EnabledLevels));
+@@ -1123,8 +1126,8 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     for (const auto &image : storageImages)
+     {
+         ANGLE_TRY(image.texture->bindToComputeImage(glContext, encoder, image.slot,
+-                                                    image.unit->level, image.unit->layer,
+-                                                    image.unit->format));
++                                                    image.unit->level, image.unit->layered,
++                                                    image.unit->layer, image.unit->format));
+     }
+     *encoderOut = encoder;
+     return angle::Result::Continue;
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index cc9da89..3542395 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -34,7 +34,7 @@
+ 
+ namespace
+ {
+-constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435034;  // MCP4
++constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435035;  // MCP5
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.h b/src/libANGLE/renderer/metal/TextureMtl.h
+index a3745d5..676cfd7 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.h
++++ b/src/libANGLE/renderer/metal/TextureMtl.h
+@@ -198,6 +198,7 @@ class TextureMtl : public TextureImpl
+                                      mtl::ComputeCommandEncoder *encoder,
+                                      int textureSlotIndex,
+                                      int level,
++                                     bool layered,
+                                      int layer,
+                                      GLenum format);
+ 
+@@ -403,6 +404,7 @@ class TextureMtl : public TextureImpl
+     // May have different formats than the original texture.
+     // Indexed by format, then layer, then level.
+     std::map<MTLPixelFormat, LayerLevelTextureViewVector> mShaderImageViews;
++    std::map<MTLPixelFormat, TextureViewVector> mLayeredShaderImageViews;
+ 
+     // Mipmap views are indexed from (base GL level -> max GL level):
+     mtl::NativeTexLevelArray mLevelViewsWithinBaseMax;
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 4fde241..02ae5d8 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -855,6 +855,11 @@ uint32_t height(GLuint glLevel) const
+         return mNativeTexture->createMipView(getNativeLevel(glLevel));
+     }
+     // Create a view for a shader image binding.
++    mtl::TextureRef createLayeredShaderImageView(GLuint glLevel, MTLPixelFormat format)
++    {
++        return mNativeTexture->createLayeredShaderImageView(getNativeLevel(glLevel), format);
++    }
++
+     mtl::TextureRef createShaderImageView2D(GLuint glLevel, int layer, MTLPixelFormat format)
+     {
+         return mNativeTexture->createShaderImageView2D(getNativeLevel(glLevel), layer, format);
+@@ -889,6 +894,7 @@ uint32_t height(GLuint glLevel) const
+     {
+         mTexImageDefs.clear();
+         mShaderImageViews.clear();
++        mLayeredShaderImageViews.clear();
+     }
+     else if (mNativeTextureStorage)
+     {
+@@ -2103,11 +2109,31 @@ uint32_t height(GLuint glLevel) const
+                                              mtl::ComputeCommandEncoder *encoder,
+                                              int textureSlotIndex,
+                                              int level,
++                                             bool layered,
+                                              int layer,
+                                              GLenum format)
+ {
+-    return bindToShaderImageImpl(context, encoder, gl::ShaderType::Compute, textureSlotIndex, level,
+-                                 layer, format);
++    if (!layered || mState.getType() == gl::TextureType::_2D)
++    {
++        return bindToShaderImageImpl(context, encoder, gl::ShaderType::Compute, textureSlotIndex,
++                                     level, mState.getType() == gl::TextureType::_2D ? 0 : layer,
++                                     format);
++    }
++    ASSERT(mNativeTextureStorage);
++    ASSERT(mState.getImmutableFormat());
++    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
++    const auto imageAccessFormat =
++        mtl::GetImpl(context)->getPixelFormat(angle::Format::InternalFormatToID(format));
++    auto &views = mLayeredShaderImageViews[imageAccessFormat.metalFormat];
++    views.resize(mState.getImmutableLevels());
++    auto &view = views[level];
++    if (!view)
++    {
++        view = mNativeTextureStorage->createLayeredShaderImageView(level,
++                                                                   imageAccessFormat.metalFormat);
++    }
++    encoder->setRWTexture(gl::ShaderType::Compute, view, textureSlotIndex);
++    return angle::Result::Continue;
+ }
+ 
+ template <typename Encoder>
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.h b/src/libANGLE/renderer/metal/mtl_resources.h
+index 8916375..2751a51 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.h
++++ b/src/libANGLE/renderer/metal/mtl_resources.h
+@@ -263,6 +263,7 @@ class Texture final : public Resource,
+     // Create a view with different format
+     TextureRef createViewWithDifferentFormat(MTLPixelFormat format);
+     // Create a view for a shader image binding.
++    TextureRef createLayeredShaderImageView(const MipmapNativeLevel &level, MTLPixelFormat format);
+     TextureRef createShaderImageView2D(const MipmapNativeLevel &level,
+                                        int layer,
+                                        MTLPixelFormat format);
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.mm b/src/libANGLE/renderer/metal/mtl_resources.mm
+index 052d74e..ce02d0a 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.mm
++++ b/src/libANGLE/renderer/metal/mtl_resources.mm
+@@ -759,6 +759,16 @@ bool needMultisampleColorFormatShaderReadWorkaround(ContextMtl *context, MTLText
+     return TextureRef(new Texture(this, format));
+ }
+ 
++TextureRef Texture::createLayeredShaderImageView(const MipmapNativeLevel &level,
++                                                 MTLPixelFormat format)
++{
++    ASSERT(isShaderReadable());
++    ASSERT(isShaderWritable());
++    ASSERT(format == pixelFormat() || supportFormatView());
++    return TextureRef(new Texture(this, format, textureType(), NSMakeRange(level.get(), 1),
++                                  NSMakeRange(0, cubeFacesOrArrayLength())));
++}
++
+ TextureRef Texture::createShaderImageView2D(const MipmapNativeLevel &level,
+                                             int layer,
+                                             MTLPixelFormat format)
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 13ecf7c..ca3a440 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1219,6 +1219,286 @@ TEST_P(ComputeDispatchTestMetal, ZeroDispatchAndFrontendValidation)
+     EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
+     ASSERT_GL_NO_ERROR();
+ }
++TEST_P(ComputeDispatchTestMetal, LayeredImagesMipViewsAndCubeAliases)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 2, local_size_y = 2) in;
++        layout(r32ui, binding = 0) uniform highp uimage3D volume;
++        layout(r32i, binding = 1) uniform highp iimage2DArray layers;
++        layout(rgba32ui, binding = 2) writeonly uniform highp uimageCube faces;
++        layout(std430, binding = 0) buffer Results {
++            uvec4 sizes[3]; uvec4 observed[24];
++        } result;
++        void main() {
++            ivec3 p = ivec3(gl_GlobalInvocationID);
++            uint i = uint((p.z * 2 + p.y) * 2 + p.x);
++            if (p.z < 2) {
++                imageStore(volume, p, uvec4(1000u + i));
++                memoryBarrierImage();
++                result.observed[i] = imageLoad(volume, p);
++            }
++            if (p.z < 3) imageStore(layers, p, ivec4(-2000 - int(i)));
++            imageStore(faces, p, uvec4(3000,4000,5000,6000) + i);
++            if (all(equal(p, ivec3(0)))) {
++                result.sizes[0] = uvec4(imageSize(volume), 0);
++                result.sizes[1] = uvec4(imageSize(layers), 0);
++                result.sizes[2] = uvec4(imageSize(faces), 0, 0);
++            }
++        }
++    )";
++    constexpr char alias[]    = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(rgba32ui, binding = 0) writeonly uniform highp uimage2D face;
++        void main() {
++            if (imageSize(face) == ivec2(2)) imageStore(face, ivec2(1,0), uvec4(9001,9002,9003,9004));
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(aliasProgram, alias);
++    GLTexture volume, layers, cube;
++    glBindTexture(GL_TEXTURE_3D, volume);
++    glTexStorage3D(GL_TEXTURE_3D, 2, GL_R32UI, 4, 4, 4);
++    std::array<uint32_t, 64> volumeGuard;
++    volumeGuard.fill(0x55555555u);
++    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 4, 4, 4, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                    volumeGuard.data());
++    glBindTexture(GL_TEXTURE_2D_ARRAY, layers);
++    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 2, GL_R32I, 4, 4, 3);
++    std::array<int32_t, 48> layerGuard;
++    layerGuard.fill(-321);
++    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 4, 4, 3, GL_RED_INTEGER, GL_INT,
++                    layerGuard.data());
++    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
++    glTexStorage2D(GL_TEXTURE_CUBE_MAP, 2, GL_RGBA32UI, 4, 4);
++    std::array<uint32_t, 64> cubeGuard;
++    cubeGuard.fill(777);
++    for (uint32_t face = 0; face < 6; ++face)
++    {
++        glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, 0, 0, 4, 4, GL_RGBA_INTEGER,
++                        GL_UNSIGNED_INT, cubeGuard.data());
++    }
++    glBindImageTexture(0, volume, 1, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++    glBindImageTexture(1, layers, 1, GL_TRUE, 0, GL_READ_WRITE, GL_R32I);
++    glBindImageTexture(2, cube, 1, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
++    ASSERT_GL_NO_ERROR();
++    GLBuffer buffer;
++    std::array<uint32_t, 128> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
++    GLProgram restored;
++    reloadProgram(program, restored);
++    glUseProgram(restored);
++    glDispatchCompute(1, 1, 6);
++    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT |
++                    GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const std::array<uint32_t, 12> sizes = {2, 2, 2, 0, 2, 2, 3, 0, 2, 2, 0, 0};
++    std::copy(sizes.begin(), sizes.end(), expected.begin());
++    for (uint32_t i = 0; i < 8; ++i)
++    {
++        expected[12 + 4 * i]     = 1000 + i;
++        expected[12 + 4 * i + 1] = expected[12 + 4 * i + 2] = 0;
++        expected[12 + 4 * i + 3]                            = 1;
++    }
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    GLFramebuffer framebuffer;
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    for (uint32_t layer = 0; layer < 2; ++layer)
++    {
++        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, volume, 1, layer);
++        ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++        std::array<uint32_t, 16> pixels;
++        glReadPixels(0, 0, 2, 2, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
++        for (uint32_t p = 0; p < 4; ++p)
++        {
++            for (uint32_t c = 0; c < 4; ++c)
++            {
++                EXPECT_EQ(pixels[4 * p + c], c == 0 ? 1000 + 4 * layer + p : c == 3 ? 1 : 0);
++            }
++        }
++    }
++    for (uint32_t layer = 0; layer < 3; ++layer)
++    {
++        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, layers, 1, layer);
++        ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++        std::array<int32_t, 16> pixels;
++        glReadPixels(0, 0, 2, 2, GL_RGBA_INTEGER, GL_INT, pixels.data());
++        for (uint32_t p = 0; p < 4; ++p)
++        {
++            for (uint32_t c = 0; c < 4; ++c)
++            {
++                EXPECT_EQ(pixels[4 * p + c], c == 0   ? -2000 - static_cast<int32_t>(4 * layer + p)
++                                             : c == 3 ? 1
++                                                      : 0);
++            }
++        }
++    }
++    // A face view shares the cube allocation; changing one texel must retain
++    // every other face and the independent lower mip level.
++    glBindImageTexture(0, cube, 1, GL_FALSE, 4, GL_WRITE_ONLY, GL_RGBA32UI);
++    glUseProgram(aliasProgram);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
++    for (uint32_t face = 0; face < 6; ++face)
++    {
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, cube, 1);
++        ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++        std::array<uint32_t, 16> pixels;
++        glReadPixels(0, 0, 2, 2, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
++        for (uint32_t p = 0; p < 4; ++p)
++        {
++            for (uint32_t c = 0; c < 4; ++c)
++            {
++                EXPECT_EQ(pixels[4 * p + c],
++                          face == 4 && p == 1 ? 9001 + c : 1000 * (c + 3) + 4 * face + p);
++            }
++        }
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, cube, 0);
++        std::array<uint32_t, 64> guard;
++        glReadPixels(0, 0, 4, 4, GL_RGBA_INTEGER, GL_UNSIGNED_INT, guard.data());
++        EXPECT_EQ(guard, cubeGuard);
++    }
++    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, volume, 0, 0);
++    std::array<uint32_t, 64> vguard;
++    glReadPixels(0, 0, 4, 4, GL_RGBA_INTEGER, GL_UNSIGNED_INT, vguard.data());
++    for (uint32_t p = 0; p < 16; ++p)
++    {
++        EXPECT_EQ(vguard[4 * p], volumeGuard[p]);
++    }
++    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, layers, 0, 0);
++    std::array<int32_t, 64> lguard;
++    glReadPixels(0, 0, 4, 4, GL_RGBA_INTEGER, GL_INT, lguard.data());
++    for (uint32_t p = 0; p < 16; ++p)
++    {
++        EXPECT_EQ(lguard[4 * p], layerGuard[p]);
++    }
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, ImageCoordinatesOutsideViews)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(r32ui, binding = 0) uniform highp uimage2D planar;
++        layout(r32ui, binding = 1) uniform highp uimage3D volume;
++        layout(r32ui, binding = 2) uniform highp uimage2DArray layers;
++        layout(r32ui, binding = 3) uniform highp uimageCube faces;
++        layout(std430, binding = 0) buffer Results { uvec4 values[8]; } result;
++        void main() {
++            imageStore(planar, ivec2(-1,0), uvec4(99));
++            imageStore(planar, ivec2(2,0), uvec4(99));
++            imageStore(volume, ivec3(0,0,-1), uvec4(99));
++            imageStore(volume, ivec3(0,0,2), uvec4(99));
++            imageStore(layers, ivec3(0,-1,0), uvec4(99));
++            imageStore(layers, ivec3(0,0,2), uvec4(99));
++            imageStore(faces, ivec3(0,0,-1), uvec4(99));
++            imageStore(faces, ivec3(0,0,6), uvec4(99));
++            memoryBarrierImage();
++            result.values[0] = imageLoad(planar, ivec2(-1,0)) |
++                               imageLoad(planar, ivec2(2,0)) |
++                               imageLoad(planar, ivec2(2147483647));
++            result.values[1] = imageLoad(volume, ivec3(0,0,-1)) |
++                               imageLoad(volume, ivec3(0,0,2)) |
++                               imageLoad(volume, ivec3(2147483647));
++            result.values[2] = imageLoad(layers, ivec3(0,-1,0)) |
++                               imageLoad(layers, ivec3(0,0,2)) |
++                               imageLoad(layers, ivec3(2147483647));
++            result.values[3] = imageLoad(faces, ivec3(0,0,-1)) |
++                               imageLoad(faces, ivec3(0,0,6)) |
++                               imageLoad(faces, ivec3(2147483647));
++            result.values[4] = imageLoad(planar, ivec2(0));
++            result.values[5] = imageLoad(volume, ivec3(0));
++            result.values[6] = imageLoad(layers, ivec3(0));
++            result.values[7] = imageLoad(faces, ivec3(0));
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLTexture planar, volume, layers, cube;
++    std::array<uint32_t, 8> initial;
++    initial.fill(777);
++    glBindTexture(GL_TEXTURE_2D, planar);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 2, 2);
++    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 2, 2, GL_RED_INTEGER, GL_UNSIGNED_INT, initial.data());
++    glBindTexture(GL_TEXTURE_3D, volume);
++    glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32UI, 2, 2, 2);
++    glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 2, 2, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                    initial.data());
++    glBindTexture(GL_TEXTURE_2D_ARRAY, layers);
++    glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R32UI, 2, 2, 2);
++    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 2, 2, 2, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                    initial.data());
++    glBindTexture(GL_TEXTURE_CUBE_MAP, cube);
++    glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32UI, 2, 2);
++    for (uint32_t f = 0; f < 6; ++f)
++    {
++        glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, 0, 0, 2, 2, GL_RED_INTEGER,
++                        GL_UNSIGNED_INT, initial.data());
++    }
++    // A 2D target ignores layered/layer, including a nonzero ignored layer.
++    glBindImageTexture(0, planar, 0, GL_TRUE, 17, GL_READ_WRITE, GL_R32UI);
++    glBindImageTexture(1, volume, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++    glBindImageTexture(2, layers, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++    glBindImageTexture(3, cube, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI);
++    GLBuffer results;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, results);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 128, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, results);
++    glUseProgram(program);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 128, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < 16; ++i)
++    {
++        EXPECT_EQ(actual[i], 0u) << i;
++    }
++    for (size_t i = 16; i < 32; ++i)
++    {
++        EXPECT_EQ(actual[i], i % 4 == 0 ? 777u : i % 4 == 3 ? 1u : 0u) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    GLFramebuffer framebuffer;
++    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
++    auto check = [&]() {
++        ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++        std::array<uint32_t, 16> pixels;
++        glReadPixels(0, 0, 2, 2, GL_RGBA_INTEGER, GL_UNSIGNED_INT, pixels.data());
++        for (size_t i = 0; i < pixels.size(); ++i)
++        {
++            EXPECT_EQ(pixels[i], i % 4 == 0 ? 777u : i % 4 == 3 ? 1u : 0u) << i;
++        }
++    };
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, planar, 0);
++    check();
++    for (uint32_t l = 0; l < 2; ++l)
++    {
++        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, volume, 0, l);
++        check();
++        glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, layers, 0, l);
++        check();
++    }
++    for (uint32_t f = 0; f < 6; ++f)
++    {
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
++                               GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, cube, 0);
++        check();
++    }
++    ASSERT_GL_NO_ERROR();
++}
++
+ class ComputeByteIndirectTestMetal : public ComputeDispatchTestMetal
+ {};
+ 

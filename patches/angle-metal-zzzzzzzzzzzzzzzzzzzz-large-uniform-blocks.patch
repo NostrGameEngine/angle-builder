@@ -1,0 +1,133 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 3432da6..ef28d9d 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -930,8 +930,20 @@ bool IsMetalDisplayAvailable()
+     mNativeCaps.maxCombinedUniformBlocks                        = 2 * mtl::kMaxShaderUBOs + 12;
+     mNativeCaps.maxUniformBufferBindings                        = mtl::kMaxGLUBOBindings;
+     mNativeCaps.maxCombinedTextureImageUnits                    = mtl::kMaxGLSamplerBindings;
+-    mNativeCaps.maxCombinedShaderUniformComponents[gl::ShaderType::Compute] =
+-        maxDefaultUniformComponents + mtl::kMaxUBOSize * 12 / 4;
++    if (supportsAppleGPUFamily(1))
++    {
++        // Apple GPUs do not impose the 64 KB constant-address-space allocation
++        // restriction of older Mac GPUs. Keep the frontend's 64 KB ceiling and
++        // validate the larger blocks in this experimental profile first.
++        mNativeCaps.maxUniformBlockSize = 64 * 1024;
++    }
++    for (gl::ShaderType stage :
++         {gl::ShaderType::Vertex, gl::ShaderType::Fragment, gl::ShaderType::Compute})
++    {
++        mNativeCaps.maxCombinedShaderUniformComponents[stage] =
++            maxDefaultUniformComponents +
++            mNativeCaps.maxUniformBlockSize * mNativeCaps.maxShaderUniformBlocks[stage] / 4;
++    }
+     mNativeCaps.maxComputeWorkGroupCount       = {65535, 65535, 65535};
+     // Use the device dimensions instead of restricting all kernels to the GLES minimum.
+     // Link-time pipeline validation still checks the native kernel's own thread limit.
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index f73c9b9..5a23bdb 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -719,6 +719,101 @@ TEST_P(ComputeDispatchTestMetal, NullImagesClearBindingsBinaryAndDeletion)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++// Check every byte of the advertised 64 KB UBO, after a GPU producer and
++// binary reload, then consume the same storage in both graphics stages.
++TEST_P(ComputeDispatchTestMetal, LargeGPUWrittenUniformBlockAllStages)
++{
++    GLint limit = 0;
++    glGetIntegerv(GL_MAX_UNIFORM_BLOCK_SIZE, &limit);
++    RecordProperty("UniformBlockSize", limit);
++    ASSERT_GE(limit, 65536);
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x=256) in;
++        layout(std430,binding=0) buffer Data { uvec4 values[]; } data;
++        void main() {
++            uint i=gl_GlobalInvocationID.x;
++            data.values[i]=uvec4(i,i^0x5a5a1234u,~i,i*i);
++        }
++    )";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x=256) in;
++        layout(std140,binding=7) uniform Large { uvec4 values[4096]; } data;
++        layout(std430,binding=1) buffer Copy { uvec4 values[]; } result;
++        void main() { uint i=gl_GlobalInvocationID.x; result.values[i]=data.values[i]; }
++    )";
++    constexpr char vertex[]   = R"(#version 310 es
++        layout(std140,binding=7) uniform Large { uvec4 values[4096]; } data;
++        uniform uint index;
++        void main() {
++            vec2 p=gl_VertexID==0 ? vec2(-1,-1) : gl_VertexID==1 ? vec2(3,-1) : vec2(-1,3);
++            gl_Position=vec4(data.values[index].x==index ? p : vec2(4),0,1);
++        }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        layout(std140,binding=7) uniform Large { uvec4 values[4096]; } data;
++        uniform highp uint index;
++        out vec4 color;
++        void main() {
++            bool valid=all(equal(data.values[index],uvec4(index,index^0x5a5a1234u,~index,index*index)));
++            color=valid ? vec4(0,1,0,1) : vec4(1,0,0,1);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(produce, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(consume, consumer);
++    ANGLE_GL_PROGRAM(render, vertex, fragment);
++    GLProgram binary;
++    reloadProgram(consume, binary);
++    constexpr size_t words = 4096 * 4 + 128;
++    std::vector<uint32_t> expected(words, 0xcafebabeu);
++    GLBuffer sourceBuffer, resultBuffer;
++    for (GLuint buffer : {sourceBuffer.get(), resultBuffer.get()})
++    {
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++        glBufferData(GL_SHADER_STORAGE_BUFFER, words * 4, expected.data(), GL_DYNAMIC_DRAW);
++    }
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sourceBuffer, 256, 65536);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, resultBuffer, 256, 65536);
++    glBindBufferRange(GL_UNIFORM_BUFFER, 7, sourceBuffer, 256, 65536);
++    glUseProgram(produce);
++    glDispatchCompute(16, 1, 1);
++    glMemoryBarrier(GL_UNIFORM_BARRIER_BIT);
++    glUseProgram(binary);
++    glDispatchCompute(16, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    glUseProgram(render);
++    glClearColor(1, 0, 0, 1);
++    glClear(GL_COLOR_BUFFER_BIT);
++    for (uint32_t index : {0u, 2048u, 4095u})
++    {
++        glUniform1ui(glGetUniformLocation(render, "index"), index);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        EXPECT_PIXEL_COLOR_EQ(8, 8, GLColor::green);
++    }
++    ASSERT_GL_NO_ERROR();
++    for (uint32_t i = 0; i < 4096; ++i)
++    {
++        const size_t offset  = 64 + 4 * i;
++        expected[offset]     = i;
++        expected[offset + 1] = i ^ 0x5a5a1234u;
++        expected[offset + 2] = ~i;
++        expected[offset + 3] = i * i;
++    }
++    for (GLuint buffer : {sourceBuffer.get(), resultBuffer.get()})
++    {
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++        const auto *actual = static_cast<const uint32_t *>(
++            glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, words * 4, GL_MAP_READ_BIT));
++        ASSERT_NE(actual, nullptr);
++        for (size_t word = 0; word < expected.size(); ++word)
++        {
++            EXPECT_EQ(actual[word], expected[word]) << "buffer " << buffer << " word " << word;
++        }
++        EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    }
++    ASSERT_GL_NO_ERROR();
++}
++
+ // Non-layered image2D bindings must alias the original 3D storage, including
+ // writes observed through a second image in the same invocation.
+ TEST_P(ComputeDispatchTestMetal, VolumeSliceAliasesArraysAndBinary)

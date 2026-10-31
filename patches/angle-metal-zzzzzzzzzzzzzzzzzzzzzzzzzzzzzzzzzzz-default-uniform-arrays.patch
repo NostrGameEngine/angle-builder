@@ -1,0 +1,16 @@
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index b9ee9a7..c23630f 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -785,8 +785,9 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                 std::string uniformName = uniformNames[location.index];
+                 if (uniform.isArray())
+                 {
+-                    // Gets the uniform name without the [0] at the end.
+-                    uniformName = gl::ParseResourceName(uniformName, nullptr);
++                    // Remove only the innermost array suffix. Outer array indices
++                    // identify distinct entries in the default-block layout map.
++                    uniformName = gl::StripLastArrayIndex(uniformName);
+                 }
+ 
+                 bool found = false;

@@ -1,0 +1,29 @@
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+index c8b7594..8101c45 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+@@ -622,19 +622,20 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+     ToObjC(depthAttachment, objCDesc.depthAttachment);
+     ToObjC(stencilAttachment, objCDesc.stencilAttachment);
+ 
+-    // This Objective-C descriptor is reused across render passes. Replace the
+-    // sample count for attached passes too, otherwise an attachmentless pass's
+-    // override can survive and disagree with the next MSAA pipeline.
+-    objCDesc.defaultRasterSampleCount = rasterSampleCount;
++    // This descriptor is reused. Apply the override only without attachments;
++    // clear it otherwise so old attachmentless samples cannot survive, and
++    // devices without attachmentless rendering never receive an unsupported override.
+     if ((defaultWidth | defaultHeight) != 0)
+     {
+         objCDesc.renderTargetWidth  = defaultWidth;
+         objCDesc.renderTargetHeight = defaultHeight;
++        objCDesc.defaultRasterSampleCount = rasterSampleCount;
+     }
+     else
+     {
+         objCDesc.renderTargetWidth  = 0;
+         objCDesc.renderTargetHeight = 0;
++        objCDesc.defaultRasterSampleCount = 0;
+     }
+ }
+ 

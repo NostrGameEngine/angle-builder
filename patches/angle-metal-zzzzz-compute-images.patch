@@ -1,0 +1,388 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index fe3a504..d21a31e 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -1383,10 +1383,6 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+ 
+     if (IsImage(type.getBasicType()))
+     {
+-        if (type.getArraySizeProduct() != 1)
+-        {
+-            UNIMPLEMENTED();
+-        }
+         mOut << " [[";
+         if (type.getLayoutQualifier().rasterOrdered)
+         {
+@@ -2832,6 +2828,7 @@ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
+     putAngle("textureProjLodOffset");
+     putAngle("textureProjOffset");
+     putAngle("textureSize");
++    putAngle("imageSize");
+     putAngle("imageLoad");
+     putAngle("imageStore");
+     putAngle("memoryBarrierImage");
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 1107096..2a86836 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -287,6 +287,7 @@ class ProgramPrelude : public TIntermTraverser
+     void textureSize_2DArray();
+     void textureSize_2DArrayShadow();
+     void textureSize_2DMS();
++    void imageSize();
+     void imageLoad();
+     void imageStore();
+     void memoryBarrierImage();
+@@ -3017,6 +3018,14 @@ ANGLE_ALWAYS_INLINE auto ANGLE_textureSize(
+ )",
+                         textureEnv())
+ 
++PROGRAM_PRELUDE_DECLARE(imageSize, R"(
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access> &texture)
++{
++    return metal::int2(texture.get_width(), texture.get_height());
++}
++)")
++
+ PROGRAM_PRELUDE_DECLARE(imageLoad, R"(
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageLoad(
+@@ -3640,6 +3649,7 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+                 return pp.textureSize_2D();
+         }
+     });
++    putBuiltIn("imageSize", EMIT_METHOD(imageSize));
+     putBuiltIn("imageLoad", EMIT_METHOD(imageLoad));
+     putBuiltIn("imageStore", EMIT_METHOD(imageStore));
+     putBuiltIn("memoryBarrierImage", EMIT_METHOD(memoryBarrierImage));
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index bc5fa93..a67a4f7 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -1030,7 +1030,8 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     {
+         const auto &binding      = mExecutable->getSamplerBindings()[i];
+         const auto &metalBinding = info.actualSamplerBindings[i];
+-        if (metalBinding.textureBinding >= mtl::kMaxShaderSamplers)
++        if (metalBinding.samplerBinding >= mtl::kMaxShaderSamplers ||
++            metalBinding.textureBinding >= mtl::kMaxComputeTextures)
+         {
+             continue;
+         }
+@@ -1062,20 +1063,21 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     for (size_t i = 0; i < mExecutable->getImageBindings().size(); ++i)
+     {
+         const uint32_t slot = info.actualComputeImageBindings[i];
+-        if (slot >= mtl::kMaxShaderImages)
++        if (slot >= mtl::kMaxComputeTextures)
+         {
+             continue;
+         }
+         const auto &binding = mExecutable->getImageBindings()[i];
+-        ANGLE_CHECK(context, binding.boundImageUnits.size() == 1,
+-                    "Compute image arrays are not implemented", GL_INVALID_OPERATION);
+-        const auto &unit = glState.getImageUnit(binding.boundImageUnits[0]);
+-        ANGLE_CHECK(context, unit.texture.get() && !unit.layered,
+-                    "Compute image requires a bound non-layered texture", GL_INVALID_OPERATION);
+-        TextureMtl *texture = mtl::GetImpl(unit.texture.get());
+-        ANGLE_TRY(
+-            texture->ensureNativeStorageCreated(glContext, true, ImageMipLevels::EnabledLevels));
+-        storageImages.push_back({texture, &unit, slot});
++        for (size_t element = 0; element < binding.boundImageUnits.size(); ++element)
++        {
++            const auto &unit = glState.getImageUnit(binding.boundImageUnits[element]);
++            ANGLE_CHECK(context, unit.texture.get() && !unit.layered,
++                        "Compute image requires a bound non-layered texture", GL_INVALID_OPERATION);
++            TextureMtl *texture = mtl::GetImpl(unit.texture.get());
++            ANGLE_TRY(texture->ensureNativeStorageCreated(glContext, true,
++                                                          ImageMipLevels::EnabledLevels));
++            storageImages.push_back({texture, &unit, static_cast<uint32_t>(slot + element)});
++        }
+     }
+     // Texture allocation/uploads can end the current compute encoder. Obtain
+     // it only after every resource is ready, then bind this dispatch's state.
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 2b85026..cc9da89 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -34,7 +34,7 @@
+ 
+ namespace
+ {
+-constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435033;  // MCP3
++constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435034;  // MCP4
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index 952e172..4e8ee95 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -2835,7 +2835,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+ }
+ ComputeCommandEncoder &ComputeCommandEncoder::setTexture(const TextureRef &texture, uint32_t index)
+ {
+-    if (index >= kMaxShaderSamplers)
++    if (index >= kMaxComputeTextures)
+     {
+         return *this;
+     }
+@@ -2848,7 +2848,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+ ComputeCommandEncoder &ComputeCommandEncoder::setTextureForWrite(const TextureRef &texture,
+                                                                  uint32_t index)
+ {
+-    if (index >= kMaxShaderSamplers)
++    if (index >= kMaxComputeTextures)
+     {
+         return *this;
+     }
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index 40c3d3c..be6413f 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -128,6 +128,9 @@ constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
+ constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
+ constexpr uint32_t kMaxViewports         = 1;
+ constexpr uint32_t kMaxShaderImages      = gl::IMPLEMENTATION_MAX_PIXEL_LOCAL_STORAGE_PLANES;
++// Compute textures and samplers use different native index spaces. Images do
++// not consume sampler slots and can coexist with all sixteen sampled textures.
++constexpr uint32_t kMaxComputeTextures = kMaxShaderSamplers + kMaxShaderImages;
+ 
+ // Restrict in-flight resource usage to 400 MB.
+ // A render pass can use more than 400MB, but the command buffer
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.mm b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+index fedbd6b..01d3673 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+@@ -149,7 +149,7 @@
+     for (mtl::SamplerBinding &binding : actualSamplerBindings)
+     {
+         binding.textureBinding = mtl::kMaxShaderSamplers;
+-        binding.samplerBinding = 0;
++        binding.samplerBinding = mtl::kMaxShaderSamplers;
+     }
+     for (int &rwTextureBinding : actualImageBindings)
+     {
+@@ -684,18 +684,22 @@ void GenerateTransformFeedbackEmulationOutputs(
+             }
+         }
+         auto &computeImages = mslShaderInfoOut->at(type).actualComputeImageBindings;
+-        computeImages.assign(executable.getImageBindings().size(), kMaxShaderImages);
++        computeImages.assign(executable.getImageBindings().size(), kMaxComputeTextures);
+         if (type == gl::ShaderType::Compute)
+         {
+             const auto &imageMap = reflection->getComputeImageBindings();
+             for (size_t i = 0; i < computeImages.size(); ++i)
+             {
+                 const auto uniform = executable.getUniformIndexFromImageIndex(i);
+-                const auto &name   = executable.getUniformMappedNames()[uniform];
+-                auto binding       = imageMap.find(name);
++                const auto &name           = executable.getUniformMappedNames()[uniform];
++                const std::string baseName = gl::ParseResourceName(name, nullptr);
++                auto binding               = imageMap.find(baseName);
+                 if (binding != imageMap.end())
+                 {
+-                    computeImages[i] = static_cast<uint32_t>(binding->second);
++                    const size_t elements = executable.getImageBindings()[i].boundImageUnits.size();
++                    const size_t offset =
++                        executable.getUniforms()[uniform].pod.parentArrayIndex * elements;
++                    computeImages[i] = static_cast<uint32_t>(binding->second + offset);
+                 }
+             }
+         }
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 72ec334..005f099 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1004,6 +1004,190 @@ TEST_P(ComputeDispatchTestMetal, PartialStorageWritesAndSignedIncrement)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++TEST_P(ComputeDispatchTestMetal, SixteenSamplersAndFourImages)
++{
++    std::string producer = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        uniform highp usampler2D sources[16];
++        layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D outputs[4];
++        void main() {
++            uvec4 sum = uvec4(0);
++    )";
++    for (uint32_t i = 0; i < 16; ++i)
++    {
++        producer += "sum += texture(sources[" + std::to_string(i) + "],vec2(0.5)) * " +
++                    std::to_string(i + 1) + "u;\n";
++    }
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        producer += "imageStore(outputs[" + std::to_string(i) + "],ivec2(0)," +
++                    "all(equal(imageSize(outputs[" + std::to_string(i) + "]),ivec2(1))) ? " +
++                    "sum + uvec4(" + std::to_string(i) + "," + std::to_string(2 * i) + "," +
++                    std::to_string(3 * i) + "," + std::to_string(4 * i) +
++                    ") : uvec4(0xffffffffu));\n";
++    }
++    producer += "}";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        uniform highp usampler2D sources[4];
++        layout(std430, binding = 0) buffer Results { uvec4 values[4]; } results;
++        void main() {
++            results.values[0] = texelFetch(sources[0],ivec2(0),0);
++            results.values[1] = texelFetch(sources[1],ivec2(0),0);
++            results.values[2] = texelFetch(sources[2],ivec2(0),0);
++            results.values[3] = texelFetch(sources[3],ivec2(0),0);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(a, producer.c_str());
++    ANGLE_GL_COMPUTE_PROGRAM(b, consumer);
++    std::array<GLTexture, 16> inputs;
++    std::array<GLTexture, 4> outputs;
++    std::array<GLint, 16> inputUnits;
++    const std::array<GLint, 4> outputUnits = {20, 21, 22, 23};
++    for (uint32_t i = 0; i < 16; ++i)
++    {
++        inputUnits[i] = 15 - static_cast<GLint>(i);
++        glActiveTexture(GL_TEXTURE0 + inputUnits[i]);
++        glBindTexture(GL_TEXTURE_2D, inputs[i]);
++        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32UI, 1, 1);
++        const std::array<uint32_t, 4> pixel = {i + 1, i + 17, i + 33, i + 49};
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT,
++                        pixel.data());
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    }
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        glActiveTexture(GL_TEXTURE0 + outputUnits[i]);
++        glBindTexture(GL_TEXTURE_2D, outputs[i]);
++        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32UI, 1, 1);
++        const std::array<uint32_t, 4> zero = {};
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RGBA_INTEGER, GL_UNSIGNED_INT,
++                        zero.data());
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++        glBindImageTexture(i, outputs[i], 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
++    }
++    ASSERT_GL_NO_ERROR();
++    GLProgram restored;
++    reloadProgram(a, restored);
++    glUseProgram(restored);
++    glUniform1iv(glGetUniformLocation(restored, "sources[0]"), 16, inputUnits.data());
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    GLBuffer results;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, results);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 64, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, results);
++    glUseProgram(b);
++    glUniform1iv(glGetUniformLocation(b, "sources[0]"), 4, outputUnits.data());
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 64, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        EXPECT_EQ(actual[4 * i], 1496 + i);
++        EXPECT_EQ(actual[4 * i + 1], 3672 + 2 * i);
++        EXPECT_EQ(actual[4 * i + 2], 5848 + 3 * i);
++        EXPECT_EQ(actual[4 * i + 3], 8024 + 4 * i);
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, NestedImageArraysAndAliases)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(r32ui, binding = 0) uniform highp uimage2D images[2][2];
++        layout(std430, binding = 0) buffer Results { uvec4 values[4]; } results;
++        void main() {
++            imageStore(images[0][0],ivec2(0),uvec4(100,200,300,400));
++            imageStore(images[0][1],ivec2(0),uvec4(101,201,301,401));
++            imageStore(images[1][0],ivec2(0),uvec4(102,202,302,402));
++            imageStore(images[1][1],ivec2(0),uvec4(103,203,303,403));
++            memoryBarrierImage();
++            results.values[0]=imageLoad(images[0][0],ivec2(0));
++            results.values[1]=imageLoad(images[0][1],ivec2(0));
++            results.values[2]=imageLoad(images[1][0],ivec2(0));
++            results.values[3]=imageLoad(images[1][1],ivec2(0));
++        }
++    )";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        uniform highp usampler2D images[4];
++        layout(std430, binding = 0) buffer Results { uvec4 values[4]; } results;
++        void main() {
++            results.values[0]=texelFetch(images[0],ivec2(0),0);
++            results.values[1]=texelFetch(images[1],ivec2(0),0);
++            results.values[2]=texelFetch(images[2],ivec2(0),0);
++            results.values[3]=texelFetch(images[3],ivec2(0),0);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(a, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(b, consumer);
++    std::array<GLTexture, 4> textures;
++    const std::array<uint32_t, 4> permutation = {2, 0, 3, 1};
++    const std::array<uint32_t, 4> inverse     = {1, 3, 0, 2};
++    const std::array<GLint, 4> samplerUnits   = {20, 21, 22, 23};
++    for (size_t i = 0; i < 4; ++i)
++    {
++        glActiveTexture(GL_TEXTURE0 + samplerUnits[i]);
++        glBindTexture(GL_TEXTURE_2D, textures[i]);
++        glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
++        const std::array<uint32_t, 4> zero = {};
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT, zero.data());
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    }
++    for (size_t i = 0; i < 4; ++i)
++    {
++        glBindImageTexture(static_cast<GLuint>(i), textures[permutation[i]], 0, GL_FALSE, 0,
++                           GL_READ_WRITE, GL_R32UI);
++    }
++    GLBuffer allocation;
++    std::array<uint32_t, 128> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 0, 64);
++    GLProgram restored;
++    reloadProgram(a, restored);
++    glUseProgram(restored);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 64);
++    glUseProgram(b);
++    glUniform1iv(glGetUniformLocation(b, "images[0]"), 4, samplerUnits.data());
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    for (uint32_t image = 0; image < 4; ++image)
++    {
++        for (uint32_t channel = 0; channel < 4; ++channel)
++        {
++            expected[4 * image + channel] = channel == 0 ? 100 + image : channel == 3 ? 1 : 0;
++            expected[256 / 4 + 4 * image + channel] = channel == 0   ? 100 + inverse[image]
++                                                      : channel == 3 ? 1
++                                                                     : 0;
++        }
++    }
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ TEST_P(ComputeDispatchTestMetal, ZeroDispatchAndFrontendValidation)
+ {
+     constexpr char source[] = R"(#version 310 es

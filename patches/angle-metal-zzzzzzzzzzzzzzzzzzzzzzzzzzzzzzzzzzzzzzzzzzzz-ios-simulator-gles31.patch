@@ -1,0 +1,45 @@
+diff --git a/gni/angle.gni b/gni/angle.gni
+index 8d0c0e4..ac6f8bd 100644
+--- a/gni/angle.gni
++++ b/gni/angle.gni
+@@ -253,7 +253,7 @@ declare_args() {
+ 
+   angle_enable_metal = is_apple
+ 
+-  # Explicit macOS GLES 3.1/MDI build profile. The baseline stays GLES 3.0.
++  # Explicit macOS/iOS Simulator GLES 3.1/MDI profile. The baseline stays GLES 3.0.
+   angle_metal_enable_gles31 = false
+ 
+   # Internal integration tests only. Never use for distributed native packages.
+diff --git a/src/libANGLE/renderer/metal/BUILD.gn b/src/libANGLE/renderer/metal/BUILD.gn
+index 337a22c..1287f50 100644
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -14,7 +14,8 @@ if (metal_internal_shader_compilation_supported) {
+ assert(is_mac || is_ios)
+ assert(angle_enable_metal)
+ assert(!angle_metal_enable_compute_tests || (is_mac && angle_build_tests))
+-assert(!angle_metal_enable_gles31 || is_mac)
++assert(!angle_metal_enable_gles31 || is_mac ||
++       (is_ios && target_environment == "simulator"))
+ assert(!angle_metal_enable_gles31 || !angle_metal_enable_compute_tests)
+ 
+ config("angle_metal_backend_config") {
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index f7de9d1..eb3e6d7 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -428,10 +428,11 @@ bool IsMetalDisplayAvailable()
+ #if defined(ANGLE_METAL_COMPUTE_TESTS)
+     // Preserve the isolated test profile independently of production selection.
+     return true;
+-#elif defined(ANGLE_METAL_GLES31) && TARGET_OS_OSX && !TARGET_OS_MACCATALYST
++#elif defined(ANGLE_METAL_GLES31) && (TARGET_OS_OSX || TARGET_OS_SIMULATOR) && \
++    !TARGET_OS_MACCATALYST
+     // Language-only memory fences require Metal 3.2. Restrict the opt-in profile
+     // to Apple GPUs with the resource features used by the compute/image paths.
+-    if (@available(macOS 15.0, *))
++    if (@available(macOS 15.0, iOS 18.0, *))
+     {
+         return supportsAppleGPUFamily(7) &&
+                mMetalDevice.get().argumentBuffersSupport >= MTLArgumentBuffersTier2 &&

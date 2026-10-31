@@ -1,0 +1,892 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 0d8a56c..aae279b 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -154,6 +154,7 @@ class GenMetalTraverser : public TIntermTraverser
+     void emitOpeningPointerParen();
+     void emitClosingPointerParen();
+     void emitFunctionSignature(const TFunction &func);
++    void emitArrayDrawID(bool instance);
+     void emitFunctionReturn(const TFunction &func);
+     void emitFunctionParameter(const TFunction &func, const TVariable &param);
+ 
+@@ -215,6 +216,8 @@ class GenMetalTraverser : public TIntermTraverser
+     int mOpenPointerParenCount        = 0;
+     bool mParentIsSwitch              = false;
+     bool isTraversingVertexMain       = false;
++    const TVariable *mArrayVertexID   = nullptr;
++    const TVariable *mArrayInstanceID = nullptr;
+     bool mTemporarilyDisableSemicolon = false;
+     std::unordered_map<const TSymbol *, Name> mRenamedSymbols;
+     const FuncToName mFuncToName           = BuildFuncToName();
+@@ -1772,10 +1775,21 @@ void GenMetalTraverser::visitSymbol(TIntermSymbol *symbolNode)
+     {
+         mOut << "(" << sh::mtl::kArrayDrawEmulationConstName << " ? ANGLE_arrayVertexID(";
+         emitNameOf(var);
++        mOut << ", ";
++        emitArrayDrawID(true);
+         mOut << ", ANGLE_arrayDraw) : ";
+         emitNameOf(var);
+         mOut << ")";
+     }
++    else if (isTraversingVertexMain && &var == mArrayInstanceID)
++    {
++        mOut << "(" << sh::mtl::kArrayDrawEmulationConstName << " ? ";
++        mOut << "((";
++        emitNameOf(var);
++        mOut << " - ANGLE_arrayDraw[6]) / 2u + ANGLE_arrayDraw[6]) : ";
++        emitNameOf(var);
++        mOut << ")";
++    }
+     else if (type.getBasicType() == TBasicType::EbtVoid)
+     {
+         mOut << "/*";
+@@ -2718,12 +2732,20 @@ void GenMetalTraverser::emitFunctionSignature(const TFunction &func)
+         emitFunctionParameter(func, param);
+     }
+ 
+-    if (isTraversingVertexMain && mPipelineStructs.invocationVertexGlobals.external)
++    if (isTraversingVertexMain)
+     {
+         if (emitComma)
+         {
+             mOut << ", ";
+         }
++        if (!mArrayVertexID)
++        {
++            mOut << "uint ANGLE_nativeVertexID [[vertex_id]], ";
++        }
++        if (!mArrayInstanceID)
++        {
++            mOut << "uint ANGLE_nativeInstanceID [[instance_id]], ";
++        }
+         mOut << "const device uint *ANGLE_arrayDraw [[buffer(25), function_constant("
+              << sh::mtl::kArrayDrawEmulationConstName << ")]]";
+     }
+@@ -2735,6 +2757,19 @@ void GenMetalTraverser::emitFunctionSignature(const TFunction &func)
+     mOut << ")";
+ }
+ 
++void GenMetalTraverser::emitArrayDrawID(bool instance)
++{
++    const TVariable *variable = instance ? mArrayInstanceID : mArrayVertexID;
++    if (variable)
++    {
++        emitNameOf(*variable);
++    }
++    else
++    {
++        mOut << (instance ? "ANGLE_nativeInstanceID" : "ANGLE_nativeVertexID");
++    }
++}
++
+ void GenMetalTraverser::emitFunctionReturn(const TFunction &func)
+ {
+     const bool isMain       = func.isMain();
+@@ -2872,6 +2907,25 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+         isTraversingVertexMain      = mCompiler.getShaderType() == GL_VERTEX_SHADER && structure &&
+                                       mPipelineStructs.vertexOut.matches(*structure);
+     }
++    mArrayVertexID   = nullptr;
++    mArrayInstanceID = nullptr;
++    if (isTraversingVertexMain)
++    {
++        for (size_t i = 0; i < func.getParamCount(); ++i)
++        {
++            const TVariable *param = func.getParam(i);
++            if (param->symbolType() == SymbolType::AngleInternal &&
++                param->name() == "vertexIDMetal")
++            {
++                mArrayVertexID = param;
++            }
++            if (Name(*param) == Pipeline{Pipeline::Type::InstanceId, nullptr}.getStructInstanceName(
++                                    Pipeline::Variant::Modified))
++            {
++                mArrayInstanceID = param;
++            }
++        }
++    }
+     emitIndentation();
+     emitFunctionSignature(func);
+     mOut << "\n";
+@@ -3584,6 +3638,39 @@ bool GenMetalTraverser::visitBranch(Visit, TIntermBranch *branchNode)
+                 mOut << "#else\n";
+                 emitIndentation();
+             }
++            if (isTraversingVertexMain && exprNode)
++            {
++                // An odd primitive count leaves one padded primitive in the
++                // second native instance. Clip it after evaluating the user shader.
++                mOut << "auto ANGLE_arrayResult = ";
++                exprNode->traverse(this);
++                mOut << ";\n";
++                emitIndentation();
++                mOut << "if (" << sh::mtl::kArrayDrawEmulationConstName
++                     << " && ANGLE_arrayDrawEnd(";
++                emitArrayDrawID(false);
++                mOut << ", ";
++                emitArrayDrawID(true);
++                mOut << ", ANGLE_arrayDraw)) {\n";
++                for (const TField *field : exprNode->getType().getStruct()->fields())
++                {
++                    if (field->type()->getQualifier() == EvqPosition)
++                    {
++                        emitIndentation();
++                        mOut << "    ANGLE_arrayResult.";
++                        emitNameOf(*field);
++                        mOut << " = metal::float4(2.0, 0.0, 0.0, 1.0);\n";
++                    }
++                }
++                emitIndentation();
++                mOut << "}\n";
++                emitIndentation();
++                mOut << "return ANGLE_arrayResult;\n";
++                emitIndentation();
++                mOut << "#endif\n";
++                mTemporarilyDisableSemicolon = true;
++                break;
++            }
+             mOut << "return";
+             if (exprNode)
+             {
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 4e5440c..d633951 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -46,6 +46,7 @@ class ProgramPrelude : public TIntermTraverser
+                 break;
+             case MetalShaderType::Vertex:
+                 transform_feedback_guard();
++                arrayVertexID();
+                 break;
+             case MetalShaderType::Fragment:
+                 functionConstants();
+@@ -1488,13 +1489,21 @@ constant bool ANGLEArrayDrawEmulation       [[function_constant(ANGLE_ARRAY_DRAW
+ 
+ PROGRAM_PRELUDE_DECLARE(arrayVertexID,
+                         R"(
+-ANGLE_ALWAYS_INLINE uint ANGLE_arrayVertexID(uint nativeID, const device uint *command)
++ANGLE_ALWAYS_INLINE bool ANGLE_arrayDrawEnd(uint nativeID, uint nativeInstance,
++                                          const device uint *command)
++{
++    const uint width = command[2] >= 4u ? 3u : 2u;
++    return ((nativeInstance-command[6]) & 1u)*command[4] + nativeID/width >= command[5];
++}
++ANGLE_ALWAYS_INLINE uint ANGLE_arrayVertexID(uint nativeID, uint nativeInstance,
++                                          const device uint *command)
+ {
+     const uint first = command[0], count = command[1], mode = command[2];
+-    const uint flags = command[3], base = command[4];
++    const uint flags = command[3], base = ((nativeInstance-command[6]) & 1u)*command[4];
+     const bool last = (flags & 2u) != 0u, provoking = (flags & 4u) != 0u;
+     const uint width = mode >= 4u ? 3u : 2u;
+     const uint primitive = base + nativeID / width;
++    if (primitive >= command[5]) return first;
+     uint corner = nativeID % width;
+     uint index = 0u;
+     if (mode == 6u) // fan: origin, i+1, i+2
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 6341013..b57d392 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -477,11 +477,6 @@ class ContextMtl : public ContextImpl, public mtl::Context
+                                       GLsizei instances,
+                                       GLint baseVertex,
+                                       GLuint baseInstance);
+-    angle::Result prepareIndirectLineLoop(const mtl::BufferRef &arguments,
+-                                          size_t argumentOffset,
+-                                          const mtl::BufferSlice &indices,
+-                                          gl::DrawElementsType nativeIndexType,
+-                                          mtl::BufferSlice *closing);
+     angle::Result drawLineLoopArraysNonInstanced(const gl::Context *context,
+                                                  GLint first,
+                                                  GLsizei count);
+@@ -662,7 +657,6 @@ class ContextMtl : public ContextImpl, public mtl::Context
+     // Lineloop and TriFan index buffer
+     mtl::BufferPool mLineLoopIndexBuffer;
+     mtl::BufferPool mLineLoopLastSegmentIndexBuffer;
+-    angle::ObjCPtr<id<MTLFunction>> mIndirectLineLoopFunction;
+     angle::ObjCPtr<id<MTLFunction>> mIndirectIndexConversionFunction;
+     angle::ObjCPtr<id<MTLFunction>> mProceduralArrayDrawFunction;
+     mtl::BufferRef mIndirectIndexConversionBuffer;
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 28e1984..3d04c76 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -8,6 +8,7 @@
+ //
+ 
+ #include "libANGLE/renderer/metal/ContextMtl.h"
++#include "libANGLE/renderer/metal/mtl_draw_command_conversion.h"
+ 
+ #include <TargetConditionals.h>
+ #include <cstdint>
+@@ -47,8 +48,6 @@
+ 
+ namespace
+ {
+-constexpr size_t kIndirectLineLoopPacketSize    = 8 * sizeof(uint32_t);
+-constexpr size_t kIndirectLineLoopIndicesOffset = 6 * sizeof(uint32_t);
+ 
+ #if TARGET_OS_OSX
+ // Unlimited triangle fan buffers
+@@ -1274,92 +1273,6 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     return angle::Result::Continue;
+ }
+ 
+-angle::Result ContextMtl::prepareIndirectLineLoop(const mtl::BufferRef &arguments,
+-                                                  size_t argumentOffset,
+-                                                  const mtl::BufferSlice &indices,
+-                                                  gl::DrawElementsType nativeIndexType,
+-                                                  mtl::BufferSlice *closing)
+-{
+-    if (!mIndirectLineLoopFunction)
+-    {
+-        mtl::TranslatedShaderInfo shader;
+-        shader.metalShaderSource = std::make_shared<const std::string>(R"(
+-#include <metal_stdlib>
+-using namespace metal;
+-kernel void main0(const device uint *source [[buffer(0)]],
+-                  device uint *destination [[buffer(1)]],
+-                  const device uchar *indices [[buffer(2)]],
+-                  constant uint &indexSize [[buffer(3)]])
+-{
+-    const uint count = source[0];
+-    const uint instances = source[1];
+-    const bool visible = count > 1u && instances > 0u;
+-    // Native indexed indirect arguments, a padding word, then two UInt32 indices.
+-    destination[0] = visible ? 2u : 0u;
+-    destination[1] = instances;
+-    destination[2] = 0u;
+-    destination[3] = indexSize ? source[3] : 0u;
+-    destination[4] = indexSize ? source[4] : source[3];
+-    uint first = 0u, last = 0u;
+-    if (visible)
+-    {
+-        const size_t begin = source[2];
+-        const size_t end = begin + size_t(count) - 1u;
+-        if (indexSize == 2u)
+-        {
+-            const device ushort *data = reinterpret_cast<const device ushort *>(indices);
+-            first = data[begin]; last = data[end];
+-        }
+-        else if (indexSize == 4u)
+-        {
+-            const device uint *data = reinterpret_cast<const device uint *>(indices);
+-            first = data[begin]; last = data[end];
+-        }
+-        else
+-        {
+-            first = uint(begin); last = uint(end);
+-        }
+-    }
+-    destination[6] = last;
+-    destination[7] = first;
+-}
+-)");
+-        gl::InfoLog log;
+-        ANGLE_TRY(CreateMslShaderLib(this, log, &shader, {}));
+-        mIndirectLineLoopFunction =
+-            angle::adoptObjCPtr([shader.metalLibrary.get() newFunctionWithName:@"main0"]);
+-        ANGLE_CHECK(this, mIndirectLineLoopFunction, "Missing indirect line-loop kernel",
+-                    GL_INVALID_OPERATION);
+-    }
+-    angle::ObjCPtr<id<MTLComputePipelineState>> pipeline;
+-    ANGLE_TRY(
+-        getPipelineCache().getComputePipeline(this, mIndirectLineLoopFunction.get(), &pipeline));
+-    // Reuse the private indirect scratch allocation. Each conversion ends the
+-    // preceding render encoder before overwriting it, including within MDI.
+-    if (!mIndirectIndexConversionBuffer ||
+-        mIndirectIndexConversionBuffer->size() < kIndirectLineLoopPacketSize)
+-    {
+-        ANGLE_TRY(mtl::Buffer::MakeBufferWithStorageMode(this, MTLStorageModePrivate,
+-                                                         kIndirectLineLoopPacketSize,
+-                                                         &mIndirectIndexConversionBuffer));
+-    }
+-    *closing = mtl::BufferSlice(mIndirectIndexConversionBuffer);
+-    const uint32_t indexSize =
+-        nativeIndexType == gl::DrawElementsType::InvalidEnum
+-            ? 0
+-            : static_cast<uint32_t>(gl::GetDrawElementsTypeSize(nativeIndexType));
+-    auto *encoder = getComputeCommandEncoder();
+-    encoder->setComputePipelineState(pipeline.get());
+-    encoder->setBuffer(arguments, argumentOffset, 0);
+-    encoder->setBufferForWrite(closing->buffer(), closing->offset(), 1);
+-    // The unused array-draw input remains bound for Metal argument validation.
+-    encoder->setBuffer(indexSize ? indices.buffer() : arguments,
+-                       indexSize ? indices.offset() : argumentOffset, 2);
+-    encoder->setData(indexSize, 3);
+-    encoder->dispatch(MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+-    return angle::Result::Continue;
+-}
+-
+ angle::Result ContextMtl::prepareProceduralArrayDraw(gl::PrimitiveMode mode,
+                                                      const mtl::BufferRef &arguments,
+                                                      size_t argumentOffset,
+@@ -1368,38 +1281,8 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     if (!mProceduralArrayDrawFunction)
+     {
+         mtl::TranslatedShaderInfo shader;
+-        shader.metalShaderSource = std::make_shared<const std::string>(R"(
+-#include <metal_stdlib>
+-using namespace metal;
+-kernel void main0(const device uint *source [[buffer(0)]],
+-                  device uint *packet [[buffer(1)]], constant uint2 &params [[buffer(2)]])
+-{
+-    const uint mode = params.x;
+-    // MAX_ELEMENT_INDEX is UINT_MAX-1. Only out-of-range commands are clamped.
+-    const uint count = min(source[0], 0xffffffffu-source[2]);
+-    const uint width = mode >= 4u ? 3u : 2u;
+-    const uint primitives = mode == 1u ? count/2u : mode == 4u ? count/3u :
+-                            mode == 3u ? (count > 1u ? count-1u : 0u) :
+-                            mode == 2u ? (count > 1u ? count : 0u) :
+-                                         (count > 2u ? count-2u : 0u);
+-    const uint maximum = 0xffffffffu/width;
+-    for (uint batch=0u; batch<3u; ++batch)
+-    {
+-        const uint base = batch*maximum;
+-        const uint batchCount = base < primitives ? min(primitives-base,maximum) : 0u;
+-        packet[batch*4u] = batchCount*width;
+-        packet[batch*4u+1u] = source[1];
+-        packet[batch*4u+2u] = 0u;
+-        packet[batch*4u+3u] = source[3];
+-        const uint meta = 16u+batch*8u;
+-        packet[meta] = source[2];
+-        packet[meta+1u] = count;
+-        packet[meta+2u] = mode;
+-        packet[meta+3u] = params.y;
+-        packet[meta+4u] = base;
+-    }
+-}
+-)");
++        shader.metalShaderSource =
++            std::make_shared<const std::string>(mtl::kProceduralArrayDrawShader);
+         gl::InfoLog log;
+         ANGLE_TRY(CreateMslShaderLib(this, log, &shader, {}));
+         mProceduralArrayDrawFunction =
+@@ -1410,7 +1293,7 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     angle::ObjCPtr<id<MTLComputePipelineState>> pipeline;
+     ANGLE_TRY(
+         getPipelineCache().getComputePipeline(this, mProceduralArrayDrawFunction.get(), &pipeline));
+-    constexpr size_t bytes = 160;
++    constexpr size_t bytes = 64;
+     if (!mIndirectIndexConversionBuffer || mIndirectIndexConversionBuffer->size() < bytes)
+     {
+         ANGLE_TRY(mtl::Buffer::MakeBufferWithStorageMode(this, MTLStorageModePrivate, bytes,
+@@ -1451,8 +1334,7 @@ kernel void main0(const device uint *source [[buffer(0)]],
+                          mode == gl::PrimitiveMode::LineLoop ||
+                          requiresIndexRewrite(getState(), mode);
+     bool procedural = false;
+-    mtl::BufferSlice converted, closing;
+-    const bool lineLoop = mode == gl::PrimitiveMode::LineLoop && !convert;
++    mtl::BufferSlice converted;
+     if (convert)
+     {
+         // This is metadata only. Never inspect an indirect count or vertex value on the CPU.
+@@ -1487,11 +1369,6 @@ kernel void main0(const device uint *source [[buffer(0)]],
+         arguments = converted.buffer();
+         offset    = converted.offset();
+     }
+-    else if (lineLoop)
+-    {
+-        ANGLE_TRY(prepareIndirectLineLoop(arguments, offset, {}, gl::DrawElementsType::InvalidEnum,
+-                                          &closing));
+-    }
+     ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
+     if (mCullAllPolygons && gl::IsPolygonMode(mode))
+     {
+@@ -1506,13 +1383,9 @@ kernel void main0(const device uint *source [[buffer(0)]],
+             gl::IsPolygonMode(mode) ? MTLPrimitiveTypeTriangle : MTLPrimitiveTypeLine;
+         if (procedural)
+         {
+-            for (size_t batch = 0; batch < 3; ++batch)
+-            {
+-                mRenderEncoder.setBuffer(gl::ShaderType::Vertex, arguments,
+-                                         offset + 64 + batch * 32,
+-                                         mtl::kArrayDrawCommandBufferBindingIndex);
+-                mRenderEncoder.drawIndirect(primitive, arguments, offset + batch * 16);
+-            }
++            mRenderEncoder.setBuffer(gl::ShaderType::Vertex, arguments, offset + 32,
++                                     mtl::kArrayDrawCommandBufferBindingIndex);
++            mRenderEncoder.drawIndirect(primitive, arguments, offset);
+         }
+         else if (convert)
+         {
+@@ -1521,16 +1394,7 @@ kernel void main0(const device uint *source [[buffer(0)]],
+         }
+         else
+         {
+-            mRenderEncoder.drawIndirect(
+-                mtl::GetPrimitiveType(lineLoop ? gl::PrimitiveMode::LineStrip : mode), arguments,
+-                offset);
+-            if (lineLoop)
+-            {
+-                mRenderEncoder.drawIndexedIndirect(
+-                    MTLPrimitiveTypeLine, MTLIndexTypeUInt32, closing.buffer(),
+-                    closing.offset() + kIndirectLineLoopIndicesOffset, closing.buffer(),
+-                    closing.offset());
+-            }
++            mRenderEncoder.drawIndirect(mtl::GetPrimitiveType(mode), arguments, offset);
+         }
+     }
+     return checkCommandBufferError();
+@@ -1562,8 +1426,6 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     mtl::BufferSlice indexBuffer;
+     gl::DrawElementsType nativeType;
+     gl::PrimitiveMode nativeMode = mode;
+-    const bool lineLoop          = mode == gl::PrimitiveMode::LineLoop && !convert;
+-    mtl::BufferSlice closing;
+     if (convert)
+     {
+         // Read the original byte/short/int representation so primitive restart
+@@ -1584,11 +1446,6 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     {
+         ANGLE_TRY(mtl::GetImpl(getState().getVertexArray())
+                       ->getIndexBufferForIndirect(context, type, &indexBuffer, &nativeType));
+-        if (lineLoop)
+-        {
+-            ANGLE_TRY(
+-                prepareIndirectLineLoop(arguments, offset, indexBuffer, nativeType, &closing));
+-        }
+     }
+     ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
+     if (mCullAllPolygons && gl::IsPolygonMode(mode))
+@@ -1599,17 +1456,9 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     ANGLE_TRY(setupDraw(context, 0, 0, 1, type, nullptr, false, &noOp));
+     if (!noOp)
+     {
+-        mRenderEncoder.drawIndexedIndirect(
+-            mtl::GetPrimitiveType(lineLoop ? gl::PrimitiveMode::LineStrip : nativeMode),
+-            mtl::GetIndexType(nativeType), indexBuffer.buffer(), indexBuffer.offset(), arguments,
+-            offset);
+-        if (lineLoop)
+-        {
+-            mRenderEncoder.drawIndexedIndirect(MTLPrimitiveTypeLine, MTLIndexTypeUInt32,
+-                                               closing.buffer(),
+-                                               closing.offset() + kIndirectLineLoopIndicesOffset,
+-                                               closing.buffer(), closing.offset());
+-        }
++        mRenderEncoder.drawIndexedIndirect(mtl::GetPrimitiveType(nativeMode),
++                                           mtl::GetIndexType(nativeType), indexBuffer.buffer(),
++                                           indexBuffer.offset(), arguments, offset);
+     }
+     return checkCommandBufferError();
+ }
+@@ -3558,7 +3407,8 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+ 
+     // Obtain RenderPipelineDesc's vertex array descriptor.
+     ANGLE_TRY(mVertexArray->setupDraw(context, &mRenderEncoder, &rppChange,
+-                                      &mRenderPipelineDesc.vertexDescriptor));
++                                      &mRenderPipelineDesc.vertexDescriptor,
++                                      mRenderPipelineDesc.getArrayDrawEmulation()));
+ 
+     if (rppChange)
+     {
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index ecef547..05fe54d 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -35,7 +35,7 @@
+ namespace
+ {
+ constexpr uint32_t kMetalProgramBinaryVersion =
+-    0x4d43503a;  // MCP10: optional procedural-array vertex-ID specialization
++    0x4d43503b;  // MCP11: procedural array instance and clipping specialization
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/VertexArrayMtl.h b/src/libANGLE/renderer/metal/VertexArrayMtl.h
+index fc6ac3f..1e5f35a 100644
+--- a/src/libANGLE/renderer/metal/VertexArrayMtl.h
++++ b/src/libANGLE/renderer/metal/VertexArrayMtl.h
+@@ -52,7 +52,8 @@ class VertexArrayMtl : public VertexArrayImpl
+     angle::Result setupDraw(const gl::Context *glContext,
+                             mtl::RenderCommandEncoder *cmdEncoder,
+                             bool *vertexDescChanged,
+-                            mtl::VertexDesc *vertexDescOut);
++                            mtl::VertexDesc *vertexDescOut,
++                            bool arrayDrawEmulation);
+ 
+     angle::Result resolveDrawElementsDraw(const gl::Context *glContext,
+                                           gl::PrimitiveMode mode,
+diff --git a/src/libANGLE/renderer/metal/VertexArrayMtl.mm b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+index 24b3a0c..84544d4 100644
+--- a/src/libANGLE/renderer/metal/VertexArrayMtl.mm
++++ b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+@@ -305,7 +305,8 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+ angle::Result VertexArrayMtl::setupDraw(const gl::Context *glContext,
+                                         mtl::RenderCommandEncoder *cmdEncoder,
+                                         bool *vertexDescChanged,
+-                                        mtl::VertexDesc *vertexDescOut)
++                                        mtl::VertexDesc *vertexDescOut,
++                                        bool arrayDrawEmulation)
+ {
+     // NOTE(hqle): consider only updating dirty attributes
+     bool dirty = mVertexArrayDirty || *vertexDescChanged;
+@@ -406,6 +407,19 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+                 {
+                     stepFunction = MTLVertexStepFunctionPerInstance;
+                     stepRate     = binding.getDivisor();
++                    if (arrayDrawEmulation)
++                    {
++                        // A GL instance is represented by two native instances.
++                        // Divisors above GLsizei's range never advance beyond baseInstance.
++                        if (stepRate > std::numeric_limits<GLsizei>::max())
++                        {
++                            stepRate = std::numeric_limits<uint32_t>::max();
++                        }
++                        else
++                        {
++                            stepRate *= 2;
++                        }
++                    }
+                 }
+ 
+                 // Metal does not allow the sum of the buffer binding
+diff --git a/src/libANGLE/renderer/metal/mtl_draw_command_conversion.h b/src/libANGLE/renderer/metal/mtl_draw_command_conversion.h
+new file mode 100644
+index 0000000..e8a829a
+--- /dev/null
++++ b/src/libANGLE/renderer/metal/mtl_draw_command_conversion.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef LIBANGLE_RENDERER_METAL_MTL_DRAW_COMMAND_CONVERSION_H_
++#define LIBANGLE_RENDERER_METAL_MTL_DRAW_COMMAND_CONVERSION_H_
++
++namespace rx::mtl
++{
++// Fixed-size GPU command packet for array topologies without a vertex-buffer bound.
++inline constexpr char kProceduralArrayDrawShader[] = R"(
++#include <metal_stdlib>
++using namespace metal;
++kernel void main0(const device uint *source [[buffer(0)]],
++                  device uint *packet [[buffer(1)]], constant uint2 &params [[buffer(2)]])
++{
++    const uint mode = params.x;
++    // MAX_ELEMENT_INDEX is UINT_MAX-1. Only out-of-range commands are clamped.
++    const uint count = min(min(source[0],0x7fffffffu), 0xffffffffu-source[2]);
++    const uint width = mode >= 4u ? 3u : 2u;
++    const uint primitives = mode == 1u ? count/2u : mode == 4u ? count/3u :
++                            mode == 3u ? (count > 1u ? count-1u : 0u) :
++                            mode == 2u ? (count > 1u ? count : 0u) :
++                                         (count > 2u ? count-2u : 0u);
++    // Two consecutive native instances cover each GL instance. One native
++    // draw preserves primitive/instance order even when expansion exceeds UINT_MAX.
++    const uint perInstance = (primitives+1u)/2u;
++    packet[0] = perInstance*width;
++    packet[1] = min(source[1],0x7fffffffu)*2u;
++    packet[2] = 0u;
++    // EXT_base_instance defines the final GLES command word.
++    packet[3] = source[3];
++    packet[8] = source[2];
++    packet[9] = count;
++    packet[10] = mode;
++    packet[11] = params.y;
++    packet[12] = perInstance;
++    packet[13] = primitives;
++    packet[14] = source[3];
++}
++)";
++}  // namespace rx::mtl
++
++#endif  // LIBANGLE_RENDERER_METAL_MTL_DRAW_COMMAND_CONVERSION_H_
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 5cc6a55..2aad48b 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -725,29 +725,32 @@ TEST_P(ComputeDispatchTestMetal, NullImagesClearBindingsBinaryAndDeletion)
+ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+ {
+     ASSERT_TRUE(EnsureGLExtensionEnabled("GL_EXT_multi_draw_indirect"));
++    ASSERT_TRUE(EnsureGLExtensionEnabled("GL_EXT_base_instance"));
+     ASSERT_TRUE(EnsureGLExtensionEnabled("GL_ANGLE_provoking_vertex"));
+     constexpr char producer[] = R"(#version 310 es
+         layout(local_size_x=1) in;
+         layout(std430,binding=0) buffer Commands { uint words[]; } commands;
+-        uniform uint base, count, instances, stride, multi;
++        uniform uint base, count, instances, stride, multi, baseInstance;
+         void main() {
+             for(uint draw=0u;draw<1u+multi;++draw) {
+                 uint at=base+draw*stride;
+                 commands.words[at]=count; commands.words[at+1u]=instances;
+-                commands.words[at+2u]=3u+8u*draw; commands.words[at+3u]=0u;
++                commands.words[at+2u]=3u+8u*draw; commands.words[at+3u]=baseInstance;
+             }
+         }
+     )";
+     constexpr char vertex[]   = R"(#version 310 es
+         layout(location=0) in vec2 position;
+-        uniform int fetchMode;
++        uniform int fetchMode, referenceBase;
+         flat out int identity;
+         void main() {
+             int i=gl_VertexID;
+             vec2 p=vec2(float(i%4)*.5-.75,float((i/4)%4)*.5-.75);
+             p=(fetchMode==1 || fetchMode==4 || fetchMode==5) ? position :
+                 p+(fetchMode>1 ? position : vec2(0));
+-            if(fetchMode==-2) p+=vec2(.0625,.03125)*float(gl_InstanceID);
++            if(fetchMode==-2) p+=vec2(.0625,.03125)*float(gl_InstanceID+referenceBase);
++            if(fetchMode==-6) p+=vec2(.0625,.03125)*float(gl_InstanceID/3+referenceBase);
++            if(fetchMode==-7) p+=vec2(.0625,.03125)*float(referenceBase);
+             if(fetchMode==-3) p+=vec2(.0625,.03125);
+             gl_Position=vec4(p+vec2(float(gl_InstanceID)*.03,0),0,1);
+             gl_PointSize=1.; identity=i;
+@@ -789,7 +792,12 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+     glBufferData(GL_ARRAY_BUFFER, sizeof(relativePoints), relativePoints.data(), GL_STATIC_DRAW);
+     glBindBuffer(GL_ARRAY_BUFFER, fixed);
+     glBufferData(GL_ARRAY_BUFFER, sizeof(fixedPoints), fixedPoints.data(), GL_STATIC_DRAW);
+-    const std::array<float, 4> displacement = {0.f, 0.f, .0625f, .03125f};
++    std::array<float, 16> displacement;
++    for (size_t i = 0; i < 8; ++i)
++    {
++        displacement[2 * i]     = float(i) * .0625f;
++        displacement[2 * i + 1] = float(i) * .03125f;
++    }
+     glBindBuffer(GL_ARRAY_BUFFER, offsets);
+     glBufferData(GL_ARRAY_BUFFER, sizeof(displacement), displacement.data(), GL_STATIC_DRAW);
+     glVertexAttribFormat(0, 2, GL_FLOAT, GL_FALSE, 0);
+@@ -802,13 +810,13 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+     for (GLenum mode : {GL_POINTS, GL_LINES, GL_LINE_LOOP, GL_LINE_STRIP, GL_TRIANGLES,
+                         GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN})
+     {
+-        for (int fetchMode = 0; fetchMode < 6; ++fetchMode)
++        for (int fetchMode = 0; fetchMode < 8; ++fetchMode)
+         {
+             for (bool last : {false, true})
+             {
+                 for (bool restarting : {false, true})
+                 {
+-                    for (uint32_t scenario = 0; scenario < 9; ++scenario)
++                    for (uint32_t scenario = 0; scenario < 10; ++scenario)
+                     {
+                         SCOPED_TRACE(testing::Message() << "mode=" << mode << " fetch=" << fetchMode
+                                                         << " last=" << last << " restart="
+@@ -819,19 +827,24 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                                       << " last=" << last << " restart=" << restarting
+                                       << " scenario=" << scenario << std::endl;
+                         }
+-                        const uint32_t count     = scenario == 3   ? 0u
+-                                                   : scenario == 4 ? 1u
+-                                                   : scenario == 5 ? 2u
+-                                                   : scenario == 6 ? 3u
+-                                                   : scenario == 7 ? 4u
+-                                                                   : 14u;
+-                        const uint32_t instances = scenario == 8 ? 0u : scenario >= 4 ? 1u : 2u;
+-                        const bool multi         = scenario == 1 || scenario == 2;
+-                        const uint32_t stride    = scenario == 2 ? 8u : 4u;
+-                        const uint32_t base      = scenario == 0 ? 0u : 64u;
+-                        const GLuint active      = (scenario & 1u) ? binary.get() : render.get();
++                        const uint32_t count        = scenario == 3   ? 0u
++                                                      : scenario == 4 ? 1u
++                                                      : scenario == 5 ? 2u
++                                                      : scenario == 6 ? 3u
++                                                      : scenario == 7 ? 4u
++                                                                      : 14u;
++                        const uint32_t instances    = scenario == 9   ? 5u
++                                                      : scenario == 8 ? 0u
++                                                      : scenario >= 4 ? 1u
++                                                                      : 2u;
++                        const uint32_t baseInstance = scenario == 9 ? 3u : 0u;
++                        const bool multi            = scenario == 1 || scenario == 2;
++                        const uint32_t stride       = scenario == 2 ? 8u : 4u;
++                        const uint32_t base         = scenario == 0 ? 0u : 64u;
++                        const GLuint active         = (scenario & 1u) ? binary.get() : render.get();
+                         glUseProgram(active);
+                         glUniform1i(glGetUniformLocation(active, "fetchMode"), -fetchMode);
++                        glUniform1i(glGetUniformLocation(active, "referenceBase"), baseInstance);
+                         glDisableVertexAttribArray(0);
+                         glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+                         glProvokingVertexANGLE(GL_FIRST_VERTEX_CONVENTION_ANGLE);
+@@ -925,7 +938,7 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                             expectedWords[at]     = count;
+                             expectedWords[at + 1] = instances;
+                             expectedWords[at + 2] = 3u + 8u * draw;
+-                            expectedWords[at + 3] = 0;
++                            expectedWords[at + 3] = baseInstance;
+                         }
+                         const GLuint arguments = scenario == 0 ? minimal.get() : commands.get();
+                         glBindBuffer(GL_DRAW_INDIRECT_BUFFER, arguments);
+@@ -934,12 +947,13 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                                      GL_DYNAMIC_DRAW);
+                         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, arguments);
+                         glUseProgram(compute);
+-                        for (const auto &uniform : std::array<std::pair<const char *, uint32_t>, 5>{
++                        for (const auto &uniform : std::array<std::pair<const char *, uint32_t>, 6>{
+                                  {{"base", base},
+                                   {"count", count},
+                                   {"instances", instances},
+                                   {"stride", stride},
+-                                  {"multi", multi ? 1u : 0u}}})
++                                  {"multi", multi ? 1u : 0u},
++                                  {"baseInstance", baseInstance}}})
+                         {
+                             glUniform1ui(glGetUniformLocation(compute, uniform.first),
+                                          uniform.second);
+@@ -962,10 +976,13 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                                                     : fetchMode == 5 ? fixed.get()
+                                                                      : offsets.get();
+                         glBindVertexBuffer(0, vertexBuffer, fetchMode == 3 ? 8 : 0,
+-                                           fetchMode == 3   ? 0
+-                                           : fetchMode >= 4 ? 16
+-                                                            : 8);
+-                        glVertexBindingDivisor(0, fetchMode == 2 ? 1 : 0);
++                                           fetchMode == 3                     ? 0
++                                           : fetchMode == 4 || fetchMode == 5 ? 16
++                                                                              : 8);
++                        glVertexBindingDivisor(0, fetchMode == 2   ? 1u
++                                                  : fetchMode == 6 ? 3u
++                                                  : fetchMode == 7 ? 0x80000001u
++                                                                   : 0u);
+                         glProvokingVertexANGLE(last ? GL_LAST_VERTEX_CONVENTION_ANGLE
+                                                     : GL_FIRST_VERTEX_CONVENTION_ANGLE);
+                         if (restarting)
+@@ -1001,7 +1018,7 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+             }
+         }
+     }
+-    EXPECT_EQ(compared, 1512u);
++    EXPECT_EQ(compared, 2240u);
+     RecordProperty("ComparedArrayIndirectFrames", compared);
+     ASSERT_GL_NO_ERROR();
+ }
+diff --git a/src/tests/gl_tests/IndirectCommandTestMetal.mm b/src/tests/gl_tests/IndirectCommandTestMetal.mm
+index 79c8626..7d355ce 100644
+--- a/src/tests/gl_tests/IndirectCommandTestMetal.mm
++++ b/src/tests/gl_tests/IndirectCommandTestMetal.mm
+@@ -24,6 +24,7 @@
+ #include "libANGLE/Display.h"
+ #include "libANGLE/renderer/metal/ContextMtl.h"
+ #include "libANGLE/renderer/metal/DisplayMtl.h"
++#include "libANGLE/renderer/metal/mtl_draw_command_conversion.h"
+ 
+ using namespace angle;
+ using namespace rx;
+@@ -486,6 +487,125 @@ void main() {
+     EXPECT_EQ(compared, 4704u);
+ }
+ 
++// Exercise the real GPU conversion kernel at the GLsizei/uint expansion boundary
++// without submitting billions of rasterized vertices. Readback is test-only.
++TEST_P(IndirectCommandTestMetal, ProceduralArrayCommandBoundaries)
++{
++    auto *display                 = static_cast<egl::Display *>(getEGLWindow()->getDisplay());
++    const gl::ContextID contextID = {
++        static_cast<GLuint>(reinterpret_cast<uintptr_t>(getEGLWindow()->getContext()))};
++    gl::Context *glContext = display->getContext(contextID);
++    ContextMtl *context    = mtl::GetImpl(glContext);
++    ASSERT_NE(context, nullptr);
++    NSError *error = nil;
++    auto library   = angle::adoptObjCPtr([context->getMetalDevice()
++        newLibraryWithSource:[NSString stringWithUTF8String:mtl::kProceduralArrayDrawShader]
++                     options:nil
++                       error:&error]);
++    ASSERT_NE(library.get(), nil) << (error ? error.localizedDescription.UTF8String : "");
++    auto function = angle::adoptObjCPtr([library.get() newFunctionWithName:@"main0"]);
++    auto pipeline = angle::adoptObjCPtr([context->getMetalDevice()
++        newComputePipelineStateWithFunction:function.get()
++                                      error:&error]);
++    ASSERT_NE(pipeline.get(), nil) << (error ? error.localizedDescription.UTF8String : "");
++    const std::array<uint32_t, 9> counts = {0u,          1u,          2u,          3u,         4u,
++                                            0x55555555u, 0x55555556u, 0x7ffffffeu, 0x7fffffffu};
++    constexpr uint32_t guard             = 0xcdcdcdcdu;
++    size_t compared                      = 0;
++    for (uint32_t mode : {1u, 2u, 3u, 4u, 5u, 6u})
++    {
++        for (uint32_t count : counts)
++        {
++            for (uint32_t first : {0u, 3u, 0x80000000u, 0xfffffffeu, 0xffffffffu})
++            {
++                for (uint32_t instances : {0u, 1u, 3u, 0x7fffffffu})
++                {
++                    for (uint32_t baseInstance : {0u, 3u})
++                    {
++                        SCOPED_TRACE(testing::Message()
++                                     << mode << ":" << count << ":" << first << ":" << instances);
++                        mtl::BufferRef source, output;
++                        // The command ends at the end of its allocation: a fifth word is illegal.
++                        ASSERT_EQ(mtl::Buffer::MakeBuffer(context, 272, &source),
++                                  angle::Result::Continue);
++                        ASSERT_EQ(mtl::Buffer::MakeBuffer(context, 128, &output),
++                                  angle::Result::Continue);
++                        std::array<uint32_t, 68> input;
++                        input.fill(guard);
++                        input[64]  = count;
++                        input[65]  = instances;
++                        input[66]  = first;
++                        input[67]  = baseInstance;
++                        auto write = source->map(context);
++                        std::memcpy(write.data(), input.data(), sizeof(input));
++                        source->unmap(context);
++                        std::array<uint32_t, 32> expected;
++                        expected.fill(guard);
++                        write = output->map(context);
++                        std::memcpy(write.data(), expected.data(), sizeof(expected));
++                        output->unmap(context);
++                        const std::array<uint32_t, 2> params = {mode, 2u};
++                        auto *encoder                        = context->getComputeCommandEncoder();
++                        encoder->setComputePipelineState(pipeline.get());
++                        encoder->setBuffer(source, 256, 0);
++                        encoder->setBufferForWrite(output, 32, 1);
++                        encoder->setData(params, 2);
++                        encoder->dispatch(MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
++                        const uint64_t bounded =
++                            std::min<uint64_t>(count, uint64_t(0xffffffffu) - first);
++                        uint64_t primitives = 0;
++                        switch (mode)
++                        {
++                            case 1:
++                                primitives = bounded / 2;
++                                break;
++                            case 2:
++                                primitives = bounded > 1 ? bounded : 0;
++                                break;
++                            case 3:
++                                primitives = bounded > 1 ? bounded - 1 : 0;
++                                break;
++                            case 4:
++                                primitives = bounded / 3;
++                                break;
++                            default:
++                                primitives = bounded > 2 ? bounded - 2 : 0;
++                                break;
++                        }
++                        const uint64_t chunk    = (primitives + 1) / 2;
++                        const uint64_t vertices = chunk * (mode >= 4 ? 3 : 2);
++                        ASSERT_LE(vertices, uint64_t(0xffffffffu));
++                        expected[8]  = static_cast<uint32_t>(vertices);
++                        expected[9]  = instances * 2u;
++                        expected[10] = 0;
++                        expected[11] = baseInstance;
++                        expected[16] = first;
++                        expected[17] = static_cast<uint32_t>(bounded);
++                        expected[18] = mode;
++                        expected[19] = 2;
++                        expected[20] = static_cast<uint32_t>(chunk);
++                        expected[21] = static_cast<uint32_t>(primitives);
++                        expected[22] = baseInstance;
++                        auto read    = output->mapReadOnly(context);
++                        ASSERT_GE(read.size(), sizeof(expected));
++                        EXPECT_EQ(std::memcmp(read.data(), expected.data(), sizeof(expected)), 0);
++                        output->unmap(context);
++                        read = source->mapReadOnly(context);
++                        ASSERT_GE(read.size(), sizeof(input));
++                        EXPECT_EQ(std::memcmp(read.data(), input.data(), sizeof(input)), 0);
++                        source->unmap(context);
++                        ++compared;
++                    }
++                }
++            }
++        }
++    }
++    EXPECT_EQ(compared, 2160u);
++    RecordProperty("ComparedCommandPackets", compared);
++    EXPECT_EQ(context->checkCommandBufferError(), angle::Result::Continue);
++    context->invalidateState(glContext);
++}
++
+ TEST_P(IndirectCommandTestMetal, ReuseGPUGeneratedArguments)
+ {
+     runCommands(false);

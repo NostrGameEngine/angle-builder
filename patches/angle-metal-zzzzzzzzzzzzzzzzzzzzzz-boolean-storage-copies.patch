@@ -1,0 +1,101 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 1998e4b..062b758 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -1958,8 +1958,11 @@ const TField &GenMetalTraverser::getDirectField(const TIntermTyped &fieldsNode,
+ 
+ bool GenMetalTraverser::needsStorageAggregate(const TType &type, const StorageBufferAccess &access)
+ {
++    // GL booleans occupy four bytes per component. Use the typed gather/store
++    // helpers so vector assignments normalize each lane rather than relying on
++    // an invalid implicit Metal boolN-to-uintN conversion.
+     return type.isArray() || type.getStruct() || type.isMatrix() ||
+-           (type.isVector() && access.componentStride != 4);
++           type.getBasicType() == EbtBool || (type.isVector() && access.componentStride != 4);
+ }
+ 
+ size_t GenMetalTraverser::storageAggregateLayout(const TType &type,
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 5a23bdb..a71e1e0 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -719,6 +719,79 @@ TEST_P(ComputeDispatchTestMetal, NullImagesClearBindingsBinaryAndDeletion)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++// Boolean storage uses GL uint-sized components even for packed vectors.
++// Cover noncanonical inputs, assignment values, swizzles and helper copy-out.
++TEST_P(ComputeDispatchTestMetal, BooleanStorageCopiesNormalizeEachComponent)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x=1) in;
++        layout(std430,binding=0) buffer Allocation { uint words[]; } data;
++        void main() {
++            data.words[64]=0x80000000u;
++            data.words[66]=0u; data.words[67]=0x01000000u;
++            data.words[68]=0xffffffffu; data.words[69]=0u; data.words[70]=7u;
++            data.words[71]=123u;
++            data.words[72]=0u; data.words[73]=7u; data.words[74]=0u;
++            data.words[75]=0x80000000u;
++        }
++    )";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x=1) in;
++        layout(std430,binding=0) readonly buffer Input {
++            bool one; bvec2 two; bvec3 three; uint tag; bvec4 four;
++        } inputData;
++        layout(std430,binding=1) buffer Output {
++            bool one; bvec2 two; bvec3 three; uint tag; bvec4 four;
++        } result;
++        void invert(inout bvec3 value) { value=not(value); }
++        void main() {
++            result.one=inputData.one;
++            result.two=inputData.two;
++            result.three=inputData.three;
++            result.four=inputData.four;
++            result.tag=(result.one=inputData.one) &&
++                all(equal((result.two=inputData.two),bvec2(false,true))) ? inputData.tag : 0u;
++            invert(result.three);
++            result.four.yx=inputData.two;
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(produce, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(consume, consumer);
++    GLProgram binary;
++    reloadProgram(consume, binary);
++    GLBuffer allocation;
++    std::array<uint32_t, 512> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    glUseProgram(produce);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 48);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, allocation, 768, 48);
++    glUseProgram(binary);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const std::array<uint32_t, 12> input  = {0x80000000u, 0xcdcdcdcdu, 0u, 0x01000000u,
++                                             0xffffffffu, 0u,          7u, 123u,
++                                             0u,          7u,          0u, 0x80000000u};
++    const std::array<uint32_t, 12> output = {1u, 0xcdcdcdcdu, 0u, 1u, 0u, 1u,
++                                             0u, 123u,        1u, 0u, 0u, 1u};
++    std::copy(input.begin(), input.end(), expected.begin() + 64);
++    std::copy(output.begin(), output.end(), expected.begin() + 192);
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t word = 0; word < expected.size(); ++word)
++    {
++        EXPECT_EQ(actual[word], expected[word]) << "source/result/guard word " << word;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ // Check every byte of the advertised 64 KB UBO, after a GPU producer and
+ // binary reload, then consume the same storage in both graphics stages.
+ TEST_P(ComputeDispatchTestMetal, LargeGPUWrittenUniformBlockAllStages)

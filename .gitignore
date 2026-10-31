@@ -8,3 +8,4 @@ generated
 x.git
 .gradle
 test-results/
+__pycache__/

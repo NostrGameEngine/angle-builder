@@ -1,0 +1,72 @@
+diff --git a/src/compiler/translator/msl/ModifyStruct.cpp b/src/compiler/translator/msl/ModifyStruct.cpp
+index 5a424d5..c107743 100644
+--- a/src/compiler/translator/msl/ModifyStruct.cpp
++++ b/src/compiler/translator/msl/ModifyStruct.cpp
+@@ -353,12 +353,22 @@ class ConvertStructState : angle::NonCopyable
+             // index is sufficient to define all the entries in MSL interface in all the compatible
+             // VS and FS MSL programs.
+             newName = BuildConcatenatedImmutableString(rootFieldName(), '_', mSubfieldIndex);
+-            const auto &rootLayout = pathItems.front().field->type()->getLayoutQualifier();
++            const TType &rootType = *pathItems.front().field->type();
++            // A struct member's temporary type does not carry its varying's
++            // interpolation qualifier. Preserve it on every flattened leaf,
++            // without replacing an explicit interface-block member qualifier.
++            if ((IsShaderIn(rootType.getQualifier()) || IsShaderOut(rootType.getQualifier())) &&
++                IsQualifierUnspecified(newType.getQualifier()))
++            {
++                modifiedType = new TType(newType);
++                modifiedType->setQualifier(rootType.getQualifier());
++            }
++            const auto &rootLayout = rootType.getLayoutQualifier();
+             if (rootLayout.locationsSpecified)
+             {
+                 // Linearized array elements and matrix columns each consume a
+                 // location. Clone the type: matrix splitting can reuse newType.
+-                modifiedType                = new TType(newType);
++                modifiedType                = new TType(*modifiedType);
+                 auto location               = modifiedType->getLayoutQualifier();
+                 location.locationsSpecified = 1;
+                 location.location           = rootLayout.location + mSubfieldIndex;
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index c98f4a0..9e0ab55 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -8,6 +8,7 @@
+ //
+ 
+ #include <regex>
++#include <utility>
+ #include "GLSLANG/ShaderLang.h"
+ #include "angle_gl.h"
+ #include "gtest/gtest.h"
+@@ -1224,6 +1225,30 @@ TEST_F(MSLOutputTest, FragmentHelperInvocation)
+     EXPECT_TRUE(notFoundInCode("gl_HelperInvocation"));
+ }
+ 
++// Struct flattening must retain interpolation on every member and matrix column.
++TEST_F(MSLOutputTest, StructVaryingInterpolationQualifiers)
++{
++    getResources()->OES_shader_multisample_interpolation = 1;
++    for (const auto &test :
++         {std::pair{"sample", "[[sample_perspective]]"},
++          std::pair{"centroid", "[[centroid_perspective]]"}, std::pair{"flat", "[[flat]]"}})
++    {
++        SCOPED_TRACE(test.first);
++        const std::string source = std::string(R"(#version 310 es
++            #extension GL_OES_shader_multisample_interpolation : require
++            precision highp float;
++            struct Data { float x; vec2 y; mat2 basis; };
++        )") + test.first + R"( in Data data;
++            out vec4 color;
++            void main() {
++                color = vec4(data.x, data.y.x, data.y.y, data.basis[1][1]);
++            }
++        )";
++        compile(source);
++        EXPECT_TRUE(foundInCode(test.second));
++    }
++}
++
+ TEST_F(MSLOutputTest, MultisampleInterpolationNoCrash)
+ {
+     getResources()->OES_shader_multisample_interpolation = 1;

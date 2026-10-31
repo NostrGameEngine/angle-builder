@@ -1,0 +1,236 @@
+diff --git a/src/libANGLE/validationES31.cpp b/src/libANGLE/validationES31.cpp
+index 551418d..3a11345 100644
+--- a/src/libANGLE/validationES31.cpp
++++ b/src/libANGLE/validationES31.cpp
+@@ -541,8 +541,8 @@ bool ValidateMultiDrawIndirectBase(const Context *context,
+                                    GLsizei drawcount,
+                                    GLsizei stride)
+ {
+-    // An INVALID_VALUE error is generated if stride is neither 0 nor a multiple of 4.
+-    if ((stride & 3) != 0)
++    // Stride is a nonnegative sizei and must be zero or a multiple of four.
++    if (stride < 0 || (stride & 3) != 0)
+     {
+         ANGLE_VALIDATION_ERROR(GL_INVALID_VALUE, kInvalidDrawBufferValue);
+         return false;
+diff --git a/src/libANGLE/validationESEXT.cpp b/src/libANGLE/validationESEXT.cpp
+index 9a5f8d8..bb3fa6f 100644
+--- a/src/libANGLE/validationESEXT.cpp
++++ b/src/libANGLE/validationESEXT.cpp
+@@ -6,6 +6,7 @@
+ // validationESEXT.cpp: Validation functions for OpenGL ES extension entry points.
+ //
+ 
++#include "common/mathutil.h"
+ #include "common/unsafe_buffers.h"
+ #include "libANGLE/validationESEXT_autogen.h"
+ 
+@@ -616,6 +617,33 @@ bool ValidateMultiDrawElementsEXT(const Context *context,
+     return false;
+ }
+ 
++namespace
++{
++// First-command validation establishes valid state and a nonnegative buffer
++// offset. The stride is nonnegative (and may overlap commands), so checking the
++// last interval covers the entire sequence.
++bool ValidateMultiDrawIndirectRange(const Context *context,
++                                    angle::EntryPoint entryPoint,
++                                    const void *indirect,
++                                    GLsizei drawcount,
++                                    GLsizei stride,
++                                    size_t commandSize)
++{
++    const Buffer *buffer = context->getState().getTargetBuffer(BufferBinding::DrawIndirect);
++    angle::CheckedNumeric<size_t> last(reinterpret_cast<uintptr_t>(indirect));
++    const size_t step = stride ? static_cast<size_t>(stride) : commandSize;
++    last += angle::CheckedNumeric<size_t>(step) * (static_cast<size_t>(drawcount) - 1);
++    const auto end = last + commandSize;
++    if (!last.IsValid() || !end.IsValid() ||
++        end.ValueOrDie() > static_cast<size_t>(buffer->getSize()))
++    {
++        ANGLE_VALIDATION_ERROR(GL_INVALID_OPERATION, kParamOverflow);
++        return false;
++    }
++    return true;
++}
++}  // namespace
++
+ bool ValidateMultiDrawArraysIndirectEXT(const Context *context,
+                                         angle::EntryPoint entryPoint,
+                                         PrimitiveMode modePacked,
+@@ -633,7 +661,8 @@ bool ValidateMultiDrawArraysIndirectEXT(const Context *context,
+         return false;
+     }
+ 
+-    return true;
++    return ValidateMultiDrawIndirectRange(context, entryPoint, indirect, drawcount, stride,
++                                          sizeof(DrawArraysIndirectCommand));
+ }
+ 
+ bool ValidateMultiDrawElementsIndirectEXT(const Context *context,
+@@ -651,7 +680,9 @@ bool ValidateMultiDrawElementsIndirectEXT(const Context *context,
+ 
+     const State &state                      = context->getState();
+     TransformFeedback *curTransformFeedback = state.getCurrentTransformFeedback();
+-    if (!ValidateDrawElementsIndirect(context, entryPoint, modePacked, typePacked, indirect))
++    if (!ValidateDrawElementsIndirect(context, entryPoint, modePacked, typePacked, indirect) ||
++        !ValidateMultiDrawIndirectRange(context, entryPoint, indirect, drawcount, stride,
++                                        sizeof(DrawElementsIndirectCommand)))
+     {
+         return false;
+     }
+diff --git a/src/tests/BUILD.gn b/src/tests/BUILD.gn
+index da1bce5..387a28b 100644
+--- a/src/tests/BUILD.gn
++++ b/src/tests/BUILD.gn
+@@ -586,6 +586,7 @@ if (is_win || is_linux || is_chromeos || is_android || is_fuchsia || is_apple) {
+           "gl_tests/ComputeShaderTest.cpp",
+           "gl_tests/DrawElementsIndirectTest.cpp",
+           "gl_tests/FramebufferTest.cpp",
++          "gl_tests/MultiDrawTest.cpp",
+           "gl_tests/ProgramInterfaceTest.cpp",
+           "gl_tests/ProgramPipelineTest.cpp",
+           "gl_tests/ShaderStorageBufferTest.cpp",
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 734f6bf..3d6ac3d 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -2,6 +2,9 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include "libANGLE/Context.h"
++#include "libANGLE/Display.h"
++#include "libANGLE/validationESEXT_autogen.h"
+ #include "test_utils/ANGLETest.h"
+ #include "test_utils/gl_raii.h"
+ 
+@@ -11,6 +14,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
++#include <limits>
+ 
+ using namespace angle;
+ namespace
+@@ -278,6 +282,101 @@ TEST_P(ComputeDispatchTestMetal, AtanZeroAbscissaAndBinary)
+     }
+ }
+ 
++// Validate the complete command interval without encoding a native draw. This
++// also reproduces missing frontend checks safely with Metal validation enabled.
++TEST_P(ComputeDispatchTestMetal, MultiDrawCommandRanges)
++{
++    constexpr char vertex[]   = R"(#version 310 es
++        void main() { gl_Position=vec4(0,0,0,1); }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        out vec4 color;
++        void main() { color=vec4(1); }
++    )";
++    ANGLE_GL_PROGRAM(program, vertex, fragment);
++    glUseProgram(program);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
++    GLBuffer commands, indices;
++    const std::array<uint32_t, 16> zeros = {};
++    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, commands);
++    glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(zeros), zeros.data(), GL_STATIC_DRAW);
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(zeros), zeros.data(), GL_STATIC_DRAW);
++    auto *display          = static_cast<egl::Display *>(getEGLWindow()->getDisplay());
++    const gl::ContextID id = {
++        static_cast<GLuint>(reinterpret_cast<uintptr_t>(getEGLWindow()->getContext()))};
++    gl::Context *context = display->getContext(id);
++    ASSERT_NE(context, nullptr);
++    ASSERT_GL_NO_ERROR();
++    for (bool indexed : {false, true})
++    {
++        SCOPED_TRACE(indexed);
++        const GLsizei commandSize = indexed ? 20 : 16;
++        auto validate = [&](uintptr_t offset, GLsizei count, GLsizei stride, bool expected,
++                            GLenum error) {
++            SCOPED_TRACE(offset);
++            SCOPED_TRACE(count);
++            SCOPED_TRACE(stride);
++            const void *at = reinterpret_cast<const void *>(offset);
++            const bool actual =
++                indexed ? gl::ValidateMultiDrawElementsIndirectEXT(
++                              context, angle::EntryPoint::GLMultiDrawElementsIndirectEXT,
++                              gl::PrimitiveMode::Triangles, gl::DrawElementsType::UnsignedInt, at,
++                              count, stride)
++                        : gl::ValidateMultiDrawArraysIndirectEXT(
++                              context, angle::EntryPoint::GLMultiDrawArraysIndirectEXT,
++                              gl::PrimitiveMode::Triangles, at, count, stride);
++            EXPECT_EQ(actual, expected);
++            EXPECT_GL_ERROR(error);
++        };
++        validate(64 - commandSize, 1, 0, true, GL_NO_ERROR);
++        validate(0, 64 / commandSize, 0, true, GL_NO_ERROR);
++        validate(0, 64 / commandSize + 1, 0, false, GL_INVALID_OPERATION);
++        validate(0, 2, 64, false, GL_INVALID_OPERATION);
++        validate(commandSize * 2, 3, -commandSize, false, GL_INVALID_VALUE);
++        validate(commandSize, 3, -commandSize, false, GL_INVALID_VALUE);
++        validate(0, 3, 4, true, GL_NO_ERROR);
++        validate(8, 3, -4, false, GL_INVALID_VALUE);
++        validate(0, 1, std::numeric_limits<GLsizei>::min(), false, GL_INVALID_VALUE);
++        validate(0, std::numeric_limits<GLsizei>::max(), std::numeric_limits<GLsizei>::max() - 3,
++                 false, GL_INVALID_OPERATION);
++        validate(std::numeric_limits<uintptr_t>::max() - 3, 1, 0, false, GL_INVALID_OPERATION);
++        validate(2, 1, 0, false, GL_INVALID_VALUE);
++        validate(0, 0, 0, false, GL_INVALID_VALUE);
++        validate(0, -1, 0, false, GL_INVALID_VALUE);
++        validate(0, 1, 2, false, GL_INVALID_VALUE);
++
++        // The public entry point must reject the entire invalid sequence before
++        // encoding any native command. Negative strides are rejected; valid
++        // overlapping packets are zero-filled and produce no fragments.
++        auto draw = [&](uintptr_t offset, GLsizei count, GLsizei stride) {
++            const void *at = reinterpret_cast<const void *>(offset);
++            if (indexed)
++            {
++                glMultiDrawElementsIndirectEXT(GL_TRIANGLES, GL_UNSIGNED_INT, at, count, stride);
++            }
++            else
++            {
++                glMultiDrawArraysIndirectEXT(GL_TRIANGLES, at, count, stride);
++            }
++        };
++        draw(0, 64 / commandSize + 1, 0);
++        EXPECT_GL_ERROR(GL_INVALID_OPERATION);
++        draw(0, 2, 64);
++        EXPECT_GL_ERROR(GL_INVALID_OPERATION);
++        draw(commandSize, 3, -commandSize);
++        EXPECT_GL_ERROR(GL_INVALID_VALUE);
++        draw(commandSize * 2, 3, -commandSize);
++        EXPECT_GL_ERROR(GL_INVALID_VALUE);
++        draw(0, 3, 4);
++        EXPECT_GL_NO_ERROR();
++        draw(8, 3, -4);
++        EXPECT_GL_ERROR(GL_INVALID_VALUE);
++    }
++}
++
+ // A GPU producer supplies std140 graphics uniforms whose native Metal layout
+ // requires matrix transposition, array repacking and boolean normalization.
+ TEST_P(ComputeDispatchTestMetal, GPUWrittenGraphicsUniformConversionAndBinary)
+diff --git a/src/tests/gl_tests/MultiDrawTest.cpp b/src/tests/gl_tests/MultiDrawTest.cpp
+index 1d384ec..cd2cfc7 100644
+--- a/src/tests/gl_tests/MultiDrawTest.cpp
++++ b/src/tests/gl_tests/MultiDrawTest.cpp
+@@ -1763,7 +1763,13 @@ ANGLE_INSTANTIATE_TEST_COMBINE_3(MultiDrawTestES3,
+                                  ANGLE_ALL_MULTIDRAW_TEST_PLATFORMS_ES3);
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(MultiDrawIndirectTest);
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++ANGLE_INSTANTIATE_TEST(MultiDrawIndirectTest,
++                       ANGLE_ALL_MULTIDRAW_TEST_PLATFORMS_ES3_1,
++                       ES31_METAL().enable(Feature::AlwaysEnableEmulatedMultidrawExtensions));
++#else
+ ANGLE_INSTANTIATE_TEST(MultiDrawIndirectTest, ANGLE_ALL_MULTIDRAW_TEST_PLATFORMS_ES3_1);
++#endif
+ 
+ ANGLE_INSTANTIATE_TEST(MultiDrawEmulationTest, ANGLE_ALL_MULTIDRAW_TEST_PLATFORMS_ES2);
+ }  // namespace

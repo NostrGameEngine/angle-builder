@@ -1,0 +1,301 @@
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index a1d375a..7d14fc9 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -3127,24 +3127,28 @@ PROGRAM_PRELUDE_DECLARE(imageSize, R"(
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access> &texture)
+ {
++    if (metal::is_null_texture(texture)) return metal::int2(0);
+     return metal::int2(texture.get_width(), texture.get_height());
+ }
+ 
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture3d<T, Access> &texture)
+ {
++    if (metal::is_null_texture(texture)) return metal::int3(0);
+     return metal::int3(texture.get_width(), texture.get_height(), texture.get_depth());
+ }
+ 
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d_array<T, Access> &texture)
+ {
++    if (metal::is_null_texture(texture)) return metal::int3(0);
+     return metal::int3(texture.get_width(), texture.get_height(), texture.get_array_size());
+ }
+ 
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texturecube<T, Access> &texture)
+ {
++    if (metal::is_null_texture(texture)) return metal::int2(0);
+     return metal::int2(texture.get_width(), texture.get_height());
+ }
+ )")
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index 060bb2d..1714c6c 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -1118,9 +1118,12 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         for (size_t element = 0; element < binding.boundImageUnits.size(); ++element)
+         {
+             const auto &unit = glState.getImageUnit(binding.boundImageUnits[element]);
+-            ANGLE_CHECK(context,
+-                        unit.texture.get() &&
+-                            (unit.layered || unit.texture->getType() != gl::TextureType::_3D),
++            if (!unit.texture.get())
++            {
++                storageImages.push_back({nullptr, &unit, static_cast<uint32_t>(slot + element)});
++                continue;
++            }
++            ANGLE_CHECK(context, unit.layered || unit.texture->getType() != gl::TextureType::_3D,
+                         "Non-layered 3D compute images require a shader variant",
+                         GL_INVALID_OPERATION);
+             TextureMtl *texture = mtl::GetImpl(unit.texture.get());
+@@ -1172,6 +1175,13 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     }
+     for (const auto &image : storageImages)
+     {
++        if (!image.texture)
++        {
++            // Clear the native slot as well as the GL binding. Guarded image
++            // helpers define null reads/sizes as zero and discard stores.
++            encoder->setTexture({}, image.slot);
++            continue;
++        }
+         ANGLE_TRY(image.texture->bindToComputeImage(glContext, encoder, image.slot,
+                                                     image.unit->level, image.unit->layered,
+                                                     image.unit->layer, image.unit->format));
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 2a59695..942c840 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -34,7 +34,8 @@
+ 
+ namespace
+ {
+-constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435036;  // MCP6
++constexpr uint32_t kMetalProgramBinaryVersion =
++    0x4d435037;  // MCP7: reject binaries with unguarded null-image accesses
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/tests/BUILD.gn b/src/tests/BUILD.gn
+index 5b67601..8e3afb2 100644
+--- a/src/tests/BUILD.gn
++++ b/src/tests/BUILD.gn
+@@ -580,7 +580,10 @@ if (is_win || is_linux || is_chromeos || is_android || is_fuchsia || is_apple) {
+     if (angle_enable_metal) {
+       sources += angle_white_box_tests_metal_sources
+       if (angle_metal_enable_compute_tests) {
+-        sources += [ "gl_tests/ComputeDispatchTestMetal.cpp" ]
++        sources += [
++          "gl_tests/ComputeDispatchTestMetal.cpp",
++          "gl_tests/ComputeShaderTest.cpp",
++        ]
+       }
+     }
+   }
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 6a2c61b..feecef7 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -5,6 +5,7 @@
+ #include "test_utils/ANGLETest.h"
+ #include "test_utils/gl_raii.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdlib>
+ #include <cstring>
+@@ -560,6 +561,164 @@ TEST_P(ComputeDispatchTestMetal, GPUIndexedPrimitiveRestartAndProvokingVertex)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++TEST_P(ComputeDispatchTestMetal, NullImagesClearBindingsBinaryAndDeletion)
++{
++    constexpr char source[] = R"(#version 310 es
++        precision highp float;
++        precision highp int;
++        layout(local_size_x=1) in;
++        layout(r32ui,binding=0) uniform highp uimage2D planar;
++        layout(r32i,binding=1) uniform highp iimage3D volume;
++        layout(r32f,binding=2) uniform highp image2DArray layers;
++        layout(r32ui,binding=3) uniform highp uimageCube faces;
++        layout(std430,binding=0) buffer Results { uvec4 records[]; } result;
++        uniform uint phase;
++        void main() {
++            uint base=phase*12u;
++            result.records[base]=uvec4(uvec2(imageSize(planar)),0u,0u);
++            result.records[base+1u]=uvec4(uvec3(imageSize(volume)),0u);
++            result.records[base+2u]=uvec4(uvec3(imageSize(layers)),0u);
++            result.records[base+3u]=uvec4(uvec2(imageSize(faces)),0u,0u);
++            result.records[base+4u]=imageLoad(planar,ivec2(0));
++            result.records[base+5u]=uvec4(imageLoad(volume,ivec3(0)));
++            result.records[base+6u]=floatBitsToUint(imageLoad(layers,ivec3(0)));
++            result.records[base+7u]=imageLoad(faces,ivec3(0));
++            imageStore(planar,ivec2(0),uvec4(101u+phase*11u,0u,0u,1u));
++            imageStore(volume,ivec3(0),ivec4(-int(201u+phase*13u),0,0,1));
++            imageStore(layers,ivec3(0),vec4(.5+float(phase),0,0,1));
++            imageStore(faces,ivec3(0),uvec4(301u+phase*17u,0u,0u,1u));
++            memoryBarrierImage();
++            result.records[base+8u]=imageLoad(planar,ivec2(0));
++            result.records[base+9u]=uvec4(imageLoad(volume,ivec3(0)));
++            result.records[base+10u]=floatBitsToUint(imageLoad(layers,ivec3(0)));
++            result.records[base+11u]=imageLoad(faces,ivec3(0));
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLProgram restored;
++    GLTexture planarTexture, volumeTexture, layerTexture, cubeTexture;
++    GLBuffer allocation;
++    std::array<uint32_t, 512> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 5 * 12 * 16);
++    auto floatWord = [](float value) {
++        uint32_t word;
++        std::memcpy(&word, &value, sizeof(word));
++        return word;
++    };
++    auto record = [&](uint32_t phaseIndex, uint32_t entry, std::array<uint32_t, 4> words) {
++        const size_t offset = 256 / 4 + (phaseIndex * 12 + entry) * 4;
++        std::copy(words.begin(), words.end(), expected.begin() + offset);
++    };
++    auto bindImages = [&](bool bound) {
++        glBindImageTexture(0, bound ? planarTexture.get() : 0, 0, GL_FALSE, 0, GL_READ_WRITE,
++                           GL_R32UI);
++        glBindImageTexture(1, bound ? volumeTexture.get() : 0, 0, GL_TRUE, 0, GL_READ_WRITE,
++                           GL_R32I);
++        glBindImageTexture(2, bound ? layerTexture.get() : 0, 0, GL_TRUE, 0, GL_READ_WRITE,
++                           GL_R32F);
++        glBindImageTexture(3, bound ? cubeTexture.get() : 0, 0, GL_TRUE, 0, GL_READ_WRITE,
++                           GL_R32UI);
++    };
++    GLuint active = program;
++    for (uint32_t phaseIndex = 0; phaseIndex < 5; ++phaseIndex)
++    {
++        SCOPED_TRACE(phaseIndex);
++        const bool bound = phaseIndex == 1 || phaseIndex == 3;
++        if (phaseIndex == 1)
++        {
++            const uint32_t planarValue = 11, cubeValue = 17;
++            const int32_t volumeValue = -13;
++            const float layerValue    = .5f;
++            glBindTexture(GL_TEXTURE_2D, planarTexture);
++            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32UI, 1, 1);
++            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1, 1, GL_RED_INTEGER, GL_UNSIGNED_INT,
++                            &planarValue);
++            glBindTexture(GL_TEXTURE_3D, volumeTexture);
++            glTexStorage3D(GL_TEXTURE_3D, 1, GL_R32I, 1, 1, 1);
++            glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, 1, 1, 1, GL_RED_INTEGER, GL_INT,
++                            &volumeValue);
++            glBindTexture(GL_TEXTURE_2D_ARRAY, layerTexture);
++            glTexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_R32F, 1, 1, 1);
++            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0, 1, 1, 1, GL_RED, GL_FLOAT,
++                            &layerValue);
++            glBindTexture(GL_TEXTURE_CUBE_MAP, cubeTexture);
++            glTexStorage2D(GL_TEXTURE_CUBE_MAP, 1, GL_R32UI, 1, 1);
++            for (uint32_t face = 0; face < 6; ++face)
++            {
++                glTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, 0, 0, 0, 1, 1,
++                                GL_RED_INTEGER, GL_UNSIGNED_INT, &cubeValue);
++            }
++        }
++        if (phaseIndex == 3)
++        {
++            reloadProgram(program, restored);
++            active = restored;
++        }
++        if (phaseIndex == 4)
++        {
++            // Delete while the preceding dispatch is still queued. GL detaches
++            // the units, and command tracking must keep the old views alive.
++            planarTexture.reset();
++            volumeTexture.reset();
++            layerTexture.reset();
++            cubeTexture.reset();
++            for (uint32_t unit = 0; unit < 4; ++unit)
++            {
++                GLint name = -1;
++                glGetIntegeri_v(GL_IMAGE_BINDING_NAME, unit, &name);
++                EXPECT_EQ(name, 0);
++            }
++        }
++        else
++        {
++            bindImages(bound);
++        }
++        glUseProgram(active);
++        glUniform1ui(glGetUniformLocation(active, "phase"), phaseIndex);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
++                        GL_BUFFER_UPDATE_BARRIER_BIT);
++        ASSERT_GL_NO_ERROR();
++        for (uint32_t image = 0; image < 4; ++image)
++        {
++            record(phaseIndex, image,
++                   !bound                     ? std::array<uint32_t, 4>{0, 0, 0, 0}
++                   : image == 0 || image == 3 ? std::array<uint32_t, 4>{1, 1, 0, 0}
++                                              : std::array<uint32_t, 4>{1, 1, 1, 0});
++            if (!bound)
++            {
++                record(phaseIndex, image + 4, {0, 0, 0, 0});
++                record(phaseIndex, image + 8, {0, 0, 0, 0});
++            }
++        }
++        if (bound)
++        {
++            record(phaseIndex, 4, {phaseIndex == 1 ? 11u : 112u, 0, 0, 1});
++            record(phaseIndex, 5, {static_cast<uint32_t>(phaseIndex == 1 ? -13 : -214), 0, 0, 1});
++            record(phaseIndex, 6, {floatWord(phaseIndex == 1 ? .5f : 1.5f), 0, 0, floatWord(1)});
++            record(phaseIndex, 7, {phaseIndex == 1 ? 17u : 318u, 0, 0, 1});
++            record(phaseIndex, 8, {101u + phaseIndex * 11u, 0, 0, 1});
++            record(phaseIndex, 9,
++                   {static_cast<uint32_t>(-static_cast<int32_t>(201 + phaseIndex * 13)), 0, 0, 1});
++            record(phaseIndex, 10, {floatWord(.5f + phaseIndex), 0, 0, floatWord(1)});
++            record(phaseIndex, 11, {301u + phaseIndex * 17u, 0, 0, 1});
++        }
++    }
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t word = 0; word < expected.size(); ++word)
++    {
++        EXPECT_EQ(actual[word], expected[word]) << "image result/source/guard word " << word;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ // Exercise actual GL compilation, linking, remapping, uniforms, program binary
+ // reload and dispatch. Two SSBO ranges alias one allocation; readback is final.
+ TEST_P(ComputeDispatchTestMetal, StorageRangesUniformsAndBinary)
+diff --git a/src/tests/gl_tests/ComputeShaderTest.cpp b/src/tests/gl_tests/ComputeShaderTest.cpp
+index 130950e..2646edf 100644
+--- a/src/tests/gl_tests/ComputeShaderTest.cpp
++++ b/src/tests/gl_tests/ComputeShaderTest.cpp
+@@ -5822,12 +5822,22 @@ void main() {
+ }
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ComputeShaderTest);
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++ANGLE_INSTANTIATE_TEST_ES31_AND(ComputeShaderTest,
++                                ES31_VULKAN().enable(Feature::ForceRobustResourceInit),
++                                ES31_METAL());
++#else
+ ANGLE_INSTANTIATE_TEST_ES31_AND(ComputeShaderTest,
+                                 ES31_VULKAN().enable(Feature::ForceRobustResourceInit));
++#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ComputeShaderTestES3);
+ ANGLE_INSTANTIATE_TEST_ES3(ComputeShaderTestES3);
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(StorageImageRenderProgramTest);
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++ANGLE_INSTANTIATE_TEST_ES31_AND(StorageImageRenderProgramTest, ES31_METAL());
++#else
+ ANGLE_INSTANTIATE_TEST_ES31(StorageImageRenderProgramTest);
++#endif
+ }  // namespace

@@ -1,0 +1,210 @@
+diff --git a/modules/glshared/glsShaderExecUtil.cpp b/modules/glshared/glsShaderExecUtil.cpp
+--- a/modules/glshared/glsShaderExecUtil.cpp
++++ b/modules/glshared/glsShaderExecUtil.cpp
+@@ -93,8 +93,68 @@
+ 
+ // Shader utilities
+ 
++// Passthrough varyings carry exact test payloads. Integer bit transport avoids
++// interpolation/validation restrictions on floating NaN and infinity values.
++static void generateTransportDecl(std::ostream &src, const glu::VarType &type, const std::string &qualifier,
++                                  const std::string &name, bool useIntegerTransport)
++{
++    if (useIntegerTransport && type.isBasicType() && glu::isDataTypeFloatOrVec(type.getBasicType()))
++    {
++        const int size = glu::getDataTypeScalarSize(type.getBasicType());
++        const glu::VarType bits(size > 1 ? glu::getDataTypeUintVec(size) : glu::TYPE_UINT, glu::PRECISION_HIGHP);
++        src << qualifier << " " << glu::declare(bits, name) << ";\n";
++    }
++    else if (useIntegerTransport && type.isBasicType() && glu::isDataTypeMatrix(type.getBasicType()))
++    {
++        const int rows = glu::getDataTypeMatrixNumRows(type.getBasicType());
++        const int cols = glu::getDataTypeMatrixNumColumns(type.getBasicType());
++        const glu::VarType bits(glu::getDataTypeUintVec(rows), glu::PRECISION_HIGHP);
++        for (int col = 0; col < cols; ++col)
++            src << qualifier << " " << glu::declare(bits, name + "_c" + de::toString(col)) << ";\n";
++    }
++    else
++        src << qualifier << " " << glu::declare(type, name) << ";\n";
++}
++
++static void generateTransportStore(std::ostream &src, const glu::VarType &type, const std::string &value,
++                                   const std::string &name, bool useIntegerTransport)
++{
++    if (useIntegerTransport && type.isBasicType() && glu::isDataTypeFloatOrVec(type.getBasicType()))
++        src << "\t" << name << " = floatBitsToUint(" << value << ");\n";
++    else if (useIntegerTransport && type.isBasicType() && glu::isDataTypeMatrix(type.getBasicType()))
++    {
++        const int cols = glu::getDataTypeMatrixNumColumns(type.getBasicType());
++        for (int col = 0; col < cols; ++col)
++            src << "\t" << name << "_c" << col << " = floatBitsToUint(" << value << "[" << col << "]);\n";
++    }
++    else
++        src << "\t" << name << " = " << value << ";\n";
++}
++
++static void generateTransportLoad(std::ostream &src, const glu::VarType &type, const std::string &value,
++                                  const std::string &name, bool useIntegerTransport)
++{
++    src << "\t" << glu::declare(type, value) << " = ";
++    if (useIntegerTransport && type.isBasicType() && glu::isDataTypeFloatOrVec(type.getBasicType()))
++        src << "uintBitsToFloat(" << name << ")";
++    else if (useIntegerTransport && type.isBasicType() && glu::isDataTypeMatrix(type.getBasicType()))
++    {
++        const int cols = glu::getDataTypeMatrixNumColumns(type.getBasicType());
++        src << glu::getDataTypeName(type.getBasicType()) << "(";
++        for (int col = 0; col < cols; ++col)
++            src << (col ? ", " : "") << "uintBitsToFloat(" << name << "_c" << col << ")";
++        src << ")";
++    }
++    else if (type.isBasicType() && glu::isDataTypeBoolOrBVec(type.getBasicType()))
++        src << glu::getDataTypeName(type.getBasicType()) << "(" << name << ")";
++    else
++        src << name;
++    src << ";\n";
++}
++
++
+ static std::string generateVertexShader(const ShaderSpec &shaderSpec, const std::string &inputPrefix,
+-                                        const std::string &outputPrefix)
++                                        const std::string &outputPrefix, bool useIntegerTransport = false)
+ {
+     const bool usesInout = glu::glslVersionUsesInOutQualifiers(shaderSpec.version);
+     const char *in       = usesInout ? "in" : "attribute";
+@@ -127,7 +187,8 @@
+             src << "flat " << out << " " << glu::declare(intType, outputPrefix + output->name) << ";\n";
+         }
+         else
+-            src << "flat " << out << " " << glu::declare(output->varType, outputPrefix + output->name) << ";\n";
++            generateTransportDecl(src, output->varType, std::string("flat ") + out,
++                                  outputPrefix + output->name, useIntegerTransport);
+     }
+ 
+     src << "\n"
+@@ -167,7 +228,8 @@
+                 << output->name << ");\n";
+         }
+         else
+-            src << "\t" << outputPrefix << output->name << " = " << output->name << ";\n";
++            generateTransportStore(src, output->varType, output->name, outputPrefix + output->name,
++                                   useIntegerTransport);
+     }
+ 
+     src << "}\n";
+@@ -280,7 +342,7 @@
+ }
+ 
+ static std::string generatePassthroughVertexShader(const ShaderSpec &shaderSpec, const std::string &inputPrefix,
+-                                                   const std::string &outputPrefix)
++                                                   const std::string &outputPrefix, bool useIntegerTransport = false)
+ {
+     // flat qualifier is not present in earlier versions?
+     DE_ASSERT(glu::glslVersionUsesInOutQualifiers(shaderSpec.version));
+@@ -292,8 +354,8 @@
+ 
+     for (vector<Symbol>::const_iterator input = shaderSpec.inputs.begin(); input != shaderSpec.inputs.end(); ++input)
+     {
+-        src << "in " << glu::declare(input->varType, inputPrefix + input->name) << ";\n"
+-            << "flat out " << glu::declare(input->varType, outputPrefix + input->name) << ";\n";
++        src << "in " << glu::declare(input->varType, inputPrefix + input->name) << ";\n";
++        generateTransportDecl(src, input->varType, "flat out", outputPrefix + input->name, useIntegerTransport);
+     }
+ 
+     src << "\nvoid main (void)\n{\n"
+@@ -301,7 +363,8 @@
+         << "    gl_PointSize = 1.0;\n";
+ 
+     for (vector<Symbol>::const_iterator input = shaderSpec.inputs.begin(); input != shaderSpec.inputs.end(); ++input)
+-        src << "\t" << outputPrefix << input->name << " = " << inputPrefix << input->name << ";\n";
++        generateTransportStore(src, input->varType, inputPrefix + input->name, outputPrefix + input->name,
++                               useIntegerTransport);
+ 
+     src << "}\n";
+ 
+@@ -397,7 +460,8 @@
+ 
+ static std::string generateFragmentShader(const ShaderSpec &shaderSpec, bool useIntOutputs,
+                                           const std::map<std::string, int> &outLocationMap,
+-                                          const std::string &inputPrefix, const std::string &outputPrefix)
++                                          const std::string &inputPrefix, const std::string &outputPrefix,
++                                          bool useIntegerTransport = false)
+ {
+     DE_ASSERT(glu::glslVersionUsesInOutQualifiers(shaderSpec.version));
+ 
+@@ -409,7 +473,7 @@
+         src << shaderSpec.globalDeclarations << "\n";
+ 
+     for (vector<Symbol>::const_iterator input = shaderSpec.inputs.begin(); input != shaderSpec.inputs.end(); ++input)
+-        src << "flat in " << glu::declare(input->varType, inputPrefix + input->name) << ";\n";
++        generateTransportDecl(src, input->varType, "flat in", inputPrefix + input->name, useIntegerTransport);
+ 
+     generateFragShaderOutputDecl(src, shaderSpec, useIntOutputs, outLocationMap, outputPrefix);
+ 
+@@ -417,7 +481,7 @@
+ 
+     // Declare & fetch local input variables
+     for (vector<Symbol>::const_iterator input = shaderSpec.inputs.begin(); input != shaderSpec.inputs.end(); ++input)
+-        src << "\t" << glu::declare(input->varType, input->name) << " = " << inputPrefix << input->name << ";\n";
++        generateTransportLoad(src, input->varType, input->name, inputPrefix + input->name, useIntegerTransport);
+ 
+     // Declare output variables
+     for (vector<Symbol>::const_iterator output = shaderSpec.outputs.begin(); output != shaderSpec.outputs.end();
+@@ -442,7 +506,8 @@
+ 
+ static std::string generatePassthroughFragmentShader(const ShaderSpec &shaderSpec, bool useIntOutputs,
+                                                      const std::map<std::string, int> &outLocationMap,
+-                                                     const std::string &inputPrefix, const std::string &outputPrefix)
++                                                     const std::string &inputPrefix, const std::string &outputPrefix,
++                                                     bool useIntegerTransport = false)
+ {
+     DE_ASSERT(glu::glslVersionUsesInOutQualifiers(shaderSpec.version));
+ 
+@@ -465,14 +530,21 @@
+             src << "flat in " << glu::declare(intType, inputPrefix + output->name) << ";\n";
+         }
+         else
+-            src << "flat in " << glu::declare(output->varType, inputPrefix + output->name) << ";\n";
++            generateTransportDecl(src, output->varType, "flat in", inputPrefix + output->name, useIntegerTransport);
+     }
+ 
+     generateFragShaderOutputDecl(src, shaderSpec, useIntOutputs, outLocationMap, outputPrefix);
+ 
+     src << "\nvoid main (void)\n{\n";
+ 
+-    generateFragShaderOutAssign(src, shaderSpec, useIntOutputs, inputPrefix, outputPrefix);
++    if (useIntegerTransport)
++    {
++        for (const Symbol &output : shaderSpec.outputs)
++            generateTransportLoad(src, output.varType, output.name, inputPrefix + output.name, true);
++        generateFragShaderOutAssign(src, shaderSpec, useIntOutputs, "", outputPrefix);
++    }
++    else
++        generateFragShaderOutAssign(src, shaderSpec, useIntOutputs, inputPrefix, outputPrefix);
+ 
+     src << "}\n";
+ 
+@@ -755,10 +827,10 @@
+ VertexShaderExecutor::VertexShaderExecutor(const glu::RenderContext &renderCtx, const ShaderSpec &shaderSpec)
+     : FragmentOutExecutor(renderCtx, shaderSpec)
+     , m_program(renderCtx, glu::ProgramSources()
+-                               << glu::VertexSource(generateVertexShader(shaderSpec, "a_", "vtx_out_"))
++                               << glu::VertexSource(generateVertexShader(shaderSpec, "a_", "vtx_out_", true))
+                                << glu::FragmentSource(
+                                       generatePassthroughFragmentShader(shaderSpec, !hasFloatRenderTargets(renderCtx),
+-                                                                        m_outputLayout.locationMap, "vtx_out_", "o_")))
++                                                                        m_outputLayout.locationMap, "vtx_out_", "o_", true)))
+ {
+ }
+ 
+@@ -849,9 +921,9 @@
+     : FragmentOutExecutor(renderCtx, shaderSpec)
+     , m_program(
+           renderCtx, glu::ProgramSources()
+-                         << glu::VertexSource(generatePassthroughVertexShader(shaderSpec, "a_", "vtx_out_"))
++                         << glu::VertexSource(generatePassthroughVertexShader(shaderSpec, "a_", "vtx_out_", true))
+                          << glu::FragmentSource(generateFragmentShader(shaderSpec, !hasFloatRenderTargets(renderCtx),
+-                                                                       m_outputLayout.locationMap, "vtx_out_", "o_")))
++                                                                       m_outputLayout.locationMap, "vtx_out_", "o_", true)))
+ {
+ }
+ 

@@ -1,0 +1,1871 @@
+diff --git a/gni/angle.gni b/gni/angle.gni
+index c4840f6..13acd0c 100644
+--- a/gni/angle.gni
++++ b/gni/angle.gni
+@@ -253,6 +253,9 @@ declare_args() {
+ 
+   angle_enable_metal = is_apple
+ 
++  # Internal integration tests only. Never use for distributed native packages.
++  angle_metal_enable_compute_tests = false
++
+   # Enables the OpenCL pass-through back end
+   angle_enable_cl_passthrough = angle_enable_cl
+ 
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index adcc9ae..60015cc 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -1367,9 +1367,26 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+         }
+         mOut << "texture(" << mMainTextureIndex << ")]]";
+         TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
+-        reflection->addRWTextureBinding(type.getLayoutQualifier().binding,
+-                                        static_cast<int>(mMainTextureIndex));
+-        ++mMainTextureIndex;
++        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++        {
++            TInfoSinkBase mappedName;
++            Name(field).emit(mappedName, kUserVariableNamePrefix);
++            reflection->addComputeImageBinding(mappedName.c_str(), mMainTextureIndex);
++            // Retain declared-unit reflection for the native translation tests.
++            // Runtime GLES bindings use the uniform-name map above.
++            if (type.getLayoutQualifier().binding >= 0 &&
++                reflection->getRWTextureBinding(type.getLayoutQualifier().binding) < 0)
++            {
++                reflection->addRWTextureBinding(type.getLayoutQualifier().binding,
++                                                static_cast<int>(mMainTextureIndex));
++            }
++        }
++        else
++        {
++            reflection->addRWTextureBinding(type.getLayoutQualifier().binding,
++                                            static_cast<int>(mMainTextureIndex));
++        }
++        mMainTextureIndex += type.getArraySizeProduct();
+     }
+ }
+ 
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 9366c74..1107096 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -291,6 +291,8 @@ class ProgramPrelude : public TIntermTraverser
+     void imageStore();
+     void memoryBarrierImage();
+     void storageArgument();
++    void storageAtomics();
++    void computeMemoryFences();
+     void barrier();
+     void interpolateAtCenter();
+     void interpolateAtCentroid();
+@@ -1159,6 +1161,113 @@ ANGLE_ALWAYS_INLINE ANGLE_SwizzleRef<T, N, 4> ANGLE_swizzle_ref(thread metal::ve
+ 
+ // Copy in/out through thread storage without changing the device allocation's
+ // GLSL layout. Logical can be a native vector/bool while Physical is packed/uint.
++// Atomics preserve the native address space and return the previous value.
++// A weak compare-exchange must retry spurious failures to implement GLSL CAS.
++PROGRAM_PRELUDE_DECLARE(storageAtomics, R"(
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicAdd(device T &memory, T value)
++{
++    return metal::atomic_fetch_add_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicMin(device T &memory, T value)
++{
++    return metal::atomic_fetch_min_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicMax(device T &memory, T value)
++{
++    return metal::atomic_fetch_max_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicAnd(device T &memory, T value)
++{
++    return metal::atomic_fetch_and_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicOr(device T &memory, T value)
++{
++    return metal::atomic_fetch_or_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicXor(device T &memory, T value)
++{
++    return metal::atomic_fetch_xor_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicExchange(device T &memory, T value)
++{
++    return metal::atomic_exchange_explicit(reinterpret_cast<device metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicCompSwap(device T &memory, T compare, T value)
++{
++    T expected = compare;
++    device metal::atomic<T> *pointer = reinterpret_cast<device metal::atomic<T> *>(&memory);
++    while (!metal::atomic_compare_exchange_weak_explicit(pointer, &expected, value,
++                metal::memory_order_relaxed, metal::memory_order_relaxed) && expected == compare) {}
++    return expected;
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicAdd(threadgroup T &memory, T value)
++{
++    return metal::atomic_fetch_add_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicMin(threadgroup T &memory, T value)
++{
++    return metal::atomic_fetch_min_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicMax(threadgroup T &memory, T value)
++{
++    return metal::atomic_fetch_max_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicAnd(threadgroup T &memory, T value)
++{
++    return metal::atomic_fetch_and_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicOr(threadgroup T &memory, T value)
++{
++    return metal::atomic_fetch_or_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicXor(threadgroup T &memory, T value)
++{
++    return metal::atomic_fetch_xor_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicExchange(threadgroup T &memory, T value)
++{
++    return metal::atomic_exchange_explicit(reinterpret_cast<threadgroup metal::atomic<T> *>(&memory),
++                            value, metal::memory_order_relaxed);
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_atomicCompSwap(threadgroup T &memory, T compare, T value)
++{
++    T expected = compare;
++    threadgroup metal::atomic<T> *pointer = reinterpret_cast<threadgroup metal::atomic<T> *>(&memory);
++    while (!metal::atomic_compare_exchange_weak_explicit(pointer, &expected, value,
++                metal::memory_order_relaxed, metal::memory_order_relaxed) && expected == compare) {}
++    return expected;
++}
++)")
++
+ PROGRAM_PRELUDE_DECLARE(storageArgument, R"(
+ template <typename Logical, typename Physical>
+ struct ANGLE_StorageArgument
+@@ -2929,6 +3038,44 @@ ANGLE_ALWAYS_INLINE auto ANGLE_imageStore(
+ }
+ )")
+ 
++// Memory-only GLSL barriers must be legal in divergent control flow. A Metal
++// threadgroup_barrier or simdgroup_barrier would add an execution rendezvous.
++PROGRAM_PRELUDE_DECLARE(computeMemoryFences, R"(
++#if __METAL_VERSION__ < 320
++#error Compute memory fences require Metal language 3.2 or newer on Apple silicon
++#endif
++ANGLE_ALWAYS_INLINE void ANGLE_computeMemoryBarrier()
++{
++    metal::atomic_thread_fence(metal::mem_flags::mem_device | metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_texture,
++                               metal::memory_order_seq_cst, metal::thread_scope_device);
++}
++ANGLE_ALWAYS_INLINE void ANGLE_computeGroupMemoryBarrier()
++{
++    metal::atomic_thread_fence(metal::mem_flags::mem_device | metal::mem_flags::mem_threadgroup | metal::mem_flags::mem_texture,
++                               metal::memory_order_seq_cst, metal::thread_scope_threadgroup);
++}
++ANGLE_ALWAYS_INLINE void ANGLE_computeMemoryBarrierBuffer()
++{
++    metal::atomic_thread_fence(metal::mem_flags::mem_device,
++                               metal::memory_order_seq_cst, metal::thread_scope_device);
++}
++ANGLE_ALWAYS_INLINE void ANGLE_computeMemoryBarrierAtomicCounter()
++{
++    metal::atomic_thread_fence(metal::mem_flags::mem_device,
++                               metal::memory_order_seq_cst, metal::thread_scope_device);
++}
++ANGLE_ALWAYS_INLINE void ANGLE_computeMemoryBarrierImage()
++{
++    metal::atomic_thread_fence(metal::mem_flags::mem_texture,
++                               metal::memory_order_seq_cst, metal::thread_scope_device);
++}
++ANGLE_ALWAYS_INLINE void ANGLE_computeMemoryBarrierShared()
++{
++    metal::atomic_thread_fence(metal::mem_flags::mem_threadgroup,
++                               metal::memory_order_seq_cst, metal::thread_scope_threadgroup);
++}
++ )")
++
+ // GLSL barrier() synchronizes the entire workgroup and makes shared writes visible.
+ PROGRAM_PRELUDE_DECLARE(barrier, R"(
+ ANGLE_ALWAYS_INLINE void ANGLE_barrier()
+@@ -3068,6 +3215,20 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+     putAngle("flatten", EMIT_METHOD(flattenArray));
+     putAngle("inout", EMIT_METHOD(inout));
+     putAngle("out", EMIT_METHOD(out));
++    putAngle("computeMemoryBarrier", EMIT_METHOD(computeMemoryFences));
++    putAngle("computeGroupMemoryBarrier", EMIT_METHOD(computeMemoryFences));
++    putAngle("computeMemoryBarrierBuffer", EMIT_METHOD(computeMemoryFences));
++    putAngle("computeMemoryBarrierAtomicCounter", EMIT_METHOD(computeMemoryFences));
++    putAngle("computeMemoryBarrierImage", EMIT_METHOD(computeMemoryFences));
++    putAngle("computeMemoryBarrierShared", EMIT_METHOD(computeMemoryFences));
++    putAngle("atomicAdd", EMIT_METHOD(storageAtomics));
++    putAngle("atomicMin", EMIT_METHOD(storageAtomics));
++    putAngle("atomicMax", EMIT_METHOD(storageAtomics));
++    putAngle("atomicAnd", EMIT_METHOD(storageAtomics));
++    putAngle("atomicOr", EMIT_METHOD(storageAtomics));
++    putAngle("atomicXor", EMIT_METHOD(storageAtomics));
++    putAngle("atomicExchange", EMIT_METHOD(storageAtomics));
++    putAngle("atomicCompSwap", EMIT_METHOD(storageAtomics));
+     putAngle("storage_out<>", EMIT_METHOD(storageArgument));
+     putAngle("storage_inout<>", EMIT_METHOD(storageArgument));
+     putAngle("swizzle_ref", EMIT_METHOD(swizzleRef));
+diff --git a/src/compiler/translator/msl/ProgramPrelude.h b/src/compiler/translator/msl/ProgramPrelude.h
+index eac1734..4c76b66 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.h
++++ b/src/compiler/translator/msl/ProgramPrelude.h
+@@ -22,7 +22,7 @@ enum class MetalShaderType
+     None,
+     Vertex,
+     Fragment,
+-    Compute,  // Unused currently
++    Compute,
+     Count,
+ };
+ 
+diff --git a/src/compiler/translator/msl/StorageBuffer.cpp b/src/compiler/translator/msl/StorageBuffer.cpp
+index c10cbb1..7409641 100644
+--- a/src/compiler/translator/msl/StorageBuffer.cpp
++++ b/src/compiler/translator/msl/StorageBuffer.cpp
+@@ -7,6 +7,7 @@
+ #include "compiler/translator/IntermRebuild.h"
+ #include "compiler/translator/msl/DriverUniformMetal.h"
+ #include "compiler/translator/msl/SymbolEnv.h"
++#include "compiler/translator/msl/TranslatorMSL.h"
+ #include "compiler/translator/tree_util/IntermNode_util.h"
+ 
+ namespace sh
+@@ -308,6 +309,75 @@ class WrapStorageArguments : public TIntermRebuild
+             return node;
+         }
+         auto &arguments = *node.getSequence();
++        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++        {
++            const char *fence = nullptr;
++            switch (function->getBuiltInOp())
++            {
++                case EOpMemoryBarrier:
++                    fence = "computeMemoryBarrier";
++                    break;
++                case EOpMemoryBarrierBuffer:
++                    fence = "computeMemoryBarrierBuffer";
++                    break;
++                case EOpMemoryBarrierImage:
++                    fence = "computeMemoryBarrierImage";
++                    break;
++                case EOpMemoryBarrierShared:
++                    fence = "computeMemoryBarrierShared";
++                    break;
++                case EOpMemoryBarrierAtomicCounter:
++                    fence = "computeMemoryBarrierAtomicCounter";
++                    break;
++                case EOpGroupMemoryBarrier:
++                    fence = "computeGroupMemoryBarrier";
++                    break;
++                default:
++                    break;
++            }
++            if (fence)
++            {
++                mtl::getTranslatorMetalReflection(&mCompiler)->requiresComputeMemoryFences = true;
++                return mEnv.callFunctionOverload(Name(fence), node.getType(), arguments);
++            }
++        }
++        const char *atomic = nullptr;
++        switch (function->getBuiltInOp())
++        {
++            case EOpAtomicAdd:
++                atomic = "atomicAdd";
++                break;
++            case EOpAtomicMin:
++                atomic = "atomicMin";
++                break;
++            case EOpAtomicMax:
++                atomic = "atomicMax";
++                break;
++            case EOpAtomicAnd:
++                atomic = "atomicAnd";
++                break;
++            case EOpAtomicOr:
++                atomic = "atomicOr";
++                break;
++            case EOpAtomicXor:
++                atomic = "atomicXor";
++                break;
++            case EOpAtomicExchange:
++                atomic = "atomicExchange";
++                break;
++            case EOpAtomicCompSwap:
++                atomic = "atomicCompSwap";
++                break;
++            default:
++                break;
++        }
++        if (atomic)
++        {
++            // Atomic memory operands must remain device/threadgroup lvalues.
++            // Ordinary GLSL out/inout copy semantics would operate on a thread
++            // temporary and destroy atomicity across shader invocations.
++            return mEnv.callFunctionOverload(Name(atomic), node.getType(), arguments);
++        }
+         for (size_t i = 0; i < arguments.size(); ++i)
+         {
+             TQualifier qualifier = function->getParam(i)->getType().getQualifier();
+diff --git a/src/compiler/translator/msl/StorageBuffer.h b/src/compiler/translator/msl/StorageBuffer.h
+index 0f6b547..689fe48 100644
+--- a/src/compiler/translator/msl/StorageBuffer.h
++++ b/src/compiler/translator/msl/StorageBuffer.h
+@@ -17,6 +17,11 @@ class DriverUniformMetal;
+ // Compute reserves slots 0..7 for storage, 19/17 for default/driver uniforms,
+ // and 24 for the UBO argument buffer. GL binding points are resolved at link time.
+ constexpr size_t kMetalComputeStorageBuffers = 8;
++// Compute does not use vertex attributes or transform feedback. Keep the driver
++// and default uniform slots fixed so program stages retain their existing ABI.
++constexpr size_t kMetalComputeUniformBuffers                            = 12;
++constexpr size_t kMetalComputeUniformSlots[kMetalComputeUniformBuffers] = {8,  9,  10, 11, 12, 13,
++                                                                           14, 15, 16, 18, 20, 21};
+ 
+ struct StorageBufferInfo
+ {
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 9696f24..51bc023 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -1345,44 +1345,70 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+     }
+ 
+     size_t storageIndex   = 0;
++    size_t computeUniformIndex = 0;
+     bool storageSupported = true;
+     if (!ReduceInterfaceBlocks(
+             *this, *root, [&idGen]() { return idGen.createNewName().rawName(); },
+             [&](const TVariable &oldVar, const TVariable &newVar) {
+                 const TType &type = oldVar.getType();
+-                if (type.getQualifier() != EvqBuffer)
++                const bool uniform =
++                    type.getQualifier() == EvqUniform && getShaderType() == GL_COMPUTE_SHADER;
++                if (type.getQualifier() != EvqBuffer && !uniform)
+                 {
+                     return;
+                 }
+                 if (getShaderType() != GL_COMPUTE_SHADER || type.isArray() ||
+-                    storageIndex >= kMetalComputeStorageBuffers)
++                    (uniform ? computeUniformIndex >= kMetalComputeUniformBuffers
++                             : storageIndex >= kMetalComputeStorageBuffers))
+                 {
+                     getInfoSink().info << "Metal storage blocks currently require a compute stage, "
+                                           "at most eight blocks, and non-array block instances.\n";
+                     storageSupported = false;
+                     return;
+                 }
+-                StorageBufferInfo info{storageIndex++, type.getLayoutQualifier().blockStorage,
++                const size_t index =
++                    uniform ? kMetalComputeUniformSlots[computeUniformIndex++] : storageIndex++;
++                StorageBufferInfo info{index, type.getLayoutQualifier().blockStorage,
+                                        type.getLayoutQualifier().matrixPacking,
+                                        type.getMemoryQualifier().readonly,
+                                        type.getInterfaceBlock()->name().data()};
+-                // Shared/packed layouts use the backend's deterministic std430 layout.
+-                if (info.storage != EbsStd140)
++                // Match the GL layout directly, including uniforms written by a
++                // preceding GPU dispatch. No CPU layout conversion is permitted.
++                if (info.storage != EbsStd140 && info.storage != EbsStd430)
+                 {
+-                    info.storage = EbsStd430;
++                    info.storage = uniform ? EbsStd140 : EbsStd430;
+                 }
+                 if (info.packing == EmpUnspecified)
+                 {
+                     info.packing = EmpColumnMajor;
+                 }
+                 const auto &fields = type.getInterfaceBlock()->fields();
+-                info.readonly = info.readonly ||
++                info.readonly = uniform || info.readonly ||
+                                 std::all_of(fields.begin(), fields.end(), [](const TField *field) {
+                                     return field->type()->getMemoryQualifier().readonly;
+                                 });
++                if (info.index ==
++                        static_cast<size_t>(compileOptions.metal.driverUniformsBindingIndex) ||
++                    info.index ==
++                        static_cast<size_t>(compileOptions.metal.defaultUniformsBindingIndex) ||
++                    info.index ==
++                        static_cast<size_t>(compileOptions.metal.UBOArgumentBufferBindingIndex))
++                {
++                    getInfoSink().info
++                        << "Metal compute buffer bindings overlap reserved uniform slots.\n";
++                    storageSupported = false;
++                    return;
++                }
+                 symbolEnv.markStorageBuffer(newVar, info);
+                 symbolEnv.markStorageBlock(*newVar.getType().getStruct());
+-                translatorMetalReflection.addStorageBufferBinding(info.blockName, info.index);
++                if (uniform)
++                {
++                    translatorMetalReflection.addComputeUniformBinding(info.blockName, info.index);
++                }
++                else
++                {
++                    translatorMetalReflection.addStorageBufferBinding(info.blockName, info.index);
++                }
+             }))
+     {
+         return false;
+diff --git a/src/compiler/translator/msl/TranslatorMSL.h b/src/compiler/translator/msl/TranslatorMSL.h
+index 13f7c2b..a283a41 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.h
++++ b/src/compiler/translator/msl/TranslatorMSL.h
+@@ -145,7 +145,29 @@ class TranslatorMetalReflection
+         return {.bindIndex = std::numeric_limits<size_t>::max(),
+                 .arraySize = std::numeric_limits<size_t>::max()};
+     }
+-    void resetStorageBufferBindings() { storageBufferBindings.clear(); }
++    void addComputeUniformBinding(const std::string &name, size_t index)
++    {
++        computeUniformBindings.emplace(name, index);
++    }
++    const std::unordered_map<std::string, size_t> &getComputeUniformBindings() const
++    {
++        return computeUniformBindings;
++    }
++    void addComputeImageBinding(const std::string &name, size_t index)
++    {
++        computeImageBindings.emplace(name, index);
++    }
++    const std::unordered_map<std::string, size_t> &getComputeImageBindings() const
++    {
++        return computeImageBindings;
++    }
++    void resetStorageBufferBindings()
++    {
++        requiresComputeMemoryFences = false;
++        storageBufferBindings.clear();
++        computeImageBindings.clear();
++        computeUniformBindings.clear();
++    }
+     void addStorageBufferBinding(const std::string &name, size_t index)
+     {
+         storageBufferBindings.emplace(name, index);
+@@ -156,6 +178,7 @@ class TranslatorMetalReflection
+     }
+     void reset()
+     {
++        requiresComputeMemoryFences = false;
+         hasUBOs              = false;
+         hasFlatInput         = false;
+         hasInvariance        = false;
+@@ -168,8 +191,11 @@ class TranslatorMetalReflection
+         userUniformBufferBindings.clear();
+         uniformBufferBindings.clear();
+         storageBufferBindings.clear();
++        computeImageBindings.clear();
++        computeUniformBindings.clear();
+     }
+ 
++    bool requiresComputeMemoryFences = false;
+     bool hasUBOs              = false;
+     bool hasFlatInput         = false;
+     bool hasInvariance        = false;
+@@ -178,6 +204,8 @@ class TranslatorMetalReflection
+ 
+   private:
+     std::unordered_map<std::string, size_t> storageBufferBindings;
++    std::unordered_map<std::string, size_t> computeImageBindings;
++    std::unordered_map<std::string, size_t> computeUniformBindings;
+     originalNamesMap originalNames;
+     samplerBindingMap samplerBindings;
+     textureBindingMap textureBindings;
+diff --git a/src/libANGLE/renderer/metal/BUILD.gn b/src/libANGLE/renderer/metal/BUILD.gn
+index 8e4c836..da7e772 100644
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -13,9 +13,13 @@ if (metal_internal_shader_compilation_supported) {
+ 
+ assert(is_mac || is_ios)
+ assert(angle_enable_metal)
++assert(!angle_metal_enable_compute_tests || (is_mac && angle_build_tests))
+ 
+ config("angle_metal_backend_config") {
+   defines = [ "ANGLE_ENABLE_METAL" ]
++  if (angle_metal_enable_compute_tests) {
++    defines += [ "ANGLE_METAL_COMPUTE_TESTS" ]
++  }
+   ldflags = [
+     "-weak_framework",
+     "Metal",
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 3b2b89e..7094ec2 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -953,18 +953,63 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                              gl::PrimitiveMode mode,
+                                              const void *indirect)
+ {
+-    // NOTE(hqle): ES 3.0
+-    UNIMPLEMENTED();
+-    return angle::Result::Stop;
++    // The initial integration supports native topologies. Keep unsupported
++    // conversions explicit while the public GLES 3.1 profile remains gated.
++    ANGLE_CHECK(
++        this,
++        mode != gl::PrimitiveMode::TriangleFan && mode != gl::PrimitiveMode::LineLoop &&
++            !requiresIndexRewrite(getState(), mode) &&
++            !getState().isTransformFeedbackActiveUnpaused() && !context->hasAnyActiveClientAttrib(),
++        "Indirect draw requires GPU primitive conversion for this state", GL_INVALID_OPERATION);
++    ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
++    if (mCullAllPolygons && gl::IsPolygonMode(mode))
++    {
++        return angle::Result::Continue;
++    }
++    // No argument values are needed for native VAOs or inactive transform
++    // feedback. The GPU reads count, instanceCount and first at execution time.
++    bool noOp = false;
++    ANGLE_TRY(
++        setupDraw(context, 0, 0, 1, gl::DrawElementsType::InvalidEnum, nullptr, false, &noOp));
++    if (!noOp)
++    {
++        gl::Buffer *arguments = getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
++        mRenderEncoder.drawIndirect(mtl::GetPrimitiveType(mode),
++                                    mtl::GetImpl(arguments)->getCurrentBuffer(),
++                                    reinterpret_cast<uintptr_t>(indirect));
++    }
++    return checkCommandBufferError();
+ }
++
+ angle::Result ContextMtl::drawElementsIndirect(const gl::Context *context,
+                                                gl::PrimitiveMode mode,
+                                                gl::DrawElementsType type,
+                                                const void *indirect)
+ {
+-    // NOTE(hqle): ES 3.0
+-    UNIMPLEMENTED();
+-    return angle::Result::Stop;
++    ANGLE_CHECK(
++        this,
++        type != gl::DrawElementsType::UnsignedByte && mode != gl::PrimitiveMode::TriangleFan &&
++            mode != gl::PrimitiveMode::LineLoop && !getState().isPrimitiveRestartEnabled() &&
++            !requiresIndexRewrite(getState(), mode) &&
++            !getState().isTransformFeedbackActiveUnpaused() && !context->hasAnyActiveClientAttrib(),
++        "Indexed indirect draw requires GPU index conversion for this state", GL_INVALID_OPERATION);
++    ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
++    if (mCullAllPolygons && gl::IsPolygonMode(mode))
++    {
++        return angle::Result::Continue;
++    }
++    bool noOp = false;
++    ANGLE_TRY(setupDraw(context, 0, 0, 1, type, nullptr, false, &noOp));
++    if (!noOp)
++    {
++        gl::Buffer *arguments = getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
++        gl::Buffer *indices   = getState().getVertexArray()->getElementArrayBuffer();
++        mRenderEncoder.drawIndexedIndirect(mtl::GetPrimitiveType(mode), mtl::GetIndexType(type),
++                                           mtl::GetImpl(indices)->getCurrentBuffer(), 0,
++                                           mtl::GetImpl(arguments)->getCurrentBuffer(),
++                                           reinterpret_cast<uintptr_t>(indirect));
++    }
++    return checkCommandBufferError();
+ }
+ 
+ angle::Result ContextMtl::multiDrawArrays(const gl::Context *context,
+@@ -1575,15 +1620,25 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                           GLuint numGroupsY,
+                                           GLuint numGroupsZ)
+ {
+-    // NOTE(hqle): ES 3.0
+-    UNIMPLEMENTED();
+-    return angle::Result::Stop;
++    auto *executable = mtl::GetImpl(context->getState().getProgramExecutable());
++    mtl::ComputeCommandEncoder *encoder;
++    ANGLE_TRY(executable->setupDispatch(context, &encoder));
++    const auto &size = context->getState().getProgramExecutable()->getComputeShaderLocalSize();
++    encoder->dispatch(MTLSizeMake(numGroupsX, numGroupsY, numGroupsZ),
++                      MTLSizeMake(size[0], size[1], size[2]));
++    return checkCommandBufferError();
+ }
+ angle::Result ContextMtl::dispatchComputeIndirect(const gl::Context *context, GLintptr indirect)
+ {
+-    // NOTE(hqle): ES 3.0
+-    UNIMPLEMENTED();
+-    return angle::Result::Stop;
++    auto *executable = mtl::GetImpl(context->getState().getProgramExecutable());
++    mtl::ComputeCommandEncoder *encoder;
++    ANGLE_TRY(executable->setupDispatch(context, &encoder));
++    const auto &size   = context->getState().getProgramExecutable()->getComputeShaderLocalSize();
++    gl::Buffer *buffer = context->getState().getTargetBuffer(gl::BufferBinding::DispatchIndirect);
++    encoder->dispatchIndirect(mtl::GetImpl(buffer)->getCurrentBuffer(),
++                              static_cast<size_t>(indirect),
++                              MTLSizeMake(size[0], size[1], size[2]));
++    return checkCommandBufferError();
+ }
+ 
+ angle::Result ContextMtl::memoryBarrier(const gl::Context *context, GLbitfield barriers)
+@@ -1594,9 +1649,10 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     }
+     if (context->getClientVersion() >= gl::Version{3, 1})
+     {
+-        // We expect ES 3.0, and as such we don't consider ES 3.1+ objects in this function yet.
+-        UNIMPLEMENTED();
+-        return angle::Result::Stop;
++        // Ending encoders preserves render targets and orders tracked device
++        // resources on the existing queue. No command-buffer wait or CPU readback.
++        endEncoding(true);
++        return checkCommandBufferError();
+     }
+     MTLBarrierScope scope;
+     switch (barriers)
+@@ -1644,9 +1700,8 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ 
+ angle::Result ContextMtl::memoryBarrierByRegion(const gl::Context *context, GLbitfield barriers)
+ {
+-    // NOTE(hqle): ES 3.0
+-    UNIMPLEMENTED();
+-    return angle::Result::Stop;
++    // A full barrier is a valid conservative implementation of the regional one.
++    return memoryBarrier(context, barriers);
+ }
+ 
+ // override mtl::ErrorHandler
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 04aba53..f7d0cd7 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -425,17 +425,23 @@ bool IsMetalDisplayAvailable()
+ 
+ gl::Version DisplayMtl::getMaxSupportedESVersion() const
+ {
+-#if TARGET_OS_SIMULATOR
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++    // Explicitly requested, non-conformant integration profile; normal builds
++    // retain their production capability gate below.
++    return gl::Version(3, 1);
++#else
++#    if TARGET_OS_SIMULATOR
+     // Simulator should be able to support ES3, despite not supporting iOS GPU
+     // Family 3 in its entirety.
+     // FIXME: None of the feature conditions are checked for simulator support.
+     return gl::Version(3, 0);
+-#else
++#    else
+     if (supportsEitherGPUFamily(4, 1))
+     {
+         return mtl::kMaxSupportedGLVersion;
+     }
+     return gl::Version(2, 0);
++#    endif
+ #endif
+ }
+ 
+@@ -918,6 +924,29 @@ bool IsMetalDisplayAvailable()
+     }
+ 
+     mNativeCaps.maxCombinedShaderOutputResources = 0;
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++    mNativeCaps.maxUniformLocations = maxDefaultUniformVectors + mtl::kMaxShaderSamplers + 4;
++    mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Compute] = 12;
++    mNativeCaps.maxCombinedShaderUniformComponents[gl::ShaderType::Compute] =
++        maxDefaultUniformComponents + mtl::kMaxUBOSize * 12 / 4;
++    mNativeCaps.maxComputeWorkGroupCount       = {65535, 65535, 65535};
++    mNativeCaps.maxComputeWorkGroupSize        = {128, 128, 64};
++    mNativeCaps.maxComputeWorkGroupInvocations = 128;
++    mNativeCaps.maxComputeSharedMemorySize =
++        static_cast<GLint>(mMetalDevice.get().maxThreadgroupMemoryLength);
++    mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Compute] = maxDefaultUniformComponents;
++    mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] = mtl::kMaxComputeStorageBuffers;
++    mNativeCaps.maxCombinedShaderStorageBlocks                  = mtl::kMaxComputeStorageBuffers;
++    mNativeCaps.maxShaderStorageBufferBindings                  = mtl::kMaxComputeStorageBuffers;
++    mNativeCaps.maxShaderStorageBlockSize =
++        std::min<GLint64>(mMetalDevice.get().maxBufferLength, 1 << 27);
++    mNativeCaps.shaderStorageBufferOffsetAlignment                  = 256;
++    mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Compute] = mtl::kMaxShaderSamplers;
++    mNativeCaps.maxCombinedShaderOutputResources = mtl::kMaxComputeStorageBuffers + 4;
++    mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute] = 4;
++    mNativeCaps.maxCombinedImageUniforms                        = 4;
++    mNativeCaps.maxImageUnits = std::max(mNativeCaps.maxImageUnits, 4);
++#endif
+ 
+     mNativeCaps.maxTransformFeedbackInterleavedComponents =
+         gl::IMPLEMENTATION_MAX_TRANSFORM_FEEDBACK_INTERLEAVED_COMPONENTS;
+@@ -987,7 +1016,13 @@ bool IsMetalDisplayAvailable()
+     mNativeExtensions.robustnessEXT               = true;
+     mNativeExtensions.robustnessKHR               = true;
+     mNativeExtensions.textureBorderClampOES       = false;  // not implemented yet
+-    mNativeExtensions.multiDrawIndirectEXT        = true;
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++    mNativeExtensions.multiDrawIndirectEXT = true;
++#else
++    // The production profile must not expose entry points whose primitive and
++    // index conversions are still being integrated in the internal test build.
++    mNativeExtensions.multiDrawIndirectEXT = false;
++#endif
+     mNativeExtensions.translatedShaderSourceANGLE = true;
+     mNativeExtensions.discardFramebufferEXT       = true;
+ 
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+index 0414f8b..4b7aa5e 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+@@ -188,6 +188,9 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+ 
+     bool hasFlatAttribute() const { return mProgramHasFlatAttributes; }
+ 
++    angle::Result setupDispatch(const gl::Context *context,
++                                mtl::ComputeCommandEncoder **encoderOut);
++
+     // Calls this before drawing, changedPipelineDesc is passed when vertex attributes desc and/or
+     // shader program changed.
+     angle::Result setupDraw(const gl::Context *glContext,
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index f4b7efb..ff6b9dc 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -375,9 +375,14 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+         angle::ObjCPtr<NSError> err;
+         const bool disableFastMath      = translatedMslInfo->hasIsnanOrIsinf;
+         const bool usesInvariance       = translatedMslInfo->hasInvariant;
++        auto macros                     = substitutionMacros;
++        if (translatedMslInfo->requiresComputeMemoryFences)
++        {
++            macros["ANGLE_METAL_COMPUTE_MEMORY_FENCES"] = "1";
++        }
+         translatedMslInfo->metalLibrary = libraryCache.getOrCompileShaderLibrary(
+-            context->getDisplay(), translatedMslInfo->metalShaderSource, substitutionMacros,
+-            disableFastMath, usesInvariance, &err);
++            context->getDisplay(), translatedMslInfo->metalShaderSource, macros, disableFastMath,
++            usesInvariance, &err);
+         if (err || !translatedMslInfo->metalLibrary)
+         {
+             infoLog << "Internal error while linking shader. MSL compilation error:\n"
+@@ -567,6 +572,8 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+             stream->writeInt<uint32_t>(uboBinding);
+         }
+         stream->writeVector(mMslShaderTranslateInfo[shaderType].actualSSBOBindings);
++        stream->writeVector(mMslShaderTranslateInfo[shaderType].actualComputeImageBindings);
++        stream->writeBool(mMslShaderTranslateInfo[shaderType].requiresComputeMemoryFences);
+         stream->writeBool(mMslShaderTranslateInfo[shaderType].hasInvariant);
+     }
+     for (size_t xfbBindIndex = 0; xfbBindIndex < mtl::kMaxShaderXFBs; xfbBindIndex++)
+@@ -622,6 +629,8 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+             uboBinding = stream->readInt<uint32_t>();
+         }
+         stream->readVector(&mMslShaderTranslateInfo[shaderType].actualSSBOBindings);
++        stream->readVector(&mMslShaderTranslateInfo[shaderType].actualComputeImageBindings);
++        mMslShaderTranslateInfo[shaderType].requiresComputeMemoryFences = stream->readBool();
+         mMslShaderTranslateInfo[shaderType].hasInvariant = stream->readBool();
+     }
+ 
+@@ -745,7 +754,10 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+             InitDefaultUniformBlock(uniforms, &layoutMap[shaderType],
+                                     &requiredBufferSize[shaderType]);
+             // Set up block conversion buffer
+-            initUniformBlocksRemapper(shader);
++            if (shaderType != gl::ShaderType::Compute)
++            {
++                initUniformBlocksRemapper(shader);
++            }
+         }
+     }
+ 
+@@ -930,6 +942,172 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     return angle::Result::Continue;
+ }
+ 
++angle::Result ProgramExecutableMtl::setupDispatch(const gl::Context *glContext,
++                                                  mtl::ComputeCommandEncoder **encoderOut)
++{
++    ContextMtl *context = mtl::GetImpl(glContext);
++    angle::ObjCPtr<id<MTLComputePipelineState>> pipeline;
++    ANGLE_TRY(getComputePipeline(context, &pipeline));
++    const auto &size         = mExecutable->getComputeShaderLocalSize();
++    const size_t invocations = size[0] * size[1] * size[2];
++    ANGLE_CHECK(context, invocations <= pipeline.get().maxTotalThreadsPerThreadgroup,
++                "Compute local size exceeds this Metal pipeline's limit", GL_INVALID_OPERATION);
++    const auto &glState = glContext->getState();
++    const auto &info    = getComputeShaderInfo();
++    mtl::ComputeDriverUniforms driver;
++    std::array<mtl::BufferRef, mtl::kMaxComputeStorageBuffers> buffers;
++    std::array<size_t, mtl::kMaxComputeStorageBuffers> offsets = {};
++    const auto &blocks = mExecutable->getShaderStorageBlocks();
++    for (size_t block = 0; block < blocks.size(); ++block)
++    {
++        const uint32_t slot = info.actualSSBOBindings[block];
++        if (slot >= mtl::kMaxComputeStorageBuffers)
++        {
++            continue;
++        }
++        const auto &binding =
++            glState.getIndexedShaderStorageBuffer(mExecutable->getShaderStorageBlockBinding(block));
++        ANGLE_CHECK(context, binding.get(), "Missing shader storage buffer", GL_INVALID_OPERATION);
++        buffers[slot] = mtl::GetImpl(binding.get())->getCurrentBuffer();
++        offsets[slot] = static_cast<size_t>(binding.getOffset());
++        driver.storageBufferSizes[slot] =
++            static_cast<uint32_t>(gl::GetBoundBufferAvailableSize(binding));
++    }
++    // Resource classes share the same allocation and dependency tracking used by
++    // graphics. MarkShaderStorageUsage in the frontend invalidates GL caches.
++    auto &uniform = mDefaultUniformBlocks[gl::ShaderType::Compute].uniformData;
++    mtl::BufferSlice uploaded;
++    if (uniform.size() > mtl::kInlineConstDataMaxSize)
++    {
++        auto *pool = getBufferPool(context, gl::ShaderType::Compute);
++        pool->releaseInFlightBuffers(context);
++        angle::Span<uint8_t> mapped;
++        ANGLE_TRY(pool->allocateAndMap(context, uniform.size(), &mapped, &uploaded));
++        angle::SpanMemcpy(mapped, uniform.span());
++        ANGLE_TRY(pool->commit(context));
++    }
++    std::array<mtl::BufferRef, mtl::kMaxShaderBuffers> uniformBuffers;
++    std::array<size_t, mtl::kMaxShaderBuffers> uniformOffsets = {};
++    for (size_t i = 0; i < mExecutable->getUniformBlocks().size(); ++i)
++    {
++        const uint32_t slot = info.actualUBOBindings[i];
++        if (slot >= mtl::kMaxShaderBuffers)
++        {
++            continue;
++        }
++        const auto &binding =
++            glState.getIndexedUniformBuffer(mExecutable->getUniformBlockBinding(i));
++        ANGLE_CHECK(context, binding.get(), "Missing compute uniform buffer", GL_INVALID_OPERATION);
++        uniformBuffers[slot] = mtl::GetImpl(binding.get())->getCurrentBuffer();
++        uniformOffsets[slot] = static_cast<size_t>(binding.getOffset());
++    }
++    struct SampledTexture
++    {
++        TextureMtl *texture;
++        gl::Sampler *sampler;
++        uint32_t textureSlot;
++        uint32_t samplerSlot;
++    };
++    std::vector<SampledTexture> sampledTextures;
++    const auto &completeTextures = glState.getActiveTexturesCache();
++    for (size_t i = 0; i < mExecutable->getSamplerBindings().size(); ++i)
++    {
++        const auto &binding      = mExecutable->getSamplerBindings()[i];
++        const auto &metalBinding = info.actualSamplerBindings[i];
++        if (metalBinding.textureBinding >= mtl::kMaxShaderSamplers)
++        {
++            continue;
++        }
++        for (uint32_t element = 0; element < binding.textureUnitsCount; ++element)
++        {
++            const GLuint unit =
++                binding.getTextureUnit(mExecutable->getSamplerBoundTextureUnits(), element);
++            gl::Texture *texture = completeTextures[unit];
++            if (!texture)
++            {
++                ANGLE_TRY(context->getIncompleteTexture(glContext, binding.textureType,
++                                                        binding.format, &texture));
++            }
++            TextureMtl *backend = mtl::GetImpl(texture);
++            ANGLE_TRY(backend->ensureNativeStorageCreated(glContext, true,
++                                                          ImageMipLevels::EnabledLevels));
++            sampledTextures.push_back({backend, context->getState().getSampler(unit),
++                                       metalBinding.textureBinding + element,
++                                       metalBinding.samplerBinding + element});
++        }
++    }
++    struct StorageImage
++    {
++        TextureMtl *texture;
++        const gl::ImageUnit *unit;
++        uint32_t slot;
++    };
++    std::vector<StorageImage> storageImages;
++    for (size_t i = 0; i < mExecutable->getImageBindings().size(); ++i)
++    {
++        const uint32_t slot = info.actualComputeImageBindings[i];
++        if (slot >= mtl::kMaxShaderImages)
++        {
++            continue;
++        }
++        const auto &binding = mExecutable->getImageBindings()[i];
++        ANGLE_CHECK(context, binding.boundImageUnits.size() == 1,
++                    "Compute image arrays are not implemented", GL_INVALID_OPERATION);
++        const auto &unit = glState.getImageUnit(binding.boundImageUnits[0]);
++        ANGLE_CHECK(context, unit.texture.get() && !unit.layered,
++                    "Compute image requires a bound non-layered texture", GL_INVALID_OPERATION);
++        TextureMtl *texture = mtl::GetImpl(unit.texture.get());
++        ANGLE_TRY(
++            texture->ensureNativeStorageCreated(glContext, true, ImageMipLevels::EnabledLevels));
++        storageImages.push_back({texture, &unit, slot});
++    }
++    // Texture allocation/uploads can end the current compute encoder. Obtain
++    // it only after every resource is ready, then bind this dispatch's state.
++    auto *encoder = context->getComputeCommandEncoder();
++    encoder->setComputePipelineState(pipeline.get());
++    for (size_t slot = 0; slot < buffers.size(); ++slot)
++    {
++        if (buffers[slot])
++        {
++            encoder->setBufferForWrite(buffers[slot], offsets[slot], static_cast<uint32_t>(slot));
++        }
++    }
++    for (size_t slot = 0; slot < uniformBuffers.size(); ++slot)
++    {
++        if (uniformBuffers[slot])
++        {
++            encoder->setBuffer(uniformBuffers[slot], uniformOffsets[slot],
++                               static_cast<uint32_t>(slot));
++        }
++    }
++    encoder->setData(driver, mtl::kDriverUniformsBindingIndex);
++    if (uniform.size())
++    {
++        if (uploaded.buffer())
++        {
++            encoder->setBuffer(uploaded.buffer(), uploaded.offset(),
++                               mtl::kDefaultUniformsBindingIndex);
++        }
++        else
++        {
++            encoder->setBytes(uniform.data(), uniform.size(), mtl::kDefaultUniformsBindingIndex);
++        }
++    }
++    for (const auto &texture : sampledTextures)
++    {
++        ANGLE_TRY(texture.texture->bindToComputeShader(glContext, encoder, texture.sampler,
++                                                       texture.textureSlot, texture.samplerSlot));
++    }
++    for (const auto &image : storageImages)
++    {
++        ANGLE_TRY(image.texture->bindToComputeImage(glContext, encoder, image.slot,
++                                                    image.unit->level, image.unit->layer,
++                                                    image.unit->format));
++    }
++    *encoderOut = encoder;
++    return angle::Result::Continue;
++}
++
+ angle::Result ProgramExecutableMtl::setupDraw(const gl::Context *glContext,
+                                               mtl::RenderCommandEncoder *cmdEncoder,
+                                               const mtl::RenderPipelineDesc &pipelineDesc,
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index f567222..2b85026 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -34,7 +34,7 @@
+ 
+ namespace
+ {
+-constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435031;  // MCP1
++constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435033;  // MCP3
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+@@ -326,6 +326,10 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+         mtl::TranslatedShaderInfo *translateInfo =
+             &executableMtl->mMslShaderTranslateInfo[shaderType];
+         std::map<std::string, std::string> macros = GetDefaultSubstitutionDictionary();
++        if (translateInfo->requiresComputeMemoryFences)
++        {
++            macros["ANGLE_METAL_COMPUTE_MEMORY_FENCES"] = "1";
++        }
+         const bool disableFastMath                = translateInfo->hasIsnanOrIsinf;
+         const bool usesInvariance = translateInfo->hasInvariant;
+ 
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.h b/src/libANGLE/renderer/metal/TextureMtl.h
+index 446f81d..a3745d5 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.h
++++ b/src/libANGLE/renderer/metal/TextureMtl.h
+@@ -189,7 +189,34 @@ class TextureMtl : public TextureImpl
+                                     int layer,
+                                     GLenum format);
+ 
++    angle::Result bindToComputeShader(const gl::Context *context,
++                                      mtl::ComputeCommandEncoder *encoder,
++                                      gl::Sampler *sampler,
++                                      int textureSlotIndex,
++                                      int samplerSlotIndex);
++    angle::Result bindToComputeImage(const gl::Context *context,
++                                     mtl::ComputeCommandEncoder *encoder,
++                                     int textureSlotIndex,
++                                     int level,
++                                     int layer,
++                                     GLenum format);
++
+   private:
++    template <typename Encoder>
++    angle::Result bindToShaderImpl(const gl::Context *context,
++                                   Encoder *encoder,
++                                   gl::ShaderType shaderType,
++                                   gl::Sampler *sampler,
++                                   int textureSlotIndex,
++                                   int samplerSlotIndex);
++    template <typename Encoder>
++    angle::Result bindToShaderImageImpl(const gl::Context *context,
++                                        Encoder *encoder,
++                                        gl::ShaderType shaderType,
++                                        int textureSlotIndex,
++                                        int level,
++                                        int layer,
++                                        GLenum format);
+     void deallocateNativeStorage(bool keepImages, bool keepSamplerStateAndFormat = false);
+     angle::Result createNativeStorage(const gl::Context *context,
+                                       gl::TextureType type,
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index e60b91e..4fde241 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -1979,6 +1979,28 @@ uint32_t height(GLuint glLevel) const
+                                        gl::Sampler *sampler,
+                                        int textureSlotIndex,
+                                        int samplerSlotIndex)
++{
++    return bindToShaderImpl(context, cmdEncoder, shaderType, sampler, textureSlotIndex,
++                            samplerSlotIndex);
++}
++
++angle::Result TextureMtl::bindToComputeShader(const gl::Context *context,
++                                              mtl::ComputeCommandEncoder *encoder,
++                                              gl::Sampler *sampler,
++                                              int textureSlotIndex,
++                                              int samplerSlotIndex)
++{
++    return bindToShaderImpl(context, encoder, gl::ShaderType::Compute, sampler, textureSlotIndex,
++                            samplerSlotIndex);
++}
++
++template <typename Encoder>
++angle::Result TextureMtl::bindToShaderImpl(const gl::Context *context,
++                                           Encoder *cmdEncoder,
++                                           gl::ShaderType shaderType,
++                                           gl::Sampler *sampler,
++                                           int textureSlotIndex,
++                                           int samplerSlotIndex)
+ {
+     ASSERT(mNativeTextureStorage);
+     ASSERT(mViewFromBaseToMaxLevel);
+@@ -2072,6 +2094,30 @@ uint32_t height(GLuint glLevel) const
+                                             int level,
+                                             int layer,
+                                             GLenum format)
++{
++    return bindToShaderImageImpl(context, cmdEncoder, shaderType, textureSlotIndex, level, layer,
++                                 format);
++}
++
++angle::Result TextureMtl::bindToComputeImage(const gl::Context *context,
++                                             mtl::ComputeCommandEncoder *encoder,
++                                             int textureSlotIndex,
++                                             int level,
++                                             int layer,
++                                             GLenum format)
++{
++    return bindToShaderImageImpl(context, encoder, gl::ShaderType::Compute, textureSlotIndex, level,
++                                 layer, format);
++}
++
++template <typename Encoder>
++angle::Result TextureMtl::bindToShaderImageImpl(const gl::Context *context,
++                                                Encoder *cmdEncoder,
++                                                gl::ShaderType shaderType,
++                                                int textureSlotIndex,
++                                                int level,
++                                                int layer,
++                                                GLenum format)
+ {
+     ASSERT(mNativeTextureStorage);
+     ASSERT(mState.getImmutableFormat());
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.h b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+index ad3ebed..61dbde6 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.h
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.h
+@@ -755,6 +755,32 @@ class ComputeCommandEncoder final : public CommandEncoder
+     ComputeCommandEncoder &setTexture(const TextureRef &texture, uint32_t index);
+     ComputeCommandEncoder &setTextureForWrite(const TextureRef &texture, uint32_t index);
+ 
++    // Stage-aware adapters let graphics and compute share texture view and
++    // sampler preparation without duplicating their GL semantics.
++    ComputeCommandEncoder &setTexture(gl::ShaderType stage,
++                                      const TextureRef &texture,
++                                      uint32_t index)
++    {
++        ASSERT(stage == gl::ShaderType::Compute);
++        return setTexture(texture, index);
++    }
++    ComputeCommandEncoder &setRWTexture(gl::ShaderType stage,
++                                        const TextureRef &texture,
++                                        uint32_t index)
++    {
++        ASSERT(stage == gl::ShaderType::Compute);
++        return setTextureForWrite(texture, index);
++    }
++    ComputeCommandEncoder &setSamplerState(gl::ShaderType stage,
++                                           id<MTLSamplerState> state,
++                                           float minLod,
++                                           float maxLod,
++                                           uint32_t index)
++    {
++        ASSERT(stage == gl::ShaderType::Compute);
++        return setSamplerState(state, minLod, maxLod, index);
++    }
++
+     ComputeCommandEncoder &dispatch(const MTLSize &threadGroupsPerGrid,
+                                     const MTLSize &threadsPerGroup);
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.h b/src/libANGLE/renderer/metal/mtl_msl_utils.h
+index 68e085b..c7eb281 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.h
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.h
+@@ -45,6 +45,8 @@ struct TranslatedShaderInfo
+     std::array<uint32_t, kMaxGLUBOBindings> actualUBOBindings;
+     std::array<uint32_t, kMaxShaderXFBs> actualXFBBindings;
+     std::vector<uint32_t> actualSSBOBindings;
++    std::vector<uint32_t> actualComputeImageBindings;
++    bool requiresComputeMemoryFences;
+     bool hasUBOArgumentBuffer;
+     bool hasIsnanOrIsinf;
+     bool hasInvariant;
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.mm b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+index f0f831a..598cf11 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+@@ -139,8 +139,10 @@
+ void TranslatedShaderInfo::reset()
+ {
+     actualSSBOBindings.clear();
++    actualComputeImageBindings.clear();
+     metalShaderSource    = nullptr;
+     metalLibrary         = nil;
++    requiresComputeMemoryFences = false;
+     hasUBOArgumentBuffer = false;
+     hasIsnanOrIsinf      = false;
+     hasInvariant         = false;
+@@ -680,6 +682,35 @@ void GenerateTransformFeedbackEmulationOutputs(
+                 storageBindings[i] = static_cast<uint32_t>(binding->second);
+             }
+         }
++        auto &computeImages = mslShaderInfoOut->at(type).actualComputeImageBindings;
++        computeImages.assign(executable.getImageBindings().size(), kMaxShaderImages);
++        if (type == gl::ShaderType::Compute)
++        {
++            const auto &imageMap = reflection->getComputeImageBindings();
++            for (size_t i = 0; i < computeImages.size(); ++i)
++            {
++                const auto uniform = executable.getUniformIndexFromImageIndex(i);
++                const auto &name   = executable.getUniformMappedNames()[uniform];
++                auto binding       = imageMap.find(name);
++                if (binding != imageMap.end())
++                {
++                    computeImages[i] = static_cast<uint32_t>(binding->second);
++                }
++            }
++        }
++        if (type == gl::ShaderType::Compute)
++        {
++            const auto &uniformMap = reflection->getComputeUniformBindings();
++            for (size_t i = 0; i < blocks.size(); ++i)
++            {
++                auto binding = uniformMap.find(blocks[i].name);
++                if (binding != uniformMap.end())
++                {
++                    mslShaderInfoOut->at(type).actualUBOBindings[i] =
++                        static_cast<uint32_t>(binding->second);
++                }
++            }
++        }
+         if (reflection->hasUBOs)
+         {
+             (*mslShaderInfoOut)[type].hasUBOArgumentBuffer = true;
+@@ -710,6 +741,8 @@ void GenerateTransformFeedbackEmulationOutputs(
+         {
+             mslShaderInfoOut->at(type).actualImageBindings[i] = reflection->getRWTextureBinding(i);
+         }
++        (*mslShaderInfoOut)[type].requiresComputeMemoryFences =
++            reflection->requiresComputeMemoryFences;
+         (*mslShaderInfoOut)[type].hasIsnanOrIsinf = reflection->hasIsnanOrIsinf;
+         (*mslShaderInfoOut)[type].hasInvariant    = reflection->hasInvariance;
+     }
+diff --git a/src/libANGLE/renderer/metal/mtl_utils.mm b/src/libANGLE/renderer/metal/mtl_utils.mm
+index 6912d1c..3df82be 100644
+--- a/src/libANGLE/renderer/metal/mtl_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_utils.mm
+@@ -942,6 +942,20 @@ static MTLLanguageVersion GetUserSetOrHighestMSLVersion(const MTLLanguageVersion
+ #pragma clang diagnostic pop
+         }
+ 
++        if (substitutionMacros.count("ANGLE_METAL_COMPUTE_MEMORY_FENCES"))
++        {
++#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000
++            if (@available(macOS 15.0, iOS 18.0, *))
++            {
++                // atomic_thread_fence provides a memory-only fence on Apple
++                // silicon; execution barriers cannot substitute for this.
++                if ([metalDevice supportsFamily:MTLGPUFamilyApple1])
++                {
++                    options.get().languageVersion = MTLLanguageVersion3_2;
++                }
++            }
++#endif
++        }
+         options.get().languageVersion =
+             GetUserSetOrHighestMSLVersion(options.get().languageVersion);
+ 
+diff --git a/src/tests/BUILD.gn b/src/tests/BUILD.gn
+index 134e68e..5b67601 100644
+--- a/src/tests/BUILD.gn
++++ b/src/tests/BUILD.gn
+@@ -579,6 +579,9 @@ if (is_win || is_linux || is_chromeos || is_android || is_fuchsia || is_apple) {
+ 
+     if (angle_enable_metal) {
+       sources += angle_white_box_tests_metal_sources
++      if (angle_metal_enable_compute_tests) {
++        sources += [ "gl_tests/ComputeDispatchTestMetal.cpp" ]
++      }
+     }
+   }
+ }
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+new file mode 100644
+index 0000000..c3afdd1
+--- /dev/null
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -0,0 +1,593 @@
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "test_utils/ANGLETest.h"
++#include "test_utils/gl_raii.h"
++
++#include <array>
++#include <cstring>
++
++using namespace angle;
++namespace
++{
++class ComputeDispatchTestMetal : public ANGLETest<>
++{
++  protected:
++    ComputeDispatchTestMetal()
++    {
++        setWindowWidth(16);
++        setWindowHeight(16);
++    }
++
++    void reloadProgram(GLuint source, GLuint destination)
++    {
++        GLint length = 0;
++        glGetProgramiv(source, GL_PROGRAM_BINARY_LENGTH, &length);
++        ASSERT_GT(length, 0);
++        std::vector<uint8_t> bytes(length);
++        GLenum format   = 0;
++        GLsizei written = 0;
++        glGetProgramBinary(source, length, &written, &format, bytes.data());
++        glProgramBinary(destination, format, bytes.data(), written);
++        GLint linked = GL_FALSE;
++        glGetProgramiv(destination, GL_LINK_STATUS, &linked);
++        ASSERT_EQ(linked, GL_TRUE);
++        ASSERT_GL_NO_ERROR();
++    }
++};
++
++// Exercise actual GL compilation, linking, remapping, uniforms, program binary
++// reload and dispatch. Two SSBO ranges alias one allocation; readback is final.
++TEST_P(ComputeDispatchTestMetal, StorageRangesUniformsAndBinary)
++{
++    RecordProperty("GLVersion", reinterpret_cast<const char *>(glGetString(GL_VERSION)));
++    RecordProperty("GLRenderer", reinterpret_cast<const char *>(glGetString(GL_RENDERER)));
++    RecordProperty("Profile", "internal integration profile; not GLES 3.1 conformance");
++    for (auto limit : {GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, GL_MAX_COMPUTE_SHARED_MEMORY_SIZE,
++                       GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS, GL_MAX_COMPUTE_UNIFORM_BLOCKS,
++                       GL_MAX_COMPUTE_IMAGE_UNIFORMS})
++    {
++        GLint value = 0;
++        glGetIntegerv(limit, &value);
++        RecordProperty("Limit_" + std::to_string(limit), value);
++    }
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 8) in;
++        layout(std430, binding = 5) readonly buffer InputData { uint prefix; uint values[]; } inputData;
++        layout(std430, binding = 2) buffer OutputData { uvec4 header; uint values[]; } outputData;
++        uniform uint scale;
++        uniform highp vec4 bias;
++        void main() {
++            uint i = gl_LocalInvocationIndex;
++            bool valid = inputData.values.length() == 8 && outputData.values.length() == 8;
++            outputData.values[i] = valid ? (inputData.values[i] + inputData.prefix) * scale + uint(bias.x) : 0xffffffffu;
++            if (i == 0u) outputData.header = uvec4(1, 2, 3, 4);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer allocation;
++    std::array<uint32_t, 1024> expected;
++    expected.fill(0xcdcdcdcdu);
++    expected[256 / 4] = 13;
++    for (uint32_t i = 0; i < 8; ++i)
++    {
++        expected[256 / 4 + 1 + i] = 100 + i;
++    }
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 5, allocation, 256, 36);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 2, allocation, 768, 48);
++    ASSERT_GL_NO_ERROR();
++    GLProgram restored;
++    GLuint active = program;
++    for (uint32_t frame = 0; frame < 4; ++frame)
++    {
++        if (frame == 2)
++        {
++            GLint length;
++            glGetProgramiv(program, GL_PROGRAM_BINARY_LENGTH, &length);
++            ASSERT_GT(length, 0);
++            std::vector<uint8_t> bytes(length);
++            GLenum format;
++            GLsizei written;
++            glGetProgramBinary(program, length, &written, &format, bytes.data());
++            glProgramBinary(restored, format, bytes.data(), written);
++            GLint linked;
++            glGetProgramiv(restored, GL_LINK_STATUS, &linked);
++            ASSERT_EQ(linked, GL_TRUE);
++            active = restored;
++        }
++        glUseProgram(active);
++        glUniform1ui(glGetUniformLocation(active, "scale"), 7 + frame);
++        glUniform4f(glGetUniformLocation(active, "bias"), 3, 0, 0, 0);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
++        ASSERT_GL_NO_ERROR();
++    }
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        expected[768 / 4 + i] = i + 1;
++    }
++    for (uint32_t i = 0; i < 8; ++i)
++    {
++        expected[768 / 4 + 4 + i] = (113 + i) * 10 + 3;
++    }
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, GPUGeneratedIndirectDispatch)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Arguments { uint prefix[64]; uint x; uint y; uint z; } arguments;
++        void main() { arguments.x = 3u; arguments.y = 2u; arguments.z = 2u; }
++    )";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x = 4, local_size_y = 3, local_size_z = 2) in;
++        layout(std430, binding = 1) buffer Results { uvec4 values[]; } results;
++        void main() {
++            uvec3 p = gl_GlobalInvocationID;
++            uint i = p.x + 12u * (p.y + 6u * p.z);
++            bool valid = all(equal(gl_NumWorkGroups, uvec3(3,2,2))) && results.values.length() == 288;
++            results.values[i] = uvec4(p, valid ? gl_LocalInvocationIndex : 0xffffffffu);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(a, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(b, consumer);
++    GLBuffer arguments, results;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, arguments);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 512, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, arguments);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, results);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 288 * 16, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, results);
++    glUseProgram(a);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
++    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, arguments);
++    glUseProgram(b);
++    glDispatchComputeIndirect(256);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 288 * 16, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (uint32_t z = 0; z < 4; ++z)
++    {
++        for (uint32_t y = 0; y < 6; ++y)
++        {
++            for (uint32_t x = 0; x < 12; ++x)
++            {
++                const size_t i = 4 * (x + 12 * (y + 6 * z));
++                EXPECT_EQ(actual[i], x);
++                EXPECT_EQ(actual[i + 1], y);
++                EXPECT_EQ(actual[i + 2], z);
++                EXPECT_EQ(actual[i + 3], x % 4 + 4 * (y % 3 + 3 * (z % 2)));
++            }
++        }
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, SharedAndStorageAtomics)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 64) in;
++        layout(std430, binding = 0) buffer Data {
++            uint count; int minimum; int maximum; uint mask;
++            uint groups[4]; uint tickets[256]; uint globalTickets[256];
++        } data;
++        shared uint count;
++        void main() {
++            uint local = gl_LocalInvocationIndex;
++            uint index = gl_GlobalInvocationID.x;
++            if (local == 0u) count = 0u;
++            barrier();
++            uint ticket = atomicAdd(count, 1u);
++            data.tickets[index] = ticket;
++            data.globalTickets[index] = atomicAdd(data.count, 1u);
++            atomicMin(data.minimum, int(index) - 128);
++            atomicMax(data.maximum, int(index) - 128);
++            atomicOr(data.mask, 1u << (index % 32u));
++            barrier();
++            if (local == 0u) data.groups[gl_WorkGroupID.x] = atomicAdd(count, 0u);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer buffer;
++    std::array<uint32_t, 4 + 4 + 256 + 256> initial = {};
++    initial[1]                                      = 0x7fffffffu;
++    initial[2]                                      = 0x80000000u;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initial), initial.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
++    glUseProgram(program);
++    glDispatchCompute(4, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(initial), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    EXPECT_EQ(actual[0], 256u);
++    EXPECT_EQ(static_cast<int32_t>(actual[1]), -128);
++    EXPECT_EQ(static_cast<int32_t>(actual[2]), 127);
++    EXPECT_EQ(actual[3], 0xffffffffu);
++    std::array<bool, 256> globalSeen = {};
++    for (uint32_t group = 0; group < 4; ++group)
++    {
++        EXPECT_EQ(actual[4 + group], 64u);
++        std::array<bool, 64> localSeen = {};
++        for (uint32_t i = 0; i < 64; ++i)
++        {
++            uint32_t ticket = actual[8 + group * 64 + i];
++            ASSERT_LT(ticket, 64u);
++            EXPECT_FALSE(localSeen[ticket]);
++            localSeen[ticket] = true;
++            uint32_t global   = actual[8 + 256 + group * 64 + i];
++            ASSERT_LT(global, 256u);
++            EXPECT_FALSE(globalSeen[global]);
++            globalSeen[global] = true;
++        }
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++// The producer writes std140 bytes directly. The consumer changes the UBO's
++// GL binding point and reads the same allocation, including bools, array strides,
++// vec3 tail packing and a row-major matrix. Only final validation maps the buffer.
++TEST_P(ComputeDispatchTestMetal, GPUWrittenUniformBuffer)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std140, row_major, binding = 0) buffer Data {
++            bool enabled; uint prefix; vec3 normal; float weight;
++            float coefficients[3]; mat2 matrix;
++        } data;
++        void main() {
++            data.enabled = true; data.prefix = 13u;
++            data.normal = vec3(2,3,4); data.weight = 7.0;
++            data.coefficients[0] = 11.0; data.coefficients[1] = 17.0; data.coefficients[2] = 19.0;
++            data.matrix[0][0] = 23.0; data.matrix[1][0] = 29.0;
++            data.matrix[0][1] = 31.0; data.matrix[1][1] = 37.0;
++        }
++    )";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x = 3) in;
++        layout(std140, row_major, binding = 3) uniform Data {
++            bool enabled; uint prefix; vec3 normal; float weight;
++            float coefficients[3]; mat2 matrix;
++        } data;
++        layout(std430, binding = 1) buffer Results { uint values[]; } results;
++        void main() {
++            uint i = gl_LocalInvocationIndex;
++            results.values[i] = data.enabled ? data.prefix + uint(dot(data.normal,vec3(1)) +
++                data.weight + data.coefficients[i] + data.matrix[0][0] + data.matrix[1][0] +
++                data.matrix[0][1] + data.matrix[1][1]) : 0xffffffffu;
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(a, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(b, consumer);
++    GLBuffer allocation;
++    std::array<uint32_t, 256> initial;
++    initial.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initial), initial.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 256, 112);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, allocation, 768, 12);
++    const GLuint index = glGetUniformBlockIndex(b, "Data");
++    ASSERT_NE(index, GL_INVALID_INDEX);
++    glUniformBlockBinding(b, index, 7);
++    glBindBufferRange(GL_UNIFORM_BUFFER, 7, allocation, 256, 112);
++    glUseProgram(a);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_UNIFORM_BARRIER_BIT);
++    glUseProgram(b);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 768, 12, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    const std::array<uint32_t, 3> expected = {160, 166, 168};
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]);
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++// GLES image bindings come from layout(binding); sampler units can be changed
++// after link. Store an image, then sample it without an intermediate readback.
++TEST_P(ComputeDispatchTestMetal, ImageToSamplerWithSamplerRemapping)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 8) in;
++        layout(rgba32ui, binding = 2) uniform writeonly highp uimage2D destination;
++        void main() {
++            uint i = gl_GlobalInvocationID.x;
++            imageStore(destination, ivec2(i, 0), uvec4(i+3u, i*7u, 19u, 23u));
++        }
++    )";
++    constexpr char consumer[] = R"(#version 310 es
++        layout(local_size_x = 8) in;
++        uniform highp usampler2D sourceImage;
++        layout(std430, binding = 0) buffer Results { uvec4 values[]; } results;
++        void main() {
++            uint i = gl_GlobalInvocationID.x;
++            results.values[i] = texelFetch(sourceImage, ivec2(i,0),0);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(a, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(b, consumer);
++    GLTexture image;
++    glActiveTexture(GL_TEXTURE3);
++    glBindTexture(GL_TEXTURE_2D, image);
++    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32UI, 8, 1);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++    GLBuffer results;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, results);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 8 * 16, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, results);
++    glBindImageTexture(2, image, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32UI);
++    GLProgram restored;
++    reloadProgram(a, restored);
++    glUseProgram(restored);
++    GLint imageUnit = -1;
++    glGetUniformiv(restored, glGetUniformLocation(restored, "destination"), &imageUnit);
++    ASSERT_EQ(imageUnit, 2);
++    ASSERT_GL_NO_ERROR();
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    glUseProgram(b);
++    glUniform1i(glGetUniformLocation(b, "sourceImage"), 3);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 8 * 16, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (uint32_t i = 0; i < 8; ++i)
++    {
++        EXPECT_EQ(actual[4 * i], i + 3);
++        EXPECT_EQ(actual[4 * i + 1], i * 7);
++        EXPECT_EQ(actual[4 * i + 2], 19u);
++        EXPECT_EQ(actual[4 * i + 3], 23u);
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, GPUGeneratedDrawAndMultiDrawIndirect)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Commands { uint words[]; } commands;
++        layout(std430, binding = 1) buffer Indices { uint values[]; } indices;
++        uniform bool indexed;
++        uniform bool visible;
++        void main() {
++            // Two commands at offset 256, stride 32. The second is always empty.
++            commands.words[64] = 3u;
++            commands.words[65] = visible ? 1u : 0u;
++            commands.words[66] = indexed ? 2u : 3u;
++            commands.words[67] = indexed ? 0xffffffffu : 0u;
++            commands.words[68] = 0u;
++            commands.words[72] = 0u; commands.words[73] = 1u;
++            commands.words[74] = 0u; commands.words[75] = 0u; commands.words[76] = 0u;
++            indices.values[2] = 4u; indices.values[3] = 5u; indices.values[4] = 6u;
++        }
++    )";
++    constexpr char vertex[]   = R"(#version 310 es
++        void main() {
++            int i = gl_VertexID - 3;
++            vec2 p = i == 0 ? vec2(-1,-1) : i == 1 ? vec2(3,-1) : vec2(-1,3);
++            gl_Position = vec4(p,0,1);
++        }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        out vec4 color;
++        void main() { color = vec4(0,1,0,1); }
++    )";
++    ASSERT_TRUE(EnsureGLExtensionEnabled("GL_EXT_multi_draw_indirect"));
++    ANGLE_GL_COMPUTE_PROGRAM(compute, producer);
++    ANGLE_GL_PROGRAM(render, vertex, fragment);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
++    GLBuffer commands, indices;
++    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, commands);
++    glBufferData(GL_DRAW_INDIRECT_BUFFER, 512, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, commands);
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, 128, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, indices);
++    for (uint32_t frame = 0; frame < 8; ++frame)
++    {
++        const bool indexed = (frame & 1) != 0;
++        const bool multi   = (frame & 2) != 0;
++        const bool visible = frame < 4;
++        glClearColor(1, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT);
++        glUseProgram(compute);
++        glUniform1i(glGetUniformLocation(compute, "indexed"), indexed);
++        glUniform1i(glGetUniformLocation(compute, "visible"), visible);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT);
++        glUseProgram(render);
++        const void *offset = reinterpret_cast<const void *>(256);
++        if (indexed)
++        {
++            if (multi)
++            {
++                glMultiDrawElementsIndirectEXT(GL_TRIANGLES, GL_UNSIGNED_INT, offset, 2, 32);
++            }
++            else
++            {
++                glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_INT, offset);
++            }
++        }
++        else
++        {
++            if (multi)
++            {
++                glMultiDrawArraysIndirectEXT(GL_TRIANGLES, offset, 2, 32);
++            }
++            else
++            {
++                glDrawArraysIndirect(GL_TRIANGLES, offset);
++            }
++        }
++        ASSERT_GL_NO_ERROR();
++        EXPECT_PIXEL_RECT_EQ(0, 0, 16, 16, visible ? GLColor::green : GLColor::red);
++    }
++}
++
++// Each branch executes memory-only fences before a common execution barrier.
++// Replacing a fence with a rendezvous can hang this valid divergent shader.
++TEST_P(ComputeDispatchTestMetal, DivergentMemoryFences)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 64) in;
++        layout(std430, binding = 0) coherent buffer Data { uint values[64]; uint result[64]; } data;
++        shared uint scratch[64];
++        void main() {
++            uint i = gl_LocalInvocationIndex;
++            data.values[i] = i + 13u; scratch[i] = i + 17u;
++            if ((i & 1u) == 0u) {
++                memoryBarrier();
++            } else {
++                memoryBarrierShared(); memoryBarrierBuffer();
++                memoryBarrierAtomicCounter(); memoryBarrierImage(); groupMemoryBarrier();
++            }
++            barrier();
++            data.result[i] = data.values[63u-i] + scratch[63u-i];
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer allocation;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 128 * 4, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    glUseProgram(program);
++    GLProgram restored;
++    for (uint32_t frame = 0; frame < 8; ++frame)
++    {
++        if (frame == 4)
++        {
++            reloadProgram(program, restored);
++            glUseProgram(restored);
++        }
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
++    }
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 128 * 4, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (uint32_t i = 0; i < 64; ++i)
++    {
++        EXPECT_EQ(actual[i], i + 13);
++        EXPECT_EQ(actual[64 + i], 2 * (63 - i) + 30);
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, AtomicReturnValuesAndCompareSwap)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Data { uint memory; uint results[8]; } data;
++        shared int memory;
++        void main() {
++            data.memory = 0xf0u;
++            data.results[0] = atomicAnd(data.memory, 0x3fu);
++            data.results[1] = atomicXor(data.memory, 0x0fu);
++            data.results[2] = atomicExchange(data.memory, 17u);
++            data.results[3] = atomicCompSwap(data.memory, 16u, 2u);
++            data.results[4] = atomicCompSwap(data.memory, 17u, 3u);
++            memory = -7;
++            data.results[5] = uint(atomicExchange(memory, -11));
++            data.results[6] = uint(atomicCompSwap(memory, -11, -19));
++            data.results[7] = uint(atomicAdd(memory, 0));
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer allocation;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, 9 * 4, nullptr, GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    glUseProgram(program);
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 9 * 4, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    const std::array<uint32_t, 9> expected = {3,
++                                              0xf0,
++                                              0x30,
++                                              0x3f,
++                                              17,
++                                              17,
++                                              static_cast<uint32_t>(-7),
++                                              static_cast<uint32_t>(-11),
++                                              static_cast<uint32_t>(-19)};
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]);
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeDispatchTestMetal, ZeroDispatchAndFrontendValidation)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Output { uint value; } outputData;
++        void main() { outputData.value = 99u; }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLBuffer buffer;
++    const std::array<uint32_t, 8> sentinel = {17, 0, 0, 0, 0, 0, 0, 0};
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(sentinel), sentinel.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
++    glUseProgram(program);
++    glDispatchCompute(0, 1, 1);
++    glDispatchCompute(1, 0, 1);
++    glDispatchCompute(1, 1, 0);
++    GLint limit;
++    glGetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 0, &limit);
++    glDispatchCompute(static_cast<GLuint>(limit) + 1, 1, 1);
++    EXPECT_GL_ERROR(GL_INVALID_VALUE);
++    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer);
++    glDispatchComputeIndirect(2);
++    EXPECT_GL_ERROR(GL_INVALID_VALUE);
++    auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, 4, GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    EXPECT_EQ(*actual, sentinel[0]);
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++}  // namespace
++ANGLE_INSTANTIATE_TEST(ComputeDispatchTestMetal,
++                       ES31_METAL().enable(Feature::AlwaysEnableEmulatedMultidrawExtensions));
+diff --git a/src/tests/test_utils/angle_test_configs.cpp b/src/tests/test_utils/angle_test_configs.cpp
+index e4e8ce0..701c65b 100644
+--- a/src/tests/test_utils/angle_test_configs.cpp
++++ b/src/tests/test_utils/angle_test_configs.cpp
+@@ -747,6 +747,11 @@ PlatformParameters ES3_METAL()
+     return PlatformParameters(3, 0, egl_platform::METAL());
+ }
+ 
++PlatformParameters ES31_METAL()
++{
++    return PlatformParameters(3, 1, egl_platform::METAL());
++}
++
+ PlatformParameters ES2_WGL()
+ {
+     return PlatformParameters(2, 0, GLESDriverType::SystemWGL);
+diff --git a/src/tests/test_utils/angle_test_configs.h b/src/tests/test_utils/angle_test_configs.h
+index b8eb5b0..296f57c 100644
+--- a/src/tests/test_utils/angle_test_configs.h
++++ b/src/tests/test_utils/angle_test_configs.h
+@@ -189,6 +189,7 @@ PlatformParameters ES32_VULKAN_SWIFTSHADER();
+ PlatformParameters ES1_METAL();
+ PlatformParameters ES2_METAL();
+ PlatformParameters ES3_METAL();
++PlatformParameters ES31_METAL();
+ 
+ PlatformParameters ES2_WGL();
+ PlatformParameters ES3_WGL();

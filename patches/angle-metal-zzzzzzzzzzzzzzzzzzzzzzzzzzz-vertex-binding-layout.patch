@@ -1,0 +1,257 @@
+diff --git a/src/libANGLE/renderer/metal/BufferMtl.mm b/src/libANGLE/renderer/metal/BufferMtl.mm
+index 7aff37f..e1b3e69 100644
+--- a/src/libANGLE/renderer/metal/BufferMtl.mm
++++ b/src/libANGLE/renderer/metal/BufferMtl.mm
+@@ -404,7 +404,7 @@ bool isOffsetAndSizeMetalBlitCompatible(size_t offset, size_t size)
+     for (VertexConversionBufferMtl &buffer : mVertexConversionBuffers)
+     {
+         if (buffer.formatID == formatID && buffer.stride == stride && buffer.offset <= offset &&
+-            buffer.offset % buffer.stride == offset % stride)
++            (stride ? buffer.offset % stride == offset % stride : buffer.offset == offset))
+         {
+             return &buffer;
+         }
+diff --git a/src/libANGLE/renderer/metal/VertexArrayMtl.mm b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+index e9d6627..24b3a0c 100644
+--- a/src/libANGLE/renderer/metal/VertexArrayMtl.mm
++++ b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+@@ -113,8 +113,10 @@ size_t GetVertexCount(BufferMtl *srcBuffer,
+     bytes -= srcFormatSize;
+ 
+     // Count how many strides fit remaining space.
+-    if (bytes > 0)
++    if (bytes > 0 && binding.getStride() != 0)
++    {
+         numVertices += static_cast<size_t>(bytes) / binding.getStride();
++    }
+ 
+     return numVertices;
+ }
+@@ -135,8 +137,10 @@ size_t GetVertexCountWithConversion(BufferMtl *srcBuffer,
+     bytes -= srcFormatSize;
+ 
+     // Count how many strides fit remaining space.
+-    if (bytes > 0)
++    if (bytes > 0 && binding.getStride() != 0)
++    {
+         numVertices += static_cast<size_t>(bytes) / binding.getStride();
++    }
+ 
+     return numVertices;
+ }
+@@ -393,7 +397,12 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+                                                          /*offset*/ 0, bufferIdx};
+                 MTLVertexStepFunction stepFunction = MTLVertexStepFunctionPerVertex;
+                 uint32_t stepRate                  = 1;
+-                if (binding.getDivisor() != 0)
++                if (binding.getStride() == 0)
++                {
++                    stepFunction = MTLVertexStepFunctionConstant;
++                    stepRate     = 0;
++                }
++                else if (binding.getDivisor() != 0)
+                 {
+                     stepFunction = MTLVertexStepFunctionPerInstance;
+                     stepRate     = binding.getDivisor();
+@@ -404,7 +413,10 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+                 // than the buffer length.
+                 // In OpenGL, this is valid only when a draw call accesses just
+                 // one vertex, so just replace the stride with the format size.
+-                uint32_t stride = mCurrentArrayBufferStrides[v];
++                uint32_t stride =
++                    binding.getStride() == 0
++                        ? mCurrentArrayBufferFormats[v]->actualAngleFormat().pixelBytes
++                        : mCurrentArrayBufferStrides[v];
+                 if (mCurrentArrayBuffers[v])
+                 {
+                     const size_t length = mCurrentArrayBuffers[v]->getCurrentBuffer()->size();
+@@ -604,24 +616,29 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+         if (bufferGL)
+         {
+             BufferMtl *bufferMtl = mtl::GetImpl(bufferGL);
++            gl::VertexBinding effectiveBinding(static_cast<GLuint>(attribIndex));
++            effectiveBinding.setStride(binding.getStride());
++            effectiveBinding.setDivisor(binding.getDivisor());
++            effectiveBinding.setOffset(binding.getOffset() + attrib.relativeOffset);
+             // https://bugs.webkit.org/show_bug.cgi?id=236733
+             // even non-converted buffers need to be observed for potential
+             // data rebinds.
+             mContentsObserverBindingsMask.set(attrib.bindingIndex);
+             bool needConversion =
+                 format.actualFormatId != format.intendedFormatId ||
+-                (binding.getOffset() % mtl::kVertexAttribBufferStrideAlignment) != 0 ||
++                (effectiveBinding.getOffset() % mtl::kVertexAttribBufferStrideAlignment) != 0 ||
+                 (binding.getStride() < format.actualAngleFormat().pixelBytes) ||
+                 (binding.getStride() % mtl::kVertexAttribBufferStrideAlignment) != 0;
+ 
+             if (needConversion)
+             {
+-                ANGLE_TRY(convertVertexBuffer(glContext, bufferMtl, binding, attribIndex, format));
++                ANGLE_TRY(convertVertexBuffer(glContext, bufferMtl, effectiveBinding, attribIndex,
++                                              format));
+             }
+             else
+             {
+                 mCurrentArrayBuffers[attribIndex]       = bufferMtl;
+-                mCurrentArrayBufferOffsets[attribIndex] = binding.getOffset();
++                mCurrentArrayBufferOffsets[attribIndex] = effectiveBinding.getOffset();
+                 mCurrentArrayBufferStrides[attribIndex] = binding.getStride();
+ 
+                 mCurrentArrayBufferFormats[attribIndex] = &format;
+@@ -1106,11 +1123,15 @@ void AppendSimpleDrawCommandRanges(std::vector<DrawCommandRange> &drawCommands,
+     {
+         VertexConversionBufferMtl *vertexConversionMtl =
+             static_cast<VertexConversionBufferMtl *>(conversion);
+-        ASSERT((binding.getOffset() - vertexConversionMtl->offset) % binding.getStride() == 0);
++        ASSERT((binding.getStride()
++                    ? (binding.getOffset() - vertexConversionMtl->offset) % binding.getStride() == 0
++                    : binding.getOffset() == vertexConversionMtl->offset));
+         mConvertedArrayBufferHolders[attribIndex].set(conversion->buffer.buffer());
+         mCurrentArrayBufferOffsets[attribIndex] =
+             conversion->buffer.offset() +
+-            stride * ((binding.getOffset() - vertexConversionMtl->offset) / binding.getStride());
++            (binding.getStride() ? stride * ((binding.getOffset() - vertexConversionMtl->offset) /
++                                             binding.getStride())
++                                 : 0);
+ 
+         mCurrentArrayBuffers[attribIndex]       = &mConvertedArrayBufferHolders[attribIndex];
+         mCurrentArrayBufferFormats[attribIndex] = &convertedFormat;
+@@ -1144,9 +1165,11 @@ void AppendSimpleDrawCommandRanges(std::vector<DrawCommandRange> &drawCommands,
+     mConvertedArrayBufferHolders[attribIndex].set(conversion->buffer.buffer());
+     mCurrentArrayBufferOffsets[attribIndex] =
+         conversion->buffer.offset() +
+-        stride *
+-            ((binding.getOffset() - static_cast<VertexConversionBufferMtl *>(conversion)->offset) /
+-             binding.getStride());
++        (binding.getStride()
++             ? stride * ((binding.getOffset() -
++                          static_cast<VertexConversionBufferMtl *>(conversion)->offset) /
++                         binding.getStride())
++             : 0);
+     mCurrentArrayBuffers[attribIndex]       = &mConvertedArrayBufferHolders[attribIndex];
+     mCurrentArrayBufferFormats[attribIndex] = &convertedFormat;
+     mCurrentArrayBufferStrides[attribIndex] = stride;
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 307f89a..ade88ea 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -745,7 +745,10 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+         void main() {
+             int i=gl_VertexID;
+             vec2 p=vec2(float(i%4)*.5-.75,float((i/4)%4)*.5-.75);
+-            p=fetchMode==1 ? position : p+(fetchMode>1 ? position : vec2(0));
++            p=(fetchMode==1 || fetchMode==4 || fetchMode==5) ? position :
++                p+(fetchMode>1 ? position : vec2(0));
++            if(fetchMode==-2) p+=vec2(.0625,.03125)*float(gl_InstanceID);
++            if(fetchMode==-3) p+=vec2(.0625,.03125);
+             gl_Position=vec4(p+vec2(float(gl_InstanceID)*.03,0),0,1);
+             gl_PointSize=1.; identity=i;
+         }
+@@ -762,7 +765,7 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+     reloadProgram(render, binary);
+     GLVertexArray vao;
+     glBindVertexArray(vao);
+-    GLBuffer positions, offsets, commands, minimal, reference;
++    GLBuffer positions, offsets, relative, fixed, commands, minimal, reference;
+     std::array<float, 128> points;
+     for (size_t i = 0; i < 64; ++i)
+     {
+@@ -771,6 +774,21 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+     }
+     glBindBuffer(GL_ARRAY_BUFFER, positions);
+     glBufferData(GL_ARRAY_BUFFER, sizeof(points), points.data(), GL_STATIC_DRAW);
++    std::array<float, 256> relativePoints;
++    std::array<int32_t, 256> fixedPoints;
++    relativePoints.fill(12345.f);
++    fixedPoints.fill(0x13579bdf);
++    for (size_t i = 0; i < 64; ++i)
++    {
++        relativePoints[4 * i + 2] = points[2 * i];
++        relativePoints[4 * i + 3] = points[2 * i + 1];
++        fixedPoints[4 * i + 1]    = static_cast<int32_t>(points[2 * i] * 65536.f);
++        fixedPoints[4 * i + 2]    = static_cast<int32_t>(points[2 * i + 1] * 65536.f);
++    }
++    glBindBuffer(GL_ARRAY_BUFFER, relative);
++    glBufferData(GL_ARRAY_BUFFER, sizeof(relativePoints), relativePoints.data(), GL_STATIC_DRAW);
++    glBindBuffer(GL_ARRAY_BUFFER, fixed);
++    glBufferData(GL_ARRAY_BUFFER, sizeof(fixedPoints), fixedPoints.data(), GL_STATIC_DRAW);
+     const std::array<float, 4> displacement = {0.f, 0.f, .0625f, .03125f};
+     glBindBuffer(GL_ARRAY_BUFFER, offsets);
+     glBufferData(GL_ARRAY_BUFFER, sizeof(displacement), displacement.data(), GL_STATIC_DRAW);
+@@ -784,7 +802,7 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+     for (GLenum mode : {GL_POINTS, GL_LINES, GL_LINE_LOOP, GL_LINE_STRIP, GL_TRIANGLES,
+                         GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN})
+     {
+-        for (int fetchMode = 0; fetchMode < 4; ++fetchMode)
++        for (int fetchMode = 0; fetchMode < 6; ++fetchMode)
+         {
+             for (bool last : {false, true})
+             {
+@@ -795,6 +813,12 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                         SCOPED_TRACE(testing::Message() << "mode=" << mode << " fetch=" << fetchMode
+                                                         << " last=" << last << " restart="
+                                                         << restarting << " scenario=" << scenario);
++                        if (std::getenv("ANGLE_TRACE_ARRAY_TEST"))
++                        {
++                            std::cout << "ARRAY mode=" << mode << " fetch=" << fetchMode
++                                      << " last=" << last << " restart=" << restarting
++                                      << " scenario=" << scenario << std::endl;
++                        }
+                         const uint32_t count     = scenario == 3   ? 0u
+                                                    : scenario == 4 ? 1u
+                                                    : scenario == 5 ? 2u
+@@ -807,18 +831,8 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                         const uint32_t base      = scenario == 0 ? 0u : 64u;
+                         const GLuint active      = (scenario & 1u) ? binary.get() : render.get();
+                         glUseProgram(active);
+-                        glUniform1i(glGetUniformLocation(active, "fetchMode"), fetchMode);
+-                        if (fetchMode == 0)
+-                        {
+-                            glDisableVertexAttribArray(0);
+-                        }
+-                        else
+-                        {
+-                            glEnableVertexAttribArray(0);
+-                        }
+-                        glBindVertexBuffer(0, fetchMode == 1 ? positions.get() : offsets.get(),
+-                                           fetchMode == 3 ? 8 : 0, fetchMode == 3 ? 0 : 8);
+-                        glVertexBindingDivisor(0, fetchMode == 2 ? 1 : 0);
++                        glUniform1i(glGetUniformLocation(active, "fetchMode"), -fetchMode);
++                        glDisableVertexAttribArray(0);
+                         glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+                         glProvokingVertexANGLE(GL_FIRST_VERTEX_CONVENTION_ANGLE);
+                         glClearColor(0, 0, 1, 1);
+@@ -934,6 +948,24 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+                         glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+                         // No host readback between command production and the actual draw.
+                         glUseProgram(active);
++                        glUniform1i(glGetUniformLocation(active, "fetchMode"), fetchMode);
++                        if (fetchMode)
++                        {
++                            glEnableVertexAttribArray(0);
++                        }
++                        glVertexAttribFormat(0, 2, fetchMode == 5 ? GL_FIXED : GL_FLOAT, GL_FALSE,
++                                             fetchMode == 4   ? 8u
++                                             : fetchMode == 5 ? 4u
++                                                              : 0u);
++                        const GLuint vertexBuffer = fetchMode == 1   ? positions.get()
++                                                    : fetchMode == 4 ? relative.get()
++                                                    : fetchMode == 5 ? fixed.get()
++                                                                     : offsets.get();
++                        glBindVertexBuffer(0, vertexBuffer, fetchMode == 3 ? 8 : 0,
++                                           fetchMode == 3   ? 0
++                                           : fetchMode >= 4 ? 16
++                                                            : 8);
++                        glVertexBindingDivisor(0, fetchMode == 2 ? 1 : 0);
+                         glProvokingVertexANGLE(last ? GL_LAST_VERTEX_CONVENTION_ANGLE
+                                                     : GL_FIRST_VERTEX_CONVENTION_ANGLE);
+                         if (restarting)
+@@ -969,7 +1001,7 @@ TEST_P(ComputeDispatchTestMetal, GPUArrayPrimitiveConversionAndAttributeBounds)
+             }
+         }
+     }
+-    EXPECT_EQ(compared, 1008u);
++    EXPECT_EQ(compared, 1512u);
+     RecordProperty("ComparedArrayIndirectFrames", compared);
+     ASSERT_GL_NO_ERROR();
+ }

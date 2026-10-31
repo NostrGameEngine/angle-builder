@@ -205,24 +205,8 @@ try {
 
     $patchesDir = Join-Path $ROOT_DIR 'patches'
     if (Test-Path $patchesDir -PathType Container) {
-      $patches = Get-ChildItem -Path $patchesDir -Filter '*.patch' -File | Sort-Object Name
-      foreach ($patch in $patches) {
-        git apply --reverse --check $patch.FullName *> $null
-        if ($LASTEXITCODE -eq 0) {
-          Log "Patch already applied: $($patch.Name)"
-          continue
-        }
-
-        git apply --check $patch.FullName *> $null
-        if ($LASTEXITCODE -eq 0) {
-          Log "Applying patch: $($patch.Name)"
-          Invoke-Native { git apply $patch.FullName }
-          continue
-        }
-
-        # Repeat the failed check without suppressing Git's hunk diagnostics.
-        git apply --check $patch.FullName
-        throw "Patch does not apply cleanly: $($patch.FullName)"
+      Invoke-Native {
+        python (Join-Path $ROOT_DIR 'scripts/write-build-manifest.py') --angle-dir $ANGLE_DIR --apply-patches
       }
     }
 

@@ -41,9 +41,11 @@ seen_classifiers=
 shopt -s nullglob
 for artifact_dir in "$INPUT_DIR"/*; do
   [[ -d "$artifact_dir" ]] || continue
-  found_artifacts=1
-
   classifier="$(basename "$artifact_dir")"
+  # Experimental profiles have their own classifier subtree and are packaged
+  # explicitly with PACKAGE_INPUT_DIR=<staging-root>/gles31.
+  [[ "$classifier" == gles31 ]] && continue
+  found_artifacts=1
   jar_file="$OUTPUT_DIR/${ARTIFACT_ID}-${VERSION}-${classifier}.jar"
   packaged_artifacts=1
   seen_classifiers="$seen_classifiers $classifier"

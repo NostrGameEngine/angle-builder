@@ -1,0 +1,405 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 60ebb7f..3e84f19 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -705,15 +705,25 @@ static const char *GetOperatorString(TOperator op,
+             return "metal::get_sample_position";
+ 
+         case TOperator::EOpBitfieldExtract:
++            return "ANGLE_bitfieldExtract";
+         case TOperator::EOpBitfieldInsert:
++            return "ANGLE_bitfieldInsert";
+         case TOperator::EOpBitfieldReverse:
++            return "ANGLE_bitfieldReverse";
+         case TOperator::EOpBitCount:
++            return "ANGLE_bitCount";
+         case TOperator::EOpFindLSB:
++            return "ANGLE_findLSB";
+         case TOperator::EOpFindMSB:
++            return "ANGLE_findMSB";
+         case TOperator::EOpUaddCarry:
++            return "ANGLE_uaddCarry";
+         case TOperator::EOpUsubBorrow:
++            return "ANGLE_usubBorrow";
+         case TOperator::EOpUmulExtended:
++            return "ANGLE_umulExtended";
+         case TOperator::EOpImulExtended:
++            return "ANGLE_imulExtended";
+         case TOperator::EOpMemoryBarrier:
+         case TOperator::EOpMemoryBarrierAtomicCounter:
+         case TOperator::EOpMemoryBarrierBuffer:
+@@ -2835,6 +2845,16 @@ GenMetalTraverser::FuncToName GenMetalTraverser::BuildFuncToName()
+     putAngle("textureProjLodOffset");
+     putAngle("textureProjOffset");
+     putAngle("textureSize");
++    putAngle("bitfieldExtract");
++    putAngle("bitfieldInsert");
++    putAngle("bitfieldReverse");
++    putAngle("bitCount");
++    putAngle("findLSB");
++    putAngle("findMSB");
++    putAngle("uaddCarry");
++    putAngle("usubBorrow");
++    putAngle("umulExtended");
++    putAngle("imulExtended");
+     putAngle("imageSize");
+     putAngle("imageLoad");
+     putAngle("imageStore");
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index aae26d2..a1d375a 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -287,6 +287,7 @@ class ProgramPrelude : public TIntermTraverser
+     void textureSize_2DArray();
+     void textureSize_2DArrayShadow();
+     void textureSize_2DMS();
++    void integerBuiltins();
+     void imageSize();
+     void imageLoad();
+     void imageStore();
+@@ -3018,6 +3019,110 @@ ANGLE_ALWAYS_INLINE auto ANGLE_textureSize(
+ )",
+                         textureEnv())
+ 
++PROGRAM_PRELUDE_DECLARE(integerBuiltins, R"(
++template <typename T>
++struct ANGLE_IntegerOutType { using type = T; };
++
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_bitfieldExtract(T value, int offset, int bits)
++{
++    if (bits <= 0) return T(0);
++    if (bits >= 32) return value;
++    using U = metal::make_unsigned_t<T>;
++    using I = metal::make_signed_t<T>;
++    const uint off = uint(offset) & 31u;
++    const U mask = U(0xffffffffu >> (32u - uint(bits)));
++    const U extracted = (U(value) >> off) & mask;
++    const I extended = as_type<I>(U(value) << ((32u - off - uint(bits)) & 31u)) >> (32u - uint(bits));
++    return metal::select(as_type<T>(extracted), as_type<T>(U(extended)), T(-1) < T(0));
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_bitfieldInsert(T base, T insert, int offset, int bits)
++{
++    if (bits <= 0) return base;
++    if (bits >= 32) return insert;
++    using U = metal::make_unsigned_t<T>;
++    const uint off = uint(offset) & 31u;
++    const U mask = U(0xffffffffu >> (32u - uint(bits))) << off;
++    return as_type<T>((U(base) & ~mask) | ((U(insert) << off) & mask));
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_bitfieldReverse(T value)
++{
++    using U = metal::make_unsigned_t<T>;
++    return as_type<T>(metal::reverse_bits(U(value)));
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE metal::make_signed_t<T> ANGLE_bitCount(T value)
++{
++    using U = metal::make_unsigned_t<T>;
++    using I = metal::make_signed_t<T>;
++    return I(metal::popcount(U(value)));
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE metal::make_signed_t<T> ANGLE_findLSB(T value)
++{
++    using U = metal::make_unsigned_t<T>;
++    using I = metal::make_signed_t<T>;
++    const U bits = U(value);
++    const U safe = metal::select(bits, U(1), bits == U(0));
++    return metal::select(I(metal::ctz(safe)), I(-1), bits == U(0));
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE metal::make_signed_t<T> ANGLE_findMSB(T value)
++{
++    using U = metal::make_unsigned_t<T>;
++    using I = metal::make_signed_t<T>;
++    const U bits = metal::select(U(value), ~U(value), value < T(0));
++    const U safe = metal::select(bits, U(1), bits == U(0));
++    return metal::select(I(31) - I(metal::clz(safe)), I(-1), bits == U(0));
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_uaddCarry(T x, T y, thread typename ANGLE_IntegerOutType<T>::type &carry)
++{
++    const T sum = x + y;
++    carry = T(sum < x);
++    return sum;
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE T ANGLE_usubBorrow(T x, T y, thread typename ANGLE_IntegerOutType<T>::type &borrow)
++{
++    const T difference = x - y;
++    borrow = T(x < y);
++    return difference;
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE void ANGLE_umulExtended(T x, T y,
++    thread typename ANGLE_IntegerOutType<T>::type &msb,
++    thread typename ANGLE_IntegerOutType<T>::type &lsb)
++{
++    const T high = metal::mulhi(x, y);
++    const T low = x * y;
++    msb = high;
++    lsb = low;
++}
++
++template <typename T>
++ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x, T y,
++    thread typename ANGLE_IntegerOutType<T>::type &msb,
++    thread typename ANGLE_IntegerOutType<T>::type &lsb)
++{
++    using U = metal::make_unsigned_t<T>;
++    const T high = metal::mulhi(x, y);
++    const T low = as_type<T>(U(x) * U(y));
++    msb = high;
++    lsb = low;
++}
++)")
++
+ PROGRAM_PRELUDE_DECLARE(imageSize, R"(
+ template <typename T, metal::access Access>
+ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access> &texture)
+@@ -3742,6 +3847,16 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+                 return pp.textureSize_2D();
+         }
+     });
++    putBuiltIn("bitfieldExtract", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("bitfieldInsert", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("bitfieldReverse", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("bitCount", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("findLSB", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("findMSB", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("uaddCarry", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("usubBorrow", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("umulExtended", EMIT_METHOD(integerBuiltins));
++    putBuiltIn("imulExtended", EMIT_METHOD(integerBuiltins));
+     putBuiltIn("imageSize", EMIT_METHOD(imageSize));
+     putBuiltIn("imageLoad", EMIT_METHOD(imageLoad));
+     putBuiltIn("imageStore", EMIT_METHOD(imageStore));
+@@ -4197,6 +4312,9 @@ void ProgramPrelude::visitOperator(TOperator op,
+         case TOperator::EOpUsubBorrow:
+         case TOperator::EOpUmulExtended:
+         case TOperator::EOpImulExtended:
++            integerBuiltins();
++            break;
++
+         case TOperator::EOpMemoryBarrier:
+         case TOperator::EOpMemoryBarrierAtomicCounter:
+         case TOperator::EOpMemoryBarrierBuffer:
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 8aff93d..a81f20e 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1509,6 +1509,203 @@ TEST_P(ComputeDispatchTestMetal, ImageCoordinatesOutsideViews)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++TEST_P(ComputeDispatchTestMetal, IntegerBuiltinsAndStorageOutArguments)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x = 32) in;
++        layout(std430, binding = 0) readonly buffer InputData { uvec4 values[64]; } inputData;
++        layout(std430, binding = 1) buffer Results {
++            uvec4 values[768]; ivec4 signedPairs[32];
++        } result;
++        uniform highp ivec2 windows[8];
++        void main() {
++            uint i = gl_GlobalInvocationID.x;
++            uint base = i * 24u;
++            uvec4 x = inputData.values[2u*i], y = inputData.values[2u*i+1u];
++            ivec4 sx = ivec4(x), sy = ivec4(y);
++            ivec2 window = windows[i & 7u];
++            result.values[base] = bitfieldExtract(x,window.x,window.y);
++            result.values[base+1u] = uvec4(bitfieldExtract(sx,window.x,window.y));
++            result.values[base+2u] = bitfieldInsert(x,y,window.x,window.y);
++            result.values[base+3u] = uvec4(bitfieldInsert(sx,sy,window.x,window.y));
++            result.values[base+4u] = bitfieldReverse(x);
++            result.values[base+5u] = uvec4(bitfieldReverse(sx));
++            result.values[base+6u] = uvec4(bitCount(x));
++            result.values[base+7u] = uvec4(bitCount(sx));
++            result.values[base+8u] = uvec4(findLSB(x));
++            result.values[base+9u] = uvec4(findLSB(sx));
++            result.values[base+10u] = uvec4(findMSB(x));
++            result.values[base+11u] = uvec4(findMSB(sx));
++            uvec4 carry, borrow, high, low;
++            result.values[base+12u] = uaddCarry(x,y,carry);
++            result.values[base+13u] = carry;
++            result.values[base+14u] = usubBorrow(x,y,borrow);
++            result.values[base+15u] = borrow;
++            umulExtended(x,y,high,low);
++            result.values[base+16u] = high;
++            result.values[base+17u] = low;
++            ivec4 signedHigh, signedLow;
++            imulExtended(sx,sy,signedHigh,signedLow);
++            result.values[base+18u] = uvec4(signedHigh);
++            result.values[base+19u] = uvec4(signedLow);
++            result.values[base+21u].xyz = uaddCarry(x.xyz,y.xyz,result.values[base+20u].xyz);
++            result.values[base+22u].y = uaddCarry(x.x,y.x,result.values[base+22u].x);
++            result.values[base+22u].w = usubBorrow(x.x,y.x,result.values[base+22u].z);
++            umulExtended(x.x,y.x,result.values[base+23u].x,result.values[base+23u].y);
++            uvec2 carry2;
++            result.values[base+23u].zw = uaddCarry(x.xy,y.xy,carry2);
++            imulExtended(sx.x,sy.x,result.signedPairs[i].x,result.signedPairs[i].y);
++            result.signedPairs[i].zw = ivec2(carry2);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    constexpr size_t resultOffset = 1280 / 4;
++    constexpr size_t signedOffset = resultOffset + 768 * 4;
++    std::array<uint32_t, 3584> expected;
++    expected.fill(0xcdcdcdcdu);
++    uint32_t random = 0x12345678u;
++    for (size_t i = 0; i < 256; ++i)
++    {
++        random      = random * 1664525u + 1013904223u;
++        expected[i] = random;
++    }
++    constexpr std::array<uint32_t, 16> edges = {0,           1,           2,           3,
++                                                0xffffffffu, 0x80000000u, 0x7fffffffu, 0x80000001u,
++                                                0xaaaaaaaau, 0x55555555u, 0xffff0000u, 0xffffu,
++                                                0x40000000u, 0x10000u,    0x01010101u, 0xf1234567u};
++    for (size_t i = 0; i < 16; ++i)
++    {
++        for (size_t lane = 0; lane < 4; ++lane)
++        {
++            expected[8 * i + lane]     = edges[(i + 5 * lane) % edges.size()];
++            expected[8 * i + 4 + lane] = edges[(3 * i + 7 * lane + 1) % edges.size()];
++        }
++    }
++    GLBuffer allocation;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, allocation, 0, 1024);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 1, allocation, 1280, 12800);
++    GLProgram restored;
++    reloadProgram(program, restored);
++    glUseProgram(restored);
++    constexpr std::array<GLint, 16> windows = {32, 0,  0, 32, 31, 1,  28, 4,
++                                               7,  16, 0, 31, 1,  31, 24, 8};
++    glUniform2iv(glGetUniformLocation(restored, "windows[0]"), 8, windows.data());
++    glDispatchCompute(1, 1, 1);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    auto lsb = [](uint32_t v) {
++        if (v == 0)
++        {
++            return 0xffffffffu;
++        }
++        uint32_t bit = 0;
++        while ((v & 1u) == 0)
++        {
++            v >>= 1;
++            ++bit;
++        }
++        return bit;
++    };
++    auto msb = [](uint32_t v) {
++        if (v == 0)
++        {
++            return 0xffffffffu;
++        }
++        uint32_t bit = 0;
++        while ((v >>= 1) != 0)
++        {
++            ++bit;
++        }
++        return bit;
++    };
++    auto signed32 = [](uint32_t v) -> int64_t {
++        return (v & 0x80000000u) != 0 ? static_cast<int64_t>(v) - 0x100000000ll : v;
++    };
++    for (size_t i = 0; i < 32; ++i)
++    {
++        const uint32_t offset = windows[2 * (i & 7)], bits = windows[2 * (i & 7) + 1];
++        const uint32_t mask =
++            bits == 32 ? 0xffffffffu : static_cast<uint32_t>((uint64_t(1) << bits) - 1);
++        for (size_t lane = 0; lane < 4; ++lane)
++        {
++            const uint32_t x = expected[8 * i + lane], y = expected[8 * i + 4 + lane];
++            const uint32_t extracted = bits == 0 ? 0 : (x >> offset) & mask;
++            uint32_t extended        = extracted;
++            if (bits != 0 && bits < 32 && (extracted & (uint32_t(1) << (bits - 1))) != 0)
++            {
++                extended |= ~mask;
++            }
++            const uint32_t insertMask = bits == 0 ? 0 : mask << offset;
++            const uint32_t inserted =
++                bits == 0 ? x : (x & ~insertMask) | ((y << offset) & insertMask);
++            uint32_t reversed = 0, count = 0;
++            for (uint32_t bit = 0; bit < 32; ++bit)
++            {
++                reversed |= ((x >> bit) & 1u) << (31 - bit);
++                count += (x >> bit) & 1u;
++            }
++            const uint64_t sum = uint64_t(x) + y, product = uint64_t(x) * y;
++            const uint64_t signedProduct = static_cast<uint64_t>(signed32(x) * signed32(y));
++            const std::array<uint32_t, 20> fields = {extracted,
++                                                     extended,
++                                                     inserted,
++                                                     inserted,
++                                                     reversed,
++                                                     reversed,
++                                                     count,
++                                                     count,
++                                                     lsb(x),
++                                                     lsb(x),
++                                                     msb(x),
++                                                     msb((x & 0x80000000u) != 0 ? ~x : x),
++                                                     static_cast<uint32_t>(sum),
++                                                     static_cast<uint32_t>(sum >> 32),
++                                                     x - y,
++                                                     x < y ? 1u : 0u,
++                                                     static_cast<uint32_t>(product >> 32),
++                                                     static_cast<uint32_t>(product),
++                                                     static_cast<uint32_t>(signedProduct >> 32),
++                                                     static_cast<uint32_t>(signedProduct)};
++            for (size_t f = 0; f < fields.size(); ++f)
++            {
++                expected[resultOffset + i * 96 + f * 4 + lane] = fields[f];
++            }
++            if (lane < 3)
++            {
++                expected[resultOffset + i * 96 + 20 * 4 + lane] = static_cast<uint32_t>(sum >> 32);
++                expected[resultOffset + i * 96 + 21 * 4 + lane] = static_cast<uint32_t>(sum);
++            }
++            if (lane == 0)
++            {
++                expected[resultOffset + i * 96 + 22 * 4]     = static_cast<uint32_t>(sum >> 32);
++                expected[resultOffset + i * 96 + 22 * 4 + 1] = static_cast<uint32_t>(sum);
++                expected[resultOffset + i * 96 + 22 * 4 + 2] = x < y ? 1u : 0u;
++                expected[resultOffset + i * 96 + 22 * 4 + 3] = x - y;
++                expected[resultOffset + i * 96 + 23 * 4]     = static_cast<uint32_t>(product >> 32);
++                expected[resultOffset + i * 96 + 23 * 4 + 1] = static_cast<uint32_t>(product);
++                expected[signedOffset + i * 4]     = static_cast<uint32_t>(signedProduct >> 32);
++                expected[signedOffset + i * 4 + 1] = static_cast<uint32_t>(signedProduct);
++            }
++            if (lane < 2)
++            {
++                expected[resultOffset + i * 96 + 23 * 4 + 2 + lane] = static_cast<uint32_t>(sum);
++                expected[signedOffset + i * 4 + 2 + lane] = static_cast<uint32_t>(sum >> 32);
++            }
++        }
++    }
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ class ComputeByteIndirectTestMetal : public ComputeDispatchTestMetal
+ {};
+ 

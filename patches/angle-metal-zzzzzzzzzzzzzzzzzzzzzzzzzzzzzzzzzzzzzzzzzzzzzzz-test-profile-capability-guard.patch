@@ -1,0 +1,27 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index eb3e6d7..f5bf6ae 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -428,8 +428,9 @@ bool IsMetalDisplayAvailable()
+ #if defined(ANGLE_METAL_COMPUTE_TESTS)
+     // Preserve the isolated test profile independently of production selection.
+     return true;
+-#elif defined(ANGLE_METAL_GLES31) && (TARGET_OS_OSX || TARGET_OS_SIMULATOR) && \
+-    !TARGET_OS_MACCATALYST
++#else
++#    if defined(ANGLE_METAL_GLES31) && (TARGET_OS_OSX || TARGET_OS_SIMULATOR) && \
++        !TARGET_OS_MACCATALYST
+     // Language-only memory fences require Metal 3.2. Restrict the opt-in profile
+     // to Apple GPUs with the resource features used by the compute/image paths.
+     if (@available(macOS 15.0, iOS 18.0, *))
+@@ -441,8 +442,9 @@ bool IsMetalDisplayAvailable()
+                mMetalDevice.get().maxThreadgroupMemoryLength >= 16384 &&
+                mMetalDevice.get().maxBufferLength >= (1u << 27);
+     }
+-#endif
++#    endif
+     return false;
++#endif
+ }
+ 
+ gl::Version DisplayMtl::getMaxSupportedESVersion() const

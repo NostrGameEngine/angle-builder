@@ -1,0 +1,20 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 19c9bd8..3432da6 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -933,8 +933,13 @@ bool IsMetalDisplayAvailable()
+     mNativeCaps.maxCombinedShaderUniformComponents[gl::ShaderType::Compute] =
+         maxDefaultUniformComponents + mtl::kMaxUBOSize * 12 / 4;
+     mNativeCaps.maxComputeWorkGroupCount       = {65535, 65535, 65535};
+-    mNativeCaps.maxComputeWorkGroupSize        = {128, 128, 64};
+-    mNativeCaps.maxComputeWorkGroupInvocations = 128;
++    // Use the device dimensions instead of restricting all kernels to the GLES minimum.
++    // Link-time pipeline validation still checks the native kernel's own thread limit.
++    const MTLSize nativeThreadgroupSize        = mMetalDevice.get().maxThreadsPerThreadgroup;
++    mNativeCaps.maxComputeWorkGroupSize        = {static_cast<GLint>(nativeThreadgroupSize.width),
++                                                  static_cast<GLint>(nativeThreadgroupSize.height),
++                                                  static_cast<GLint>(nativeThreadgroupSize.depth)};
++    mNativeCaps.maxComputeWorkGroupInvocations = static_cast<GLint>(nativeThreadgroupSize.width);
+     mNativeCaps.maxComputeSharedMemorySize =
+         static_cast<GLint>(mMetalDevice.get().maxThreadgroupMemoryLength);
+     mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Compute] = maxDefaultUniformComponents;

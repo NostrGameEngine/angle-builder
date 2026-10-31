@@ -1,0 +1,106 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index d34707c..cb4fff7 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -474,7 +474,8 @@ static const char *GetOperatorString(TOperator op,
+         case TOperator::EOpDegrees:
+             return "ANGLE_degrees";
+         case TOperator::EOpAtan:
+-            return argType1 == nullptr ? "metal::atan" : "metal::atan2";
++            // Fast atan2 may choose the wrong quadrant for a zero x input.
++            return argType1 == nullptr ? "metal::atan" : "metal::precise::atan2";
+         case TOperator::EOpMod:
+             return "ANGLE_mod";  // differs from metal::mod
+         case TOperator::EOpRefract:
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index 9e0ab55..11785db 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -1210,6 +1210,18 @@ TEST_F(MSLOutputTest, StructAndVarDeclarationSeparationNoCrash3)
+     compile(kShader);
+ }
+ 
++// Explicit precise math preserves the quadrant for zero x inputs.
++TEST_F(MSLOutputTest, PreciseTwoArgumentAtan)
++{
++    compile(R"(#version 310 es
++        precision lowp float;
++        uniform vec2 inputValue;
++        out vec4 color;
++        void main() { color = vec4(atan(inputValue.x, inputValue.y)); }
++    )");
++    EXPECT_TRUE(foundInCode("metal::precise::atan2"));
++}
++
+ // The GLSL builtin is a per-invocation Metal query, also inside user functions.
+ TEST_F(MSLOutputTest, FragmentHelperInvocation)
+ {
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index c796f8d..734f6bf 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -220,6 +220,64 @@ TEST_P(ComputeDispatchTestMetal, TextureGatherCoreSamplersAndBinary)
+     }
+ }
+ 
++// Keep the quadrant of atan(y,x) when x is either sign of zero. Inputs
++// come from storage so constant folding cannot hide fast-math edge cases.
++TEST_P(ComputeDispatchTestMetal, AtanZeroAbscissaAndBinary)
++{
++    constexpr char source[] = R"(#version 310 es
++        precision lowp float;
++        precision highp int;
++        layout(local_size_x=1) in;
++        layout(std430,binding=3) readonly buffer Input { vec2 values[]; } inputData;
++        layout(std430,binding=0) buffer Output {
++            uvec4 prefix[4]; float values[6]; uvec4 suffix[4];
++        } outputData;
++        void main() {
++            uint i=gl_GlobalInvocationID.x;
++            outputData.values[i]=atan(inputData.values[i].x,inputData.values[i].y);
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLProgram binary;
++    reloadProgram(program, binary);
++    const std::array<float, 12> inputs  = {1, 0.0f, 1, -0.0f, -1, 0.0f, -1, -0.0f, 2, 2, 2, -2};
++    constexpr float pi                  = 3.14159265358979323846f;
++    const std::array<float, 6> expected = {pi / 2, pi / 2, -pi / 2, -pi / 2, pi / 4, 3 * pi / 4};
++    GLBuffer input, output;
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, input);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(inputs), inputs.data(), GL_STATIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, input);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, output);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, output);
++    std::array<uint32_t, 40> initial;
++    initial.fill(0xcdcdcdcdu);
++    for (GLuint active : {program.get(), binary.get()})
++    {
++        glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(initial), initial.data(), GL_DYNAMIC_DRAW);
++        glUseProgram(active);
++        glDispatchCompute(6, 1, 1);
++        glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++        ASSERT_GL_NO_ERROR();
++        const auto *actual = static_cast<const uint32_t *>(
++            glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(initial), GL_MAP_READ_BIT));
++        ASSERT_NE(actual, nullptr);
++        for (size_t i = 0; i < initial.size(); ++i)
++        {
++            if (i >= 16 && i < 22)
++            {
++                float angle;
++                memcpy(&angle, actual + i, sizeof(angle));
++                EXPECT_NEAR(angle, expected[i - 16], 0.001f) << i;
++            }
++            else
++            {
++                EXPECT_EQ(actual[i], initial[i]) << i;
++            }
++        }
++        EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    }
++}
++
+ // A GPU producer supplies std140 graphics uniforms whose native Metal layout
+ // requires matrix transposition, array repacking and boolean normalization.
+ TEST_P(ComputeDispatchTestMetal, GPUWrittenGraphicsUniformConversionAndBinary)

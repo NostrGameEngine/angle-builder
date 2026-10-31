@@ -177,18 +177,21 @@ jobs:
           persist-credentials: false
 
       - name: Checkout pinned ANGLE sources without build dependencies
-        uses: actions/checkout@v4
-        with:
-          repository: google/angle
-          ref: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
-          path: build/angle
-          persist-credentials: false
+        env:
+          ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+        run: |
+          set -euo pipefail
+          git init -q build/angle
+          git -C build/angle fetch --depth=1 https://chromium.googlesource.com/angle/angle.git "$ANGLE_COMMIT"
+          git -C build/angle checkout --detach FETCH_HEAD
 
       - name: Check patches and enumeration logic
         shell: bash
         run: |
           set -euo pipefail
           python3 tests/test-angle-checkout.py
+          python3 tests/test-build-manifest.py
+          python3 tests/test-patch-series.py
           python3 tests/test-patch-checkout.py
           for patch in patches/*.patch; do
             git -C build/angle apply --check "$GITHUB_WORKSPACE/$patch"
@@ -227,12 +230,13 @@ jobs:
           persist-credentials: false
 
       - name: Checkout pinned public EGL and GLES headers
-        uses: actions/checkout@v4
-        with:
-          repository: google/angle
-          ref: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
-          path: build/angle
-          persist-credentials: false
+        env:
+          ANGLE_COMMIT: ${{ needs.resolve.outputs.ANGLE_COMMIT }}
+        run: |
+          set -euo pipefail
+          git init -q build/angle
+          git -C build/angle fetch --depth=1 https://chromium.googlesource.com/angle/angle.git "$ANGLE_COMMIT"
+          git -C build/angle checkout --detach FETCH_HEAD
 
       - name: Download the Linux libraries built by this run
         uses: actions/download-artifact@v4

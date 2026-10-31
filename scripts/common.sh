@@ -128,22 +128,8 @@ ensure_angle_checkout() {
 }
 
 apply_patches() {
-  local patch
-  if [[ ! -d "$ROOT_DIR/patches" ]]; then
-    return
-  fi
-  shopt -s nullglob
-  for patch in "$ROOT_DIR"/patches/*.patch; do
-    if git -C "$ANGLE_DIR" apply --reverse --check "$patch" >/dev/null 2>&1; then
-      log "Patch already applied: $(basename "$patch")"
-    elif git -C "$ANGLE_DIR" apply --check "$patch" >/dev/null 2>&1; then
-      log "Applying patch: $(basename "$patch")"
-      git -C "$ANGLE_DIR" apply "$patch"
-    else
-      fail "Patch does not apply cleanly: $patch"
-    fi
-  done
-  shopt -u nullglob
+  [[ -d "$ROOT_DIR/patches" ]] || return 0
+  python3 "$ROOT_DIR/scripts/write-build-manifest.py" --angle-dir "$ANGLE_DIR" --apply-patches
 }
 
 build_info_file() {

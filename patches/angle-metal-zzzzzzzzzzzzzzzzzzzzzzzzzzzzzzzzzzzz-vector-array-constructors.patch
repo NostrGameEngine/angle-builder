@@ -1,0 +1,42 @@
+diff --git a/src/compiler/translator/tree_ops/msl/AddExplicitTypeCasts.cpp b/src/compiler/translator/tree_ops/msl/AddExplicitTypeCasts.cpp
+index 62782ae..45c5e02 100644
+--- a/src/compiler/translator/tree_ops/msl/AddExplicitTypeCasts.cpp
++++ b/src/compiler/translator/tree_ops/msl/AddExplicitTypeCasts.cpp
+@@ -27,7 +27,10 @@ class Rewriter : public TIntermRebuild
+         const size_t argCount = callNode.getChildCount();
+         const TType &retType  = callNode.getType();
+ 
+-        if (callNode.isConstructor())
++        // Array constructors already have element-typed arguments. The vector
++        // dimension also describes arrays of vectors, whose arguments must not
++        // be coerced as scalar/vector operands.
++        if (callNode.isConstructor() && !retType.isArray())
+         {
+             if (IsScalarBasicType(retType))
+             {
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index d068d2c..cac40cd 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -589,6 +589,21 @@ TEST_F(MSLOutputTest, KeywordConflict)
+     compile(shaderString);
+ }
+ 
++// Arrays of vectors retain vector dimensions in the AST. Their constructor
++// arguments are elements/arrays, never scalar operands for an explicit cast.
++TEST_F(MSLVertexOutputTest, NestedVectorArrayConstructors)
++{
++    compile(R"(#version 310 es
++        uniform bool enabled;
++        void main() {
++            bvec3 row[1] = bvec3[1](bvec3(enabled,true,false));
++            bvec3 values[3][1] = bvec3[3][1](row,row,row);
++            gl_Position = vec4(values[2][0].x ? 1.0 : 0.0);
++        }
++    )");
++    EXPECT_TRUE(foundInCode("array<"));
++}
++
+ TEST_F(MSLVertexOutputTest, Vertex)
+ {
+     const std::string &shaderString =

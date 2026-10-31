@@ -1,0 +1,93 @@
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.mm b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+index 72eaf3d..c8b7594 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.mm
+@@ -622,18 +622,19 @@ void ToObjC(const RenderPassStencilAttachmentDesc &desc,
+     ToObjC(depthAttachment, objCDesc.depthAttachment);
+     ToObjC(stencilAttachment, objCDesc.stencilAttachment);
+ 
++    // This Objective-C descriptor is reused across render passes. Replace the
++    // sample count for attached passes too, otherwise an attachmentless pass's
++    // override can survive and disagree with the next MSAA pipeline.
++    objCDesc.defaultRasterSampleCount = rasterSampleCount;
+     if ((defaultWidth | defaultHeight) != 0)
+     {
+-        objCDesc.renderTargetWidth        = defaultWidth;
+-        objCDesc.renderTargetHeight       = defaultHeight;
+-        objCDesc.defaultRasterSampleCount = rasterSampleCount;
++        objCDesc.renderTargetWidth  = defaultWidth;
++        objCDesc.renderTargetHeight = defaultHeight;
+     }
+     else
+     {
+         objCDesc.renderTargetWidth  = 0;
+         objCDesc.renderTargetHeight = 0;
+-        // No need to reset defaultRasterSampleCount as it is only applied when no attachments are
+-        // provided.
+     }
+ }
+ 
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 3d6ac3d..289964b 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -377,6 +377,59 @@ TEST_P(ComputeDispatchTestMetal, MultiDrawCommandRanges)
+     }
+ }
+ 
++// The cached native render-pass descriptor survives encoder restarts. Changing
++// from attachmentless rendering to an MSAA attachment must replace its samples.
++TEST_P(ComputeDispatchTestMetal, AttachmentlessToMultisampleRenderPass)
++{
++    constexpr char vertex[]   = R"(#version 310 es
++        void main() {
++            vec2 p=gl_VertexID==0 ? vec2(-1,-1) : gl_VertexID==1 ? vec2(3,-1) : vec2(-1,3);
++            gl_Position=vec4(p,0,1);
++        }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        out vec4 color;
++        void main() { color=vec4(0,1,0,1); }
++    )";
++    ANGLE_GL_PROGRAM(program, vertex, fragment);
++    glUseProgram(program);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
++    GLFramebuffer target, resolve;
++    GLRenderbuffer multisample, single;
++    glBindRenderbuffer(GL_RENDERBUFFER, multisample);
++    glRenderbufferStorageMultisample(GL_RENDERBUFFER, 4, GL_RGBA8, 16, 16);
++    glBindRenderbuffer(GL_RENDERBUFFER, single);
++    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 16, 16);
++    glBindFramebuffer(GL_FRAMEBUFFER, resolve);
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, single);
++    ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++    glViewport(0, 0, 16, 16);
++    for (GLint samples : {1, 4, 1, 2, 4, 1})
++    {
++        SCOPED_TRACE(samples);
++        glBindFramebuffer(GL_FRAMEBUFFER, target);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, 0);
++        glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, 16);
++        glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, 16);
++        glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_SAMPLES, samples);
++        ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER,
++                                  multisample);
++        ASSERT_GLENUM_EQ(glCheckFramebufferStatus(GL_FRAMEBUFFER), GL_FRAMEBUFFER_COMPLETE);
++        glClearColor(1, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, resolve);
++        glBlitFramebuffer(0, 0, 16, 16, 0, 0, 16, 16, GL_COLOR_BUFFER_BIT, GL_NEAREST);
++        glBindFramebuffer(GL_FRAMEBUFFER, resolve);
++        ASSERT_GL_NO_ERROR();
++        EXPECT_PIXEL_RECT_EQ(0, 0, 16, 16, GLColor::green);
++    }
++}
++
+ // A GPU producer supplies std140 graphics uniforms whose native Metal layout
+ // requires matrix transposition, array repacking and boolean normalization.
+ TEST_P(ComputeDispatchTestMetal, GPUWrittenGraphicsUniformConversionAndBinary)

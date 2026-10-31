@@ -1,0 +1,1076 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 062b758..f88c048 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -1403,6 +1403,15 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+             break;
+     }
+ 
++    if ((mPipelineStructs.vertexOut.external == &parent ||
++         mPipelineStructs.fragmentIn.external == &parent) &&
++        type.getLayoutQualifier().locationsSpecified)
++    {
++        // A separable interface matches explicit locations even when the two
++        // programs use different GLSL variable names.
++        mOut << " [[user(ANGLE_loc_" << type.getLayoutQualifier().location << ")]]";
++    }
++
+     if (IsImage(type.getBasicType()) &&
+         (mCompiler.getShaderType() != GL_COMPUTE_SHADER || mEmittingNativeImages))
+     {
+diff --git a/src/compiler/translator/msl/ModifyStruct.cpp b/src/compiler/translator/msl/ModifyStruct.cpp
+index aee1570..5a424d5 100644
+--- a/src/compiler/translator/msl/ModifyStruct.cpp
++++ b/src/compiler/translator/msl/ModifyStruct.cpp
+@@ -341,6 +341,7 @@ class ConvertStructState : angle::NonCopyable
+         newType.setLayoutQualifier(layoutQualifier);
+         sh::ImmutableString newName  = field.name();
+         sh::SymbolType newSymbolType = field.symbolType();
++        TType *modifiedType          = &newType;
+         if (pathItems.size() > 1)
+         {
+             // Current state is linearizing a root input field into multiple modified fields. The
+@@ -352,9 +353,20 @@ class ConvertStructState : angle::NonCopyable
+             // index is sufficient to define all the entries in MSL interface in all the compatible
+             // VS and FS MSL programs.
+             newName = BuildConcatenatedImmutableString(rootFieldName(), '_', mSubfieldIndex);
++            const auto &rootLayout = pathItems.front().field->type()->getLayoutQualifier();
++            if (rootLayout.locationsSpecified)
++            {
++                // Linearized array elements and matrix columns each consume a
++                // location. Clone the type: matrix splitting can reuse newType.
++                modifiedType                = new TType(newType);
++                auto location               = modifiedType->getLayoutQualifier();
++                location.locationsSpecified = 1;
++                location.location           = rootLayout.location + mSubfieldIndex;
++                modifiedType->setLayoutQualifier(location);
++            }
+             ++mSubfieldIndex;
+         }
+-        TField *modifiedField = new TField(&newType, newName, field.line(), newSymbolType);
++        TField *modifiedField = new TField(modifiedType, newName, field.line(), newSymbolType);
+         if (addressSpace)
+         {
+             symbolEnv.markAsPointer(*modifiedField, *addressSpace);
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 61a5ed9..24dc838 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -187,8 +187,8 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     return attribs.getAsInt(EGL_CONTEXT_METAL_OWNERSHIP_IDENTITY_ANGLE, 0);
+ }
+ 
+-// Compute pipelines use the component program's executable so uniforms,
+-// resource binding changes and executable lifetime keep their original owner.
++// The frontend retains installed component executables. Compute dispatch and
++// graphics stage setup consume each component's original resource state.
+ class ProgramPipelineMtl final : public ProgramPipelineImpl
+ {
+   public:
+@@ -199,14 +199,15 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+                        const gl::ProgramMergedVaryings &,
+                        const gl::ProgramVaryingPacking &) override
+     {
+-        bool computeOnly = bool(mState.getShaderProgramExecutable(gl::ShaderType::Compute));
++        // Interface matching and retained component ownership are handled by
++        // ProgramPipeline. Native stage functions are selected at draw setup.
+         for (gl::ShaderType type : mState.getExecutable().getLinkedShaderStages())
+         {
+-            computeOnly = computeOnly && type == gl::ShaderType::Compute;
++            ANGLE_CHECK(mtl::GetImpl(context),
++                        type == gl::ShaderType::Vertex || type == gl::ShaderType::Fragment ||
++                            type == gl::ShaderType::Compute,
++                        "Unsupported Metal program-pipeline stage", GL_INVALID_OPERATION);
+         }
+-        ANGLE_CHECK(mtl::GetImpl(context), computeOnly,
+-                    "Metal separable pipelines currently require a compute stage only",
+-                    GL_INVALID_OPERATION);
+         return angle::Result::Continue;
+     }
+ };
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+index 82625c0..31c4d08 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+@@ -128,7 +128,8 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+     void save(gl::BinaryOutputStream *stream);
+ 
+     // May end the previous render pass. Call before acquiring the draw encoder.
+-    angle::Result prepareUniformBuffers(ContextMtl *context);
++    angle::Result prepareUniformBuffers(ContextMtl *context,
++                                        gl::ShaderType selectedStage = gl::ShaderType::InvalidEnum);
+ 
+     void installLinkedShaders(gl::ShaderMap<mtl::TranslatedShaderInfo> shaders);
+     const mtl::TranslatedShaderInfo &getComputeShaderInfo() const
+@@ -192,7 +193,7 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+     void getUniformiv(const gl::Context *context, GLint location, GLint *params) const override;
+     void getUniformuiv(const gl::Context *context, GLint location, GLuint *params) const override;
+ 
+-    bool hasFlatAttribute() const { return mProgramHasFlatAttributes; }
++    bool hasFlatAttribute() const;
+ 
+     angle::Result setupDispatch(const gl::Context *context,
+                                 mtl::ComputeCommandEncoder **encoderOut);
+@@ -210,6 +211,13 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+     friend class ProgramMtl;
+ 
+     void reset(ContextMtl *context);
++    ProgramExecutableMtl *getGraphicsStageOwner(gl::ShaderType stage) const;
++    angle::Result setupPipelineDraw(const gl::Context *context,
++                                    mtl::RenderCommandEncoder *encoder,
++                                    const mtl::RenderPipelineDesc &pipelineDesc,
++                                    bool pipelineDescChanged,
++                                    bool forceTexturesSetting,
++                                    bool uniformBuffersDirty);
+ 
+     template <int cols, int rows>
+     void setUniformMatrixfv(GLint location,
+@@ -251,14 +259,18 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+                                        const mtl::RenderPipelineDesc &renderPipelineDesc,
+                                        id<MTLFunction> *shaderOut);
+ 
+-    angle::Result commitUniforms(ContextMtl *context, mtl::RenderCommandEncoder *cmdEncoder);
++    angle::Result commitUniforms(ContextMtl *context,
++                                 mtl::RenderCommandEncoder *cmdEncoder,
++                                 gl::ShaderType selectedStage = gl::ShaderType::InvalidEnum);
+     angle::Result updateTextures(const gl::Context *glContext,
+                                  mtl::RenderCommandEncoder *cmdEncoder,
+-                                 bool forceUpdate);
++                                 bool forceUpdate,
++                                 gl::ShaderType selectedStage = gl::ShaderType::InvalidEnum);
+ 
+     angle::Result updateUniformBuffers(ContextMtl *context,
+                                        mtl::RenderCommandEncoder *cmdEncoder,
+-                                       const mtl::RenderPipelineDesc &pipelineDesc);
++                                       const mtl::RenderPipelineDesc &pipelineDesc,
++                                       gl::ShaderType selectedStage = gl::ShaderType::InvalidEnum);
+     angle::Result updateXfbBuffers(ContextMtl *context,
+                                    mtl::RenderCommandEncoder *cmdEncoder,
+                                    const mtl::RenderPipelineDesc &pipelineDesc);
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index d2f494d..a353c86 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -1210,6 +1210,99 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     return angle::Result::Continue;
+ }
+ 
++ProgramExecutableMtl *ProgramExecutableMtl::getGraphicsStageOwner(gl::ShaderType stage) const
++{
++    if (!mExecutable->IsPPO())
++    {
++        return const_cast<ProgramExecutableMtl *>(this);
++    }
++    const auto &component = mExecutable->getPPOProgramExecutables()[stage];
++    return component ? mtl::GetImpl(component.get()) : nullptr;
++}
++
++bool ProgramExecutableMtl::hasFlatAttribute() const
++{
++    const auto *vertex = getGraphicsStageOwner(gl::ShaderType::Vertex);
++    return vertex && vertex->mProgramHasFlatAttributes;
++}
++
++angle::Result ProgramExecutableMtl::setupPipelineDraw(const gl::Context *glContext,
++                                                      mtl::RenderCommandEncoder *encoder,
++                                                      const mtl::RenderPipelineDesc &pipelineDesc,
++                                                      bool pipelineDescChanged,
++                                                      bool forceTexturesSetting,
++                                                      bool uniformBuffersDirty)
++{
++    auto *context  = mtl::GetImpl(glContext);
++    auto *vertex   = getGraphicsStageOwner(gl::ShaderType::Vertex);
++    auto *fragment = getGraphicsStageOwner(gl::ShaderType::Fragment);
++    if (pipelineDescChanged)
++    {
++        id<MTLFunction> vertexFunction = nil, fragmentFunction = nil;
++        if (vertex)
++        {
++            ANGLE_TRY(vertex->getSpecializedShader(context, gl::ShaderType::Vertex, pipelineDesc,
++                                                   &vertexFunction));
++            vertex->mCurrentShaderVariants[gl::ShaderType::Vertex] =
++                &vertex->mVertexShaderVariants[pipelineDesc.getRasterizationType()];
++            vertex->mDefaultUniformBlocksDirty.set(gl::ShaderType::Vertex);
++            vertex->mSamplerBindingsDirty.set(gl::ShaderType::Vertex);
++        }
++        if (fragment)
++        {
++            ANGLE_TRY(fragment->getSpecializedShader(context, gl::ShaderType::Fragment,
++                                                     pipelineDesc, &fragmentFunction));
++            const bool multisampled = pipelineDesc.outputDescriptor.getRasterSampleCount() > 1;
++            const bool depthWrite = pipelineDesc.outputDescriptor.getDepthAttachmentPixelFormat() !=
++                                    MTLPixelFormatInvalid;
++            fragment->mCurrentShaderVariants[gl::ShaderType::Fragment] =
++                pipelineDesc.rasterizationEnabled()
++                    ? &fragment
++                           ->mFragmentShaderVariants[PipelineParametersToFragmentShaderVariantIndex(
++                               multisampled, depthWrite)]
++                    : nullptr;
++            fragment->mDefaultUniformBlocksDirty.set(gl::ShaderType::Fragment);
++            fragment->mSamplerBindingsDirty.set(gl::ShaderType::Fragment);
++        }
++        angle::ObjCPtr<id<MTLRenderPipelineState>> pipeline;
++        ANGLE_TRY(context->getPipelineCache().getRenderPipeline(
++            context, vertexFunction, fragmentFunction, pipelineDesc, &pipeline));
++        encoder->setRenderPipelineState(pipeline);
++    }
++    for (gl::ShaderType stage : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
++    {
++        if (auto *owner = getGraphicsStageOwner(stage))
++        {
++            ANGLE_TRY(owner->commitUniforms(context, encoder, stage));
++            ANGLE_TRY(owner->updateTextures(glContext, encoder, forceTexturesSetting, stage));
++        }
++    }
++    if (uniformBuffersDirty || pipelineDescChanged)
++    {
++        if (vertex && vertex == fragment)
++        {
++            // The first call consumes/clears the prepared range vector. A program
++            // installed in both stages must therefore bind both in one call.
++            ANGLE_TRY(vertex->updateUniformBuffers(context, encoder, pipelineDesc));
++        }
++        else
++        {
++            for (gl::ShaderType stage : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
++            {
++                if (auto *owner = getGraphicsStageOwner(stage))
++                {
++                    ANGLE_TRY(owner->updateUniformBuffers(context, encoder, pipelineDesc, stage));
++                }
++            }
++        }
++    }
++    if (pipelineDescChanged && vertex)
++    {
++        ANGLE_TRY(vertex->updateXfbBuffers(context, encoder, pipelineDesc));
++    }
++    return angle::Result::Continue;
++}
++
+ angle::Result ProgramExecutableMtl::setupDraw(const gl::Context *glContext,
+                                               mtl::RenderCommandEncoder *cmdEncoder,
+                                               const mtl::RenderPipelineDesc &pipelineDesc,
+@@ -1217,6 +1310,11 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                                               bool forceTexturesSetting,
+                                               bool uniformBuffersDirty)
+ {
++    if (mExecutable->IsPPO())
++    {
++        return setupPipelineDraw(glContext, cmdEncoder, pipelineDesc, pipelineDescChanged,
++                                 forceTexturesSetting, uniformBuffersDirty);
++    }
+     ContextMtl *context = mtl::GetImpl(glContext);
+ 
+     if (pipelineDescChanged)
+@@ -1395,10 +1493,15 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ }
+ 
+ angle::Result ProgramExecutableMtl::commitUniforms(ContextMtl *context,
+-                                                   mtl::RenderCommandEncoder *cmdEncoder)
++                                                   mtl::RenderCommandEncoder *cmdEncoder,
++                                                   gl::ShaderType selectedStage)
+ {
+     for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
++        if (selectedStage != gl::ShaderType::InvalidEnum && selectedStage != shaderType)
++        {
++            continue;
++        }
+         if (!mDefaultUniformBlocksDirty[shaderType] || !mCurrentShaderVariants[shaderType])
+         {
+             continue;
+@@ -1442,7 +1545,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ 
+ angle::Result ProgramExecutableMtl::updateTextures(const gl::Context *glContext,
+                                                    mtl::RenderCommandEncoder *cmdEncoder,
+-                                                   bool forceUpdate)
++                                                   bool forceUpdate,
++                                                   gl::ShaderType selectedStage)
+ {
+     ContextMtl *contextMtl                          = mtl::GetImpl(glContext);
+     const auto &glState                             = glContext->getState();
+@@ -1450,6 +1554,10 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ 
+     for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
++        if (selectedStage != gl::ShaderType::InvalidEnum && selectedStage != shaderType)
++        {
++            continue;
++        }
+         if ((!mSamplerBindingsDirty[shaderType] && !forceUpdate) ||
+             !mCurrentShaderVariants[shaderType])
+         {
+@@ -1530,7 +1638,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ angle::Result ProgramExecutableMtl::updateUniformBuffers(
+     ContextMtl *context,
+     mtl::RenderCommandEncoder *cmdEncoder,
+-    const mtl::RenderPipelineDesc &pipelineDesc)
++    const mtl::RenderPipelineDesc &pipelineDesc,
++    gl::ShaderType selectedStage)
+ {
+     const std::vector<gl::InterfaceBlock> &blocks = mExecutable->getUniformBlocks();
+     if (blocks.empty())
+@@ -1548,6 +1657,10 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ 
+     for (gl::ShaderType shaderType : mExecutable->getLinkedShaderStages())
+     {
++        if (selectedStage != gl::ShaderType::InvalidEnum && selectedStage != shaderType)
++        {
++            continue;
++        }
+         if (!mCurrentShaderVariants[shaderType])
+         {
+             continue;
+@@ -1591,8 +1704,26 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     return angle::Result::Continue;
+ }
+ 
+-angle::Result ProgramExecutableMtl::prepareUniformBuffers(ContextMtl *context)
++angle::Result ProgramExecutableMtl::prepareUniformBuffers(ContextMtl *context,
++                                                          gl::ShaderType selectedStage)
+ {
++    if (mExecutable->IsPPO())
++    {
++        auto *vertex   = getGraphicsStageOwner(gl::ShaderType::Vertex);
++        auto *fragment = getGraphicsStageOwner(gl::ShaderType::Fragment);
++        if (vertex && vertex == fragment)
++        {
++            return vertex->prepareUniformBuffers(context);
++        }
++        for (gl::ShaderType stage : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
++        {
++            if (auto *owner = getGraphicsStageOwner(stage))
++            {
++                ANGLE_TRY(owner->prepareUniformBuffers(context, stage));
++            }
++        }
++        return angle::Result::Continue;
++    }
+     const gl::State &glState                      = context->getState();
+     const std::vector<gl::InterfaceBlock> &blocks = mExecutable->getUniformBlocks();
+ 
+@@ -1602,6 +1733,10 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     for (uint32_t bufferIndex = 0; bufferIndex < blocks.size(); ++bufferIndex)
+     {
+         const gl::InterfaceBlock &block = blocks[bufferIndex];
++        if (selectedStage != gl::ShaderType::InvalidEnum && !block.isActive(selectedStage))
++        {
++            continue;
++        }
+         const GLuint binding            = mExecutable->getUniformBlockBinding(bufferIndex);
+         const gl::OffsetBindingPointer<gl::Buffer> &bufferBinding =
+             glState.getIndexedUniformBuffer(binding);
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 99092f6..e3ea690 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -35,7 +35,7 @@
+ namespace
+ {
+ constexpr uint32_t kMetalProgramBinaryVersion =
+-    0x4d435038;  // MCP8: native/local image records include aliased 3D slices
++    0x4d435039;  // MCP9: explicit native varying semantics for separable stages
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/tests/BUILD.gn b/src/tests/BUILD.gn
+index 0296276..b739aa6 100644
+--- a/src/tests/BUILD.gn
++++ b/src/tests/BUILD.gn
+@@ -584,6 +584,7 @@ if (is_win || is_linux || is_chromeos || is_android || is_fuchsia || is_apple) {
+           "gl_tests/ComputeDispatchTestMetal.cpp",
+           "gl_tests/ComputeShaderTest.cpp",
+           "gl_tests/ShaderStorageBufferTest.cpp",
++          "gl_tests/ProgramPipelineTest.cpp",
+         ]
+       }
+     }
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index a71e1e0..8cedcdd 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+ #include <iostream>
+@@ -3321,6 +3322,213 @@ TEST_P(ComputeByteIndirectTestMetal, GPUGeneratedIndicesAndTightMultiDraw)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++class GraphicsPipelineTestMetal : public ComputeDispatchTestMetal
++{};
++
++// Keep mutable uniforms, bindings and conversion ranges with the installed
++// stage owner, including one program shared by both stages and queued deletion.
++TEST_P(GraphicsPipelineTestMetal, GPUUniformConversionsStageOwnershipAndBinary)
++{
++    constexpr char vertex[]   = R"(#version 310 es
++        precision highp float;
++        layout(std140) uniform Params {
++            layout(row_major) mat2x3 basis; bvec3 enabled; vec4 color;
++        } data;
++        uniform float factor;
++        layout(location=0) out vec4 carrier;
++        layout(location=3) out mat2x3 matrices[2];
++        void main() {
++            vec2 p=gl_VertexID==0 ? vec2(-1,-1) : gl_VertexID==1 ? vec2(3,-1) : vec2(-1,3);
++            bool valid=all(equal(data.enabled,bvec3(true,false,true))) &&
++                all(equal(data.basis[0],vec3(1,2,3))) && all(equal(data.basis[1],vec3(4,5,6)));
++            gl_Position=vec4(valid ? p : vec2(4),0,1);
++            carrier=data.color*factor;
++            matrices[0]=data.basis; matrices[1]=data.basis*2.;
++        }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        layout(std140) uniform Params {
++            layout(row_major) mat2x3 basis; bvec3 enabled; vec4 color;
++        } data;
++        uniform float factor;
++        layout(location=0) in vec4 payload;
++        layout(location=3) in mat2x3 received[2];
++        out vec4 color;
++        void main() {
++            bool valid=all(equal(data.enabled,bvec3(true,false,true)));
++            for(int m=0;m<2;++m) for(int c=0;c<2;++c)
++                valid=valid && all(equal(received[m][c],data.basis[c]*float(m+1)));
++            color=valid ? vec4(payload.rgb*data.color.rgb*factor,1) : vec4(1,0,0,1);
++        }
++    )";
++    constexpr char producer[] = R"(#version 310 es
++        precision highp float;
++        layout(local_size_x=1) in;
++        layout(std430,binding=0) buffer Allocation { uint words[]; } data;
++        uniform vec4 colors[3];
++        void put(uint index,float value) { data.words[index]=floatBitsToUint(value); }
++        void block(uint base,vec4 color) {
++            put(base,1.); put(base+1u,4.); put(base+4u,2.); put(base+5u,5.);
++            put(base+8u,3.); put(base+9u,6.);
++            data.words[base+12u]=0x80000000u; data.words[base+13u]=0u;
++            data.words[base+14u]=0x01000000u;
++            for(uint lane=0u;lane<4u;++lane) put(base+16u+lane,color[lane]);
++        }
++        void main() { block(64u,colors[0]); block(192u,colors[1]); block(320u,colors[2]); }
++    )";
++    auto link                 = [&](GLProgram &program, const char *vs, const char *fs) {
++        glProgramParameteri(program, GL_PROGRAM_SEPARABLE, GL_TRUE);
++        for (const auto &stage : std::array<std::pair<GLenum, const char *>, 2>{
++                 {{GL_VERTEX_SHADER, vs}, {GL_FRAGMENT_SHADER, fs}}})
++        {
++            if (!stage.second)
++            {
++                continue;
++            }
++            GLShader shader(stage.first);
++            glShaderSource(shader, 1, &stage.second, nullptr);
++            glCompileShader(shader);
++            GLint compiled = GL_FALSE;
++            glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
++            ASSERT_EQ(compiled, GL_TRUE);
++            glAttachShader(program, shader);
++        }
++        glLinkProgram(program);
++        GLint linked = GL_FALSE;
++        glGetProgramiv(program, GL_LINK_STATUS, &linked);
++        ASSERT_EQ(linked, GL_TRUE);
++        ASSERT_GL_NO_ERROR();
++    };
++    GLProgram vs, fs, both, vsBinary, fsBinary, bothBinary;
++    ASSERT_NO_FATAL_FAILURE(link(vs, vertex, nullptr));
++    ASSERT_NO_FATAL_FAILURE(link(fs, nullptr, fragment));
++    ASSERT_NO_FATAL_FAILURE(link(both, vertex, fragment));
++    for (GLProgram *destination : {&vsBinary, &fsBinary, &bothBinary})
++    {
++        glProgramParameteri(*destination, GL_PROGRAM_SEPARABLE, GL_TRUE);
++    }
++    ASSERT_NO_FATAL_FAILURE(reloadProgram(vs, vsBinary));
++    ASSERT_NO_FATAL_FAILURE(reloadProgram(fs, fsBinary));
++    ASSERT_NO_FATAL_FAILURE(reloadProgram(both, bothBinary));
++    ANGLE_GL_COMPUTE_PROGRAM(produce, producer);
++    GLBuffer allocation;
++    std::array<uint32_t, 512> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    GLProgramPipeline pipeline;
++    glBindProgramPipeline(pipeline);
++    std::array<float, 12> colors;
++    for (uint32_t phase = 0; phase < 8; ++phase)
++    {
++        SCOPED_TRACE(phase);
++        colors = {
++            .25f + .0625f * phase, .5f,  .75f, 1.f, .5f, 1.f, .25f + .0625f * phase, 1.f, .25f,
++            .5f + .03125f * phase, .75f, 1.f};
++        glUseProgram(produce);
++        glUniform4fv(glGetUniformLocation(produce, "colors[0]"), 3, colors.data());
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_UNIFORM_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        GLProgram *vertexOwner   = phase >= 3 ? &vsBinary : &vs;
++        GLProgram *fragmentOwner = phase >= 2 ? &fsBinary : &fs;
++        if (phase == 4 || phase == 5)
++        {
++            vertexOwner = fragmentOwner = &both;
++        }
++        if (phase == 6)
++        {
++            vertexOwner = fragmentOwner = &bothBinary;
++        }
++        const bool shared            = vertexOwner == fragmentOwner;
++        const GLuint vertexBinding   = shared ? (phase == 6 ? 13u : 5u) : phase >= 3 ? 11u : 3u;
++        const GLuint fragmentBinding = shared ? vertexBinding : phase >= 2 ? 9u : 7u;
++        // Leave old bindings pointing at a different color to expose stale maps.
++        for (GLuint binding : {3u, 7u, 5u})
++        {
++            glBindBufferRange(GL_UNIFORM_BUFFER, binding, allocation, 1280, 80);
++        }
++        glBindBufferRange(GL_UNIFORM_BUFFER, vertexBinding, allocation, shared ? 1280 : 256, 80);
++        glBindBufferRange(GL_UNIFORM_BUFFER, fragmentBinding, allocation, shared ? 1280 : 768, 80);
++        const float vertexFactor   = phase == 1 || phase == 6 ? .5f : 1.f;
++        const float fragmentFactor = shared ? vertexFactor : 1.f;
++        glUniformBlockBinding(*vertexOwner, glGetUniformBlockIndex(*vertexOwner, "Params"),
++                              vertexBinding);
++        glUniformBlockBinding(*fragmentOwner, glGetUniformBlockIndex(*fragmentOwner, "Params"),
++                              fragmentBinding);
++        glProgramUniform1f(*vertexOwner, glGetUniformLocation(*vertexOwner, "factor"),
++                           vertexFactor);
++        glProgramUniform1f(*fragmentOwner, glGetUniformLocation(*fragmentOwner, "factor"),
++                           fragmentFactor);
++        glUseProgramStages(pipeline, GL_VERTEX_SHADER_BIT, *vertexOwner);
++        glUseProgramStages(pipeline, GL_FRAGMENT_SHADER_BIT, *fragmentOwner);
++        glUseProgram(0);
++        if (phase == 3)
++        {
++            glActiveShaderProgram(pipeline, fs);
++            glUniform1f(glGetUniformLocation(fs, "factor"), 9.f);
++        }
++        if (phase == 5)
++        {
++            glUseProgram(both);
++            glDrawArrays(GL_TRIANGLES, 0, 3);
++            glUseProgram(0);
++        }
++        if (phase == 7)
++        {
++            glActiveShaderProgram(pipeline, 0);
++            vsBinary.reset();
++            fsBinary.reset();
++            vs.reset();
++            fs.reset();
++        }
++        glClearColor(1, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        ASSERT_GL_NO_ERROR();
++        GLColor expectedPixel(0, 0, 0, 255);
++        for (size_t lane = 0; lane < 3; ++lane)
++        {
++            const float a       = colors[(shared ? 8 : 0) + lane] * vertexFactor;
++            const float b       = colors[(shared ? 8 : 4) + lane] * fragmentFactor;
++            expectedPixel[lane] = static_cast<GLubyte>(std::lround(a * b * 255.f));
++        }
++        EXPECT_PIXEL_COLOR_NEAR(8, 8, expectedPixel, 1);
++    }
++    auto word = [](float value) {
++        uint32_t bits;
++        std::memcpy(&bits, &value, 4);
++        return bits;
++    };
++    for (size_t block = 0; block < 3; ++block)
++    {
++        const size_t base = 64 + 128 * block;
++        for (size_t row = 0; row < 3; ++row)
++        {
++            expected[base + 4 * row]     = word(float(row + 1));
++            expected[base + 4 * row + 1] = word(float(row + 4));
++        }
++        expected[base + 12] = 0x80000000u;
++        expected[base + 13] = 0u;
++        expected[base + 14] = 0x01000000u;
++        for (size_t lane = 0; lane < 4; ++lane)
++        {
++            expected[base + 16 + lane] = word(colors[4 * block + lane]);
++        }
++    }
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t index = 0; index < expected.size(); ++index)
++    {
++        EXPECT_EQ(actual[index], expected[index]) << "source/padding/guard word " << index;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ }  // namespace
+ ANGLE_INSTANTIATE_TEST(ComputeDispatchTestMetal,
+                        ES31_METAL().enable(Feature::AlwaysEnableEmulatedMultidrawExtensions));
+@@ -3333,3 +3541,7 @@ ANGLE_INSTANTIATE_TEST(ComputeByteIndirectTestMetal,
+ ANGLE_INSTANTIATE_TEST(ComputeLinkValidationTestMetal,
+                        ES31_METAL(),
+                        ES31_METAL().disable(Feature::EnableParallelMtlLibraryCompilation));
++
++ANGLE_INSTANTIATE_TEST(GraphicsPipelineTestMetal,
++                       ES31_METAL(),
++                       ES31_METAL().disable(Feature::EnableParallelMtlLibraryCompilation));
+diff --git a/src/tests/gl_tests/ProgramPipelineTest.cpp b/src/tests/gl_tests/ProgramPipelineTest.cpp
+index dc507e7..894343b 100644
+--- a/src/tests/gl_tests/ProgramPipelineTest.cpp
++++ b/src/tests/gl_tests/ProgramPipelineTest.cpp
+@@ -35,7 +35,7 @@ class ProgramPipelineTest : public ANGLETest<>
+ // Verify that program pipeline is not supported in version lower than ES31.
+ TEST_P(ProgramPipelineTest, GenerateProgramPipelineObject)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     GLuint pipeline;
+     glGenProgramPipelines(1, &pipeline);
+@@ -194,7 +194,7 @@ void ProgramPipelineXFBTest31::bindProgramPipelineWithXFBVaryings(
+ // Test generate or delete program pipeline.
+ TEST_P(ProgramPipelineTest31, GenOrDeleteProgramPipelineTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     GLuint pipeline;
+     glGenProgramPipelines(-1, &pipeline);
+@@ -211,7 +211,7 @@ TEST_P(ProgramPipelineTest31, GenOrDeleteProgramPipelineTest)
+ // Test BindProgramPipeline.
+ TEST_P(ProgramPipelineTest31, BindProgramPipelineTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     glBindProgramPipeline(0);
+     EXPECT_GL_NO_ERROR();
+@@ -232,7 +232,7 @@ TEST_P(ProgramPipelineTest31, BindProgramPipelineTest)
+ // Test IsProgramPipeline
+ TEST_P(ProgramPipelineTest31, IsProgramPipelineTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     EXPECT_GL_FALSE(glIsProgramPipeline(0));
+     EXPECT_GL_NO_ERROR();
+@@ -341,7 +341,7 @@ GLint ProgramPipelineTest31::getAvailableProgramBinaryFormatCount() const
+ // Test glUseProgramStages
+ TEST_P(ProgramPipelineTest31, UseProgramStages)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -372,7 +372,7 @@ TEST_P(ProgramPipelineTest31, UseProgramStages)
+ // Test glUseProgramStages with different programs
+ TEST_P(ProgramPipelineTest31, UseProgramStagesWithDifferentPrograms)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -451,7 +451,7 @@ void main()
+ // Test glUseProgramStages
+ TEST_P(ProgramPipelineTest31, UseCreateShaderProgramv)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -468,7 +468,7 @@ TEST_P(ProgramPipelineTest31, UseCreateShaderProgramv)
+ // Test pipeline without vertex shader
+ TEST_P(ProgramPipelineTest31, PipelineWithoutVertexShader)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create a separable program object with a fragment shader
+     const GLchar *fragString = essl31_shaders::fs::Red();
+@@ -490,7 +490,7 @@ TEST_P(ProgramPipelineTest31, PipelineWithoutVertexShader)
+ // Test pipeline without any shaders
+ TEST_P(ProgramPipelineTest31, PipelineWithoutShaders)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Generate a program pipeline
+     glGenProgramPipelines(1, &mPipeline);
+@@ -512,7 +512,7 @@ TEST_P(ProgramPipelineTest31, PipelineWithoutShaders)
+ // Test glUniform
+ TEST_P(ProgramPipelineTest31, FragmentStageUniformTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -570,7 +570,7 @@ void main()
+ // Test glUniformBlockBinding and then glBufferData
+ TEST_P(ProgramPipelineTest31, FragmentStageUniformBlockBufferDataTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -620,7 +620,7 @@ void main()
+ // Test glUniformBlockBinding followed by glBindBufferRange
+ TEST_P(ProgramPipelineTest31, FragmentStageUniformBlockBindBufferRangeTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -681,7 +681,7 @@ void main()
+ // Test that glUniformBlockBinding can successfully change the binding for PPOs
+ TEST_P(ProgramPipelineTest31, FragmentStageUniformBlockBinding)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -748,7 +748,7 @@ void main()
+ // Test that dirty bits related to UBOs propagates to the PPO.
+ TEST_P(ProgramPipelineTest31, UniformBufferUpdatesBeforeBindToPPO)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString = essl31_shaders::vs::Simple();
+     const GLchar *fragString = R"(#version 310 es
+@@ -842,7 +842,7 @@ void main()
+ // Test glBindBufferRange between draw calls in the presence of multiple UBOs between VS and FS
+ TEST_P(ProgramPipelineTest31, BindBufferRangeForMultipleUBOsInMultipleStages)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -953,7 +953,7 @@ void main()
+ // Test varyings
+ TEST_P(ProgramPipelineTest31, ProgramPipelineVaryings)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -969,7 +969,9 @@ void main()
+ 
+     bindProgramPipeline(vertString, fragString);
+ 
+-    drawQuadWithPPO(essl31_shaders::PositionAttrib(), 0.5f, 1.0f);
++    // GLSL round(0.5) may choose either direction. Avoid that tie in the
++    // interpolated z component; this case tests pipeline varying transport.
++    drawQuadWithPPO(essl31_shaders::PositionAttrib(), 0.25f, 1.0f);
+     ASSERT_GL_NO_ERROR();
+ 
+     int w = getWindowWidth() - 2;
+@@ -984,7 +986,7 @@ void main()
+ // Creates a program pipeline with a 2D texture and renders with it.
+ TEST_P(ProgramPipelineTest31, DrawWith2DTexture)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString = R"(#version 310 es
+ precision highp float;
+@@ -1032,7 +1034,7 @@ void main()
+ // Test modifying a shader after it has been detached from a pipeline
+ TEST_P(ProgramPipelineTest31, DetachAndModifyShader)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString = essl31_shaders::vs::Simple();
+     const GLchar *fragString = essl31_shaders::fs::Green();
+@@ -1095,8 +1097,8 @@ void main()
+ // Test binding two programs that use a texture as different types
+ TEST_P(ProgramPipelineTest31, DifferentTextureTypes)
+ {
+-    // Only the Vulkan backend supports PPO
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Per the OpenGL ES 3.1 spec:
+     //
+@@ -1174,8 +1176,8 @@ TEST_P(ProgramPipelineTest31, VerifyPpoLinkErrorSignalledCorrectly)
+     // Unbind program
+     // Draw  <<--- expect a link validation error here
+ 
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -1207,8 +1209,8 @@ void main()
+ // Tests creating two program pipelines with a common shader and a varying location mismatch.
+ TEST_P(ProgramPipelineTest31, VaryingLocationMismatch)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create a fragment shader using the varying location "5".
+     const char *kFS = R"(#version 310 es
+@@ -1281,7 +1283,7 @@ void main()
+ // Test that uniform updates are propagated with minimal state changes.
+ TEST_P(ProgramPipelineTest31, UniformUpdate)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -1340,7 +1342,7 @@ void main()
+ // Test that uniform updates propagate to two pipelines.
+ TEST_P(ProgramPipelineTest31, UniformUpdateTwoPipelines)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two separable program objects from a
+     // single source string respectively (vertSrc and fragSrc)
+@@ -1432,7 +1434,7 @@ void main()
+ // Tests that setting sampler bindings on a program before the pipeline works as expected.
+ TEST_P(ProgramPipelineTest31, BindSamplerBeforeCreatingPipeline)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     // Create two textures - red and green.
+     GLTexture redTex;
+@@ -1491,8 +1493,8 @@ TEST_P(ProgramPipelineTest31, BindSamplerBeforeCreatingPipeline)
+ // successfully.
+ TEST_P(ProgramPipelineTest31, VaryingIOBlockSeparableProgram)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+     ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_io_blocks"));
+ 
+     constexpr char kVS[] =
+@@ -1532,8 +1534,8 @@ TEST_P(ProgramPipelineTest31, VaryingIOBlockSeparableProgram)
+ // successfully.
+ TEST_P(ProgramPipelineXFBTest31, VaryingIOBlockSeparableProgramWithXFB)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+     ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_EXT_shader_io_blocks"));
+ 
+     constexpr char kVS[] =
+@@ -1599,8 +1601,8 @@ TEST_P(ProgramPipelineXFBTest31, VaryingIOBlockSeparableProgramWithXFB)
+ // Test that XFB GL_SEPARATE_ATTRIBS behaves correctly with PPO.
+ TEST_P(ProgramPipelineXFBTest31, SeparableProgramWithXFBSeparateMode)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString = R"(#version 310 es
+ precision highp float;
+@@ -1612,6 +1614,7 @@ void main()
+ {
+     gl_Position = inputAttribute;
+     texCoord = u_color;
++    unused1 = vec4(0.0);
+ })";
+ 
+     GLShader vertShader(GL_VERTEX_SHADER);
+@@ -1685,8 +1688,8 @@ void main()
+ // validation error.
+ TEST_P(ProgramPipelineXFBTest31, ChangeShaderStageDuringPauseAndResume)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const char *kVS1 = R"(#version 310 es
+ out float tfVarying10;
+@@ -1819,8 +1822,8 @@ void main() {
+ // works.
+ TEST_P(ProgramPipelineXFBTest31, ChangeShaderStageDuringPauseAndResumeWithBufferChange)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const char *kVS1 = R"(#version 310 es
+ out float tfVarying10;
+@@ -1975,8 +1978,8 @@ void main() {
+ // Test that resuming transform feedback with a different pipeline results in validation error.
+ TEST_P(ProgramPipelineXFBTest31, PipelineSwitchDuringPauseAndResume)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const char *kVS1 = R"(#version 310 es
+ out float tfVarying10;
+@@ -2107,8 +2110,8 @@ void main() {
+ // in validation error.
+ TEST_P(ProgramPipelineXFBTest31, BindProgramDuringPauseAndResume)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const char *kVS1 = R"(#version 310 es
+ out float tfVarying10;
+@@ -2238,8 +2241,8 @@ void main() {
+ // PPO, and resuming after unbinding the program will result in validation error.
+ TEST_P(ProgramPipelineXFBTest31, UseProgramAndPPOThenUnbindProgramAndResume)
+ {
+-    // Only the Vulkan backend supports PPOs
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    // Exercise backends with program-pipeline integration.
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const char *kVS1 = R"(#version 310 es
+ out float tfVarying10;
+@@ -2338,7 +2341,7 @@ void main() {
+ // Test modifying a shader and re-linking it updates the PPO too
+ TEST_P(ProgramPipelineTest31, ModifyAndRelinkShader)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString      = essl31_shaders::vs::Simple();
+     const GLchar *fragStringGreen = essl31_shaders::fs::Green();
+@@ -2399,7 +2402,7 @@ TEST_P(ProgramPipelineTest31, ModifyAndRelinkShader)
+ // linked by the PPO during glDrawArrays.
+ TEST_P(ProgramPipelineTest31, ProgramBinary)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+     ANGLE_SKIP_TEST_IF(getAvailableProgramBinaryFormatCount() == 0);
+ 
+     const GLchar *vertString = R"(#version 310 es
+@@ -2490,7 +2493,7 @@ void main()
+ // Test that updating a sampler uniform in a separable program behaves correctly with PPOs.
+ TEST_P(ProgramPipelineTest31, SampleTextureAThenTextureB)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     constexpr int kWidth  = 2;
+     constexpr int kHeight = 2;
+@@ -2569,7 +2572,7 @@ void main()
+ // Verify that image uniforms can be used with separable programs
+ TEST_P(ProgramPipelineTest31, ImageUniforms)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     GLint maxVertexImageUniforms;
+     glGetIntegerv(GL_MAX_VERTEX_IMAGE_UNIFORMS, &maxVertexImageUniforms);
+@@ -2607,7 +2610,7 @@ void main()
+ // Verify that image uniforms can link in separable programs
+ TEST_P(ProgramPipelineTest31, LinkedImageUniforms)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     GLint maxVertexImageUniforms;
+     glGetIntegerv(GL_MAX_VERTEX_IMAGE_UNIFORMS, &maxVertexImageUniforms);
+@@ -2663,7 +2666,7 @@ void main()
+ // pipeline.
+ TEST_P(ProgramPipelineTest31, MaxFragmentUniformBufferObjects)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     GLint maxUniformBlocks;
+     glGetIntegerv(GL_MAX_FRAGMENT_UNIFORM_BLOCKS, &maxUniformBlocks);
+@@ -2706,10 +2709,11 @@ void main()
+ // pipeline.
+ TEST_P(ProgramPipelineTest31, MaxFragmentShaderStorageBufferObjects)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     GLint maxShaderStorageBuffers;
+     glGetIntegerv(GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, &maxShaderStorageBuffers);
++    ANGLE_SKIP_TEST_IF(maxShaderStorageBuffers == 0);
+     const GLchar *vertString = essl31_shaders::vs::Simple();
+     std::stringstream fragStringStream;
+     fragStringStream << R"(#version 310 es
+@@ -2850,7 +2854,7 @@ void main()
+ // https://issuetracker.google.com/issues/299532942
+ TEST_P(ProgramPipelineTest31, ProgramPipelineBindBufferRange)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString = R"(#version 310 es
+ in vec4 position;
+@@ -2978,7 +2982,7 @@ TEST_P(ProgramPipelineTest31, ProgramPipelineivTest)
+ // when location is specified in separable programs.
+ TEST_P(ProgramPipelineTest31, ShaderInterfaceMatchingTest)
+ {
+-    ANGLE_SKIP_TEST_IF(!IsVulkan());
++    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
+ 
+     const GLchar *vertString = R"(#version 310 es
+ precision highp float;
+@@ -2988,6 +2992,9 @@ layout(location = 1) out float f[2];
+ void main()
+ {
+     gl_Position = a_position;
++    u3 = uvec3(1u, 2u, 3u);
++    f[0] = 0.25;
++    f[1] = 0.5;
+ })";
+ 
+     const GLchar *fragString = R"(#version 310 es
+@@ -3252,13 +3259,25 @@ void main()
+ }
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineTest);
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++ANGLE_INSTANTIATE_TEST_ES3_AND_ES31_AND(ProgramPipelineTest, ES31_METAL());
++#else
+ ANGLE_INSTANTIATE_TEST_ES3_AND_ES31(ProgramPipelineTest);
++#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineTest31);
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++ANGLE_INSTANTIATE_TEST_ES31_AND(ProgramPipelineTest31, ES31_METAL());
++#else
+ ANGLE_INSTANTIATE_TEST_ES31(ProgramPipelineTest31);
++#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineXFBTest31);
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++ANGLE_INSTANTIATE_TEST_ES31_AND(ProgramPipelineXFBTest31, ES31_METAL());
++#else
+ ANGLE_INSTANTIATE_TEST_ES31(ProgramPipelineXFBTest31);
++#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineTest32);
+ ANGLE_INSTANTIATE_TEST_ES32(ProgramPipelineTest32);

@@ -1,0 +1,134 @@
+diff --git a/src/tests/BUILD.gn b/src/tests/BUILD.gn
+index b739aa6..da1bce5 100644
+--- a/src/tests/BUILD.gn
++++ b/src/tests/BUILD.gn
+@@ -581,10 +581,16 @@ if (is_win || is_linux || is_chromeos || is_android || is_fuchsia || is_apple) {
+       sources += angle_white_box_tests_metal_sources
+       if (angle_metal_enable_compute_tests) {
+         sources += [
++          "gl_tests/AtomicCounterBufferTest.cpp",
+           "gl_tests/ComputeDispatchTestMetal.cpp",
+           "gl_tests/ComputeShaderTest.cpp",
+-          "gl_tests/ShaderStorageBufferTest.cpp",
++          "gl_tests/DrawElementsIndirectTest.cpp",
++          "gl_tests/FramebufferTest.cpp",
++          "gl_tests/ProgramInterfaceTest.cpp",
+           "gl_tests/ProgramPipelineTest.cpp",
++          "gl_tests/ShaderStorageBufferTest.cpp",
++          "gl_tests/TextureMultisampleTest.cpp",
++          "gl_tests/VertexAttributeTest.cpp",
+         ]
+       }
+     }
+diff --git a/src/tests/gl_tests/ComputeShaderTest.cpp b/src/tests/gl_tests/ComputeShaderTest.cpp
+index eac644d..afa05e5 100644
+--- a/src/tests/gl_tests/ComputeShaderTest.cpp
++++ b/src/tests/gl_tests/ComputeShaderTest.cpp
+@@ -5824,22 +5824,12 @@ void main() {
+ }
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ComputeShaderTest);
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-ANGLE_INSTANTIATE_TEST_ES31_AND(ComputeShaderTest,
+-                                ES31_VULKAN().enable(Feature::ForceRobustResourceInit),
+-                                ES31_METAL());
+-#else
+ ANGLE_INSTANTIATE_TEST_ES31_AND(ComputeShaderTest,
+                                 ES31_VULKAN().enable(Feature::ForceRobustResourceInit));
+-#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ComputeShaderTestES3);
+ ANGLE_INSTANTIATE_TEST_ES3(ComputeShaderTestES3);
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(StorageImageRenderProgramTest);
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-ANGLE_INSTANTIATE_TEST_ES31_AND(StorageImageRenderProgramTest, ES31_METAL());
+-#else
+ ANGLE_INSTANTIATE_TEST_ES31(StorageImageRenderProgramTest);
+-#endif
+ }  // namespace
+diff --git a/src/tests/gl_tests/ProgramPipelineTest.cpp b/src/tests/gl_tests/ProgramPipelineTest.cpp
+index 894343b..d2c3143 100644
+--- a/src/tests/gl_tests/ProgramPipelineTest.cpp
++++ b/src/tests/gl_tests/ProgramPipelineTest.cpp
+@@ -3259,25 +3259,13 @@ void main()
+ }
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineTest);
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-ANGLE_INSTANTIATE_TEST_ES3_AND_ES31_AND(ProgramPipelineTest, ES31_METAL());
+-#else
+ ANGLE_INSTANTIATE_TEST_ES3_AND_ES31(ProgramPipelineTest);
+-#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineTest31);
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-ANGLE_INSTANTIATE_TEST_ES31_AND(ProgramPipelineTest31, ES31_METAL());
+-#else
+ ANGLE_INSTANTIATE_TEST_ES31(ProgramPipelineTest31);
+-#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineXFBTest31);
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-ANGLE_INSTANTIATE_TEST_ES31_AND(ProgramPipelineXFBTest31, ES31_METAL());
+-#else
+ ANGLE_INSTANTIATE_TEST_ES31(ProgramPipelineXFBTest31);
+-#endif
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ProgramPipelineTest32);
+ ANGLE_INSTANTIATE_TEST_ES32(ProgramPipelineTest32);
+diff --git a/src/tests/gl_tests/ShaderStorageBufferTest.cpp b/src/tests/gl_tests/ShaderStorageBufferTest.cpp
+index b7dc505..e46be25 100644
+--- a/src/tests/gl_tests/ShaderStorageBufferTest.cpp
++++ b/src/tests/gl_tests/ShaderStorageBufferTest.cpp
+@@ -3554,13 +3554,7 @@ void main() {
+ }
+ 
+ GTEST_ALLOW_UNINSTANTIATED_PARAMETERIZED_TEST(ShaderStorageBufferTest31);
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+ ANGLE_INSTANTIATE_TEST_ES31_AND(ShaderStorageBufferTest31,
+-                                ES31_METAL(),
+                                 ES31_VULKAN().enable(Feature::PreferCPUForBufferSubData));
+-#else
+-ANGLE_INSTANTIATE_TEST_ES31_AND(ShaderStorageBufferTest31,
+-                                ES31_VULKAN().enable(Feature::PreferCPUForBufferSubData));
+-#endif
+ 
+ }  // namespace
+diff --git a/src/tests/test_utils/angle_test_instantiate.h b/src/tests/test_utils/angle_test_instantiate.h
+index 9c27e67..57f83d3 100644
+--- a/src/tests/test_utils/angle_test_instantiate.h
++++ b/src/tests/test_utils/angle_test_instantiate.h
+@@ -149,15 +149,23 @@ struct CombinedPrintToStringParamName
+             .enable(Feature::VaryingsRequireMatchingPrecisionInSpirv)                  \
+             .enable(Feature::SimulateTileMemoryForTesting)
+ 
+-#define ANGLE_ALL_TEST_PLATFORMS_ES31                                           \
+-    ES31_OPENGL(), ES31_OPENGLES(), ES31_VULKAN(), ES31_VULKAN_SWIFTSHADER(),   \
+-        ES31_VULKAN()                                                           \
+-            .enable(Feature::EnableParallelCompileAndLink)                      \
+-            .enable(Feature::VaryingsRequireMatchingPrecisionInSpirv),          \
+-        ES31_VULKAN().disable(Feature::EnableCreateContextBackwardsCompatible), \
+-        ES31_VULKAN_SWIFTSHADER()                                               \
+-            .enable(Feature::EnableParallelCompileAndLink)                      \
+-            .disable(Feature::SupportsGraphicsPipelineLibrary)                  \
++// Keep the unfinished Metal ES 3.1 profile confined to integration test builds.
++#if defined(ANGLE_METAL_COMPUTE_TESTS)
++#    define ANGLE_TEST_PLATFORM_ES31_METAL ES31_METAL(),
++#else
++#    define ANGLE_TEST_PLATFORM_ES31_METAL
++#endif
++
++#define ANGLE_ALL_TEST_PLATFORMS_ES31                                             \
++    ANGLE_TEST_PLATFORM_ES31_METAL ES31_OPENGL(), ES31_OPENGLES(), ES31_VULKAN(), \
++        ES31_VULKAN_SWIFTSHADER(),                                                \
++        ES31_VULKAN()                                                             \
++            .enable(Feature::EnableParallelCompileAndLink)                        \
++            .enable(Feature::VaryingsRequireMatchingPrecisionInSpirv),            \
++        ES31_VULKAN().disable(Feature::EnableCreateContextBackwardsCompatible),   \
++        ES31_VULKAN_SWIFTSHADER()                                                 \
++            .enable(Feature::EnableParallelCompileAndLink)                        \
++            .disable(Feature::SupportsGraphicsPipelineLibrary)                    \
+             .enable(Feature::VaryingsRequireMatchingPrecisionInSpirv)
+ 
+ #define ANGLE_ALL_TEST_PLATFORMS_ES32                                 \

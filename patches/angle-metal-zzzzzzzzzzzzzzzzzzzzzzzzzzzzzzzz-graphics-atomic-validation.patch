@@ -1,0 +1,149 @@
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 1ac80f7..1524676 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -23,6 +23,7 @@
+ #include "compiler/translator/tree_ops/MonomorphizeUnsupportedFunctions.h"
+ #include "compiler/translator/tree_ops/PreTransformTextureCubeGradDerivatives.h"
+ #include "compiler/translator/tree_ops/ReduceInterfaceBlocks.h"
++#include "compiler/translator/tree_ops/RemoveAtomicCounterBuiltins.h"
+ #include "compiler/translator/tree_ops/RewriteArrayOfArrayOfOpaqueUniforms.h"
+ #include "compiler/translator/tree_ops/RewriteAtomicCounters.h"
+ #include "compiler/translator/tree_ops/RewriteDfdy.h"
+@@ -873,6 +874,22 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+                                   PerformanceDiagnostics * /*perfDiagnostics*/,
+                                   DriverUniformMetal *driverUniforms)
+ {
++    const bool atomicCounters =
++        std::any_of(mUniforms.begin(), mUniforms.end(), [](const ShaderVariable &uniform) {
++            return uniform.active && gl::IsAtomicCounterType(uniform.type);
++        });
++    if (!atomicCounters && getShaderVersion() >= 310 && !RemoveAtomicCounterBuiltins(this, root))
++    {
++        return false;
++    }
++    if (getShaderType() != GL_COMPUTE_SHADER && atomicCounters)
++    {
++        // These optional graphics-stage limits are zero. Reject the shader
++        // cleanly before reaching MSL's compute-only atomic-counter lowering.
++        getInfoSink().info << "Metal graphics atomic counters are not supported.\n";
++        return false;
++    }
++
+     TSymbolTable &symbolTable = getSymbolTable();
+     IdGen idGen;
+     ProgramPreludeConfig ppc(metalShaderTypeFromGLSL(getShaderType()));
+@@ -971,10 +988,6 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+     else if (getShaderType() == GL_COMPUTE_SHADER)
+     {
+         driverUniforms->addComputeDriverUniformsToShader(root, &getSymbolTable());
+-        const bool atomicCounters =
+-            std::any_of(mUniforms.begin(), mUniforms.end(), [](const ShaderVariable &uniform) {
+-                return uniform.active && gl::IsAtomicCounterType(uniform.type);
+-            });
+         if (atomicCounters &&
+             !RewriteAtomicCounters(this, root, &getSymbolTable(),
+                                    driverUniforms->getAcbBufferOffsets(), nullptr, 1))
+@@ -1372,9 +1385,14 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+                 const bool atomic  = oldVar.symbolType() == SymbolType::AngleInternal &&
+                                      type.getInterfaceBlock()->name() == "ANGLEAtomicCounters";
+                 const size_t count = type.getArraySizeProduct();
+-                if (getShaderType() != GL_COMPUTE_SHADER ||
+-                    (!atomic && (uniform ? computeUniformIndex + count > kMetalComputeUniformBuffers
+-                                         : storageIndex + count > kMetalComputeStorageBuffers)))
++                if (getShaderType() != GL_COMPUTE_SHADER)
++                {
++                    getInfoSink().info << "Metal graphics storage blocks are not supported.\n";
++                    storageSupported = false;
++                    return;
++                }
++                if (!atomic && (uniform ? computeUniformIndex + count > kMetalComputeUniformBuffers
++                                        : storageIndex + count > kMetalComputeStorageBuffers))
+                 {
+                     getInfoSink().info << "Metal compute supports at most eight storage block "
+                                           "elements and twelve uniform block elements.\n";
+diff --git a/src/tests/gl_tests/AtomicCounterBufferTest.cpp b/src/tests/gl_tests/AtomicCounterBufferTest.cpp
+index 40f17f2..562cc20 100644
+--- a/src/tests/gl_tests/AtomicCounterBufferTest.cpp
++++ b/src/tests/gl_tests/AtomicCounterBufferTest.cpp
+@@ -429,6 +429,10 @@ void main()
+ // Test atomic counter read.
+ TEST_P(AtomicCounterBufferTest31, AtomicCounterRead)
+ {
++    GLint maxFragmentAtomicCounters = 0;
++    glGetIntegerv(GL_MAX_FRAGMENT_ATOMIC_COUNTERS, &maxFragmentAtomicCounters);
++    ANGLE_SKIP_TEST_IF(maxFragmentAtomicCounters < 1);
++
+     constexpr char kFS[] =
+         "#version 310 es\n"
+         "precision highp float;\n"
+@@ -462,6 +466,10 @@ TEST_P(AtomicCounterBufferTest31, AtomicCounterRead)
+ // update in the context
+ TEST_P(AtomicCounterBufferTest31, DependentAtomicCounterBufferChange)
+ {
++    GLint maxFragmentAtomicCounters = 0;
++    glGetIntegerv(GL_MAX_FRAGMENT_ATOMIC_COUNTERS, &maxFragmentAtomicCounters);
++    ANGLE_SKIP_TEST_IF(maxFragmentAtomicCounters < 1);
++
+     constexpr char kFS[] =
+         "#version 310 es\n"
+         "precision highp float;\n"
+@@ -504,6 +512,10 @@ TEST_P(AtomicCounterBufferTest31, DependentAtomicCounterBufferChange)
+ // This test will fail if there are bugs in how we count valid bindings.
+ TEST_P(AtomicCounterBufferTest31, AtomicCounterBufferRangeRead)
+ {
++    GLint maxFragmentAtomicCounters = 0;
++    glGetIntegerv(GL_MAX_FRAGMENT_ATOMIC_COUNTERS, &maxFragmentAtomicCounters);
++    ANGLE_SKIP_TEST_IF(maxFragmentAtomicCounters < 1);
++
+     // Skipping due to a bug on the Qualcomm driver.
+     // http://anglebug.com/42262383
+     ANGLE_SKIP_TEST_IF(IsNexus5X() && IsOpenGLES());
+@@ -597,6 +609,10 @@ void main()
+ // there are bugs in how we count valid bindings.
+ TEST_P(AtomicCounterBufferTest31, AtomicCounterBufferRepeatedBindUnbind)
+ {
++    GLint maxFragmentAtomicCounters = 0;
++    glGetIntegerv(GL_MAX_FRAGMENT_ATOMIC_COUNTERS, &maxFragmentAtomicCounters);
++    ANGLE_SKIP_TEST_IF(maxFragmentAtomicCounters < 1);
++
+     constexpr char kFS[] =
+         "#version 310 es\n"
+         "precision highp float;\n"
+diff --git a/src/tests/gl_tests/ProgramInterfaceTest.cpp b/src/tests/gl_tests/ProgramInterfaceTest.cpp
+index 0587b68..30db2a2 100644
+--- a/src/tests/gl_tests/ProgramInterfaceTest.cpp
++++ b/src/tests/gl_tests/ProgramInterfaceTest.cpp
+@@ -433,6 +433,10 @@ TEST_P(ProgramInterfaceTestES31, GetResource)
+ // Tests glGetProgramInterfaceiv.
+ TEST_P(ProgramInterfaceTestES31, GetProgramInterface)
+ {
++    GLint maxFragmentStorageBlocks = 0;
++    glGetIntegerv(GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, &maxFragmentStorageBlocks);
++    ANGLE_SKIP_TEST_IF(maxFragmentStorageBlocks < 2);
++
+     // TODO(jiajia.qin@intel.com): Don't skip this test once SSBO are supported on render pipeline.
+     // http://anglebug.com/40644618
+     ANGLE_SKIP_TEST_IF(IsD3D11());
+diff --git a/src/tests/gl_tests/VertexAttributeTest.cpp b/src/tests/gl_tests/VertexAttributeTest.cpp
+index f52238e..415e2c5 100644
+--- a/src/tests/gl_tests/VertexAttributeTest.cpp
++++ b/src/tests/gl_tests/VertexAttributeTest.cpp
+@@ -3293,7 +3293,7 @@ void main()
+ 
+ TEST_P(VertexAttributeTestES31, UsePpoComputeShaderToUpdateVertexBuffer)
+ {
+-    // PPOs are only supported in the Vulkan backend
++    // Exercise both backends with implemented program-pipeline ownership.
+     ANGLE_SKIP_TEST_IF(!isVulkanRenderer() && !IsMetal());
+ 
+     initTest();
+@@ -3363,7 +3363,7 @@ void main()
+ 
+ TEST_P(VertexAttributeTestES31, UseComputeShaderToUpdateVertexBufferSamePpo)
+ {
+-    // PPOs are only supported in the Vulkan backend
++    // Exercise both backends with implemented program-pipeline ownership.
+     ANGLE_SKIP_TEST_IF(!isVulkanRenderer() && !IsMetal());
+ 
+     initTest();

@@ -1,0 +1,44 @@
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 8d9d7ac..28e1984 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -1447,8 +1447,9 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     auto arguments = mtl::GetImpl(getState().getTargetBuffer(gl::BufferBinding::DrawIndirect))
+                          ->getCurrentBuffer();
+     size_t offset  = reinterpret_cast<uintptr_t>(indirect);
+-    const bool convert =
+-        mode == gl::PrimitiveMode::TriangleFan || requiresIndexRewrite(getState(), mode);
++    const bool convert = mode == gl::PrimitiveMode::TriangleFan ||
++                         mode == gl::PrimitiveMode::LineLoop ||
++                         requiresIndexRewrite(getState(), mode);
+     bool procedural = false;
+     mtl::BufferSlice converted, closing;
+     const bool lineLoop = mode == gl::PrimitiveMode::LineLoop && !convert;
+@@ -1554,10 +1555,10 @@ kernel void main0(const device uint *source [[buffer(0)]],
+     const bool nativeStrip = mode == gl::PrimitiveMode::LineStrip ||
+                              mode == gl::PrimitiveMode::TriangleStrip ||
+                              mode == gl::PrimitiveMode::LineLoop;
+-    const bool convert     = mode == gl::PrimitiveMode::TriangleFan ||
+-                             getState().isPrimitiveRestartEnabled() ||
+-                             requiresIndexRewrite(getState(), mode) ||
+-                             (type == gl::DrawElementsType::UnsignedShort && nativeStrip);
++    const bool convert =
++        mode == gl::PrimitiveMode::TriangleFan || mode == gl::PrimitiveMode::LineLoop ||
++        getState().isPrimitiveRestartEnabled() || requiresIndexRewrite(getState(), mode) ||
++        (type == gl::DrawElementsType::UnsignedShort && nativeStrip);
+     mtl::BufferSlice indexBuffer;
+     gl::DrawElementsType nativeType;
+     gl::PrimitiveMode nativeMode = mode;
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index ade88ea..5cc6a55 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -3707,6 +3707,8 @@ TEST_P(GraphicsPipelineTestMetal, GPUUniformConversionsStageOwnershipAndBinary)
+     glBindBuffer(GL_SHADER_STORAGE_BUFFER, allocation);
+     glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
+     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
+     GLProgramPipeline pipeline;
+     glBindProgramPipeline(pipeline);
+     std::array<float, 12> colors;

@@ -1,0 +1,26 @@
+diff --git a/src/libANGLE/renderer/metal/BUILD.gn b/src/libANGLE/renderer/metal/BUILD.gn
+index 1287f50..c217681 100644
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -102,10 +102,17 @@ if (metal_internal_shader_compilation_supported) {
+         "-mmacosx-version-min=10.14",
+       ]
+     } else if (is_ios) {
+-      args += [
+-        "--std=ios-metal2.1",
+-        "-mios-version-min=12",
+-      ]
++      args += [ "--std=ios-metal2.1" ]
++      if (target_environment == "simulator") {
++        # Device AIR cannot identify an iOS Simulator library. Match the
++        # framework's simulator platform and deployment target explicitly.
++        args += [
++          "-target",
++          "air64-apple-ios${ios_deployment_target}-simulator",
++        ]
++      } else {
++        args += [ "-mios-version-min=12" ]
++      }
+     }
+   }
+ 

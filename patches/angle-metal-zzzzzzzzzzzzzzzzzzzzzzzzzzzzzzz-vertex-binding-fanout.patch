@@ -1,0 +1,200 @@
+diff --git a/src/libANGLE/renderer/metal/VertexArrayMtl.mm b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+index 84544d4..118316c 100644
+--- a/src/libANGLE/renderer/metal/VertexArrayMtl.mm
++++ b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+@@ -249,6 +249,18 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+     const std::vector<gl::VertexAttribute> &attribs = mState.getVertexAttributes();
+     const std::vector<gl::VertexBinding> &bindings  = mState.getVertexBindings();
+ 
++    // Bindings can be shared by multiple attributes, including disabled ones.
++    // Observe storage changes while any enabled attribute uses the binding.
++    mContentsObserverBindingsMask.reset();
++    mContentsObserverBindingsMask.set(gl::kElementArrayBufferIndex);
++    for (const gl::VertexAttribute &attrib : attribs)
++    {
++        if (attrib.enabled && getVertexArrayBuffer(attrib.bindingIndex))
++        {
++            mContentsObserverBindingsMask.set(attrib.bindingIndex);
++        }
++    }
++
+     for (size_t dirtyBit : dirtyBits)
+     {
+         switch (dirtyBit)
+@@ -270,21 +282,25 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+ 
+                 ANGLE_VERTEX_INDEX_CASES(ANGLE_VERTEX_DIRTY_ATTRIB_FUNC)
+ 
+-#define ANGLE_VERTEX_DIRTY_BINDING_FUNC(INDEX)                                                    \
+-    case gl::VertexArray::DIRTY_BIT_BINDING_0 + INDEX:                                            \
+-        ANGLE_TRY(syncDirtyAttrib(context, attribs[INDEX], bindings[attribs[INDEX].bindingIndex], \
+-                                  INDEX));                                                        \
+-        mVertexArrayDirty = true;                                                                 \
+-        (*bindingBits)[INDEX].reset();                                                            \
++#define ANGLE_VERTEX_DIRTY_BINDING_FUNC(INDEX)                                                 \
++    case gl::VertexArray::DIRTY_BIT_BINDING_0 + INDEX:                                         \
++        for (size_t location : bindings[INDEX].getBoundAttributesMask())                       \
++        {                                                                                      \
++            ANGLE_TRY(syncDirtyAttrib(context, attribs[location], bindings[INDEX], location)); \
++        }                                                                                      \
++        mVertexArrayDirty = true;                                                              \
++        (*bindingBits)[INDEX].reset();                                                         \
+         break;
+ 
+                 ANGLE_VERTEX_INDEX_CASES(ANGLE_VERTEX_DIRTY_BINDING_FUNC)
+ 
+-#define ANGLE_VERTEX_DIRTY_BUFFER_DATA_FUNC(INDEX)                                                \
+-    case gl::VertexArray::DIRTY_BIT_BUFFER_DATA_0 + INDEX:                                        \
+-        ANGLE_TRY(syncDirtyAttrib(context, attribs[INDEX], bindings[attribs[INDEX].bindingIndex], \
+-                                  INDEX));                                                        \
+-        mVertexDataDirty = true;                                                                  \
++#define ANGLE_VERTEX_DIRTY_BUFFER_DATA_FUNC(INDEX)                                             \
++    case gl::VertexArray::DIRTY_BIT_BUFFER_DATA_0 + INDEX:                                     \
++        for (size_t location : bindings[INDEX].getBoundAttributesMask())                       \
++        {                                                                                      \
++            ANGLE_TRY(syncDirtyAttrib(context, attribs[location], bindings[INDEX], location)); \
++        }                                                                                      \
++        mVertexDataDirty = true;                                                               \
+         break;
+ 
+                 ANGLE_VERTEX_INDEX_CASES(ANGLE_VERTEX_DIRTY_BUFFER_DATA_FUNC)
+@@ -620,7 +636,6 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+ {
+     ContextMtl *contextMtl = mtl::GetImpl(glContext);
+     ASSERT(mtl::kMaxVertexAttribs > attribIndex);
+-    mContentsObserverBindingsMask.reset(attrib.bindingIndex);
+ 
+     if (attrib.enabled)
+     {
+@@ -634,10 +649,6 @@ inline MTLVertexFormat GetCurrentAttribFormat(GLenum type)
+             effectiveBinding.setStride(binding.getStride());
+             effectiveBinding.setDivisor(binding.getDivisor());
+             effectiveBinding.setOffset(binding.getOffset() + attrib.relativeOffset);
+-            // https://bugs.webkit.org/show_bug.cgi?id=236733
+-            // even non-converted buffers need to be observed for potential
+-            // data rebinds.
+-            mContentsObserverBindingsMask.set(attrib.bindingIndex);
+             bool needConversion =
+                 format.actualFormatId != format.intendedFormatId ||
+                 (effectiveBinding.getOffset() % mtl::kVertexAttribBufferStrideAlignment) != 0 ||
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 2aad48b..de79e58 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -41,6 +41,94 @@ class ComputeDispatchTestMetal : public ANGLETest<>
+     }
+ };
+ 
++// Attribute locations and buffer bindings are independent. Converted views of
++// one GPU-written binding must all refresh, even when another bound attribute
++// is disabled. Storage replacement must fan out to the same attribute set.
++TEST_P(ComputeDispatchTestMetal, GPUVertexBindingFanoutToConvertedAttributes)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x=6) in;
++        layout(std430,binding=0) buffer Data { int words[]; } data;
++        uniform uint base, phase;
++        void main() {
++            const vec2 p[6]=vec2[6](vec2(-1,-1),vec2(1,-1),vec2(-1,1),
++                                   vec2(-1,1),vec2(1,-1),vec2(1,1));
++            uint i=gl_LocalInvocationIndex, at=base+8u*i;
++            data.words[at]=int(p[i].x*65536.); data.words[at+1u]=int(p[i].y*65536.);
++            data.words[at+4u]=16384+8192*int(phase);
++            data.words[at+5u]=32768; data.words[at+6u]=65536; data.words[at+7u]=65536;
++        }
++    )";
++    constexpr char vertex[]   = R"(#version 310 es
++        layout(location=0) in vec2 position;
++        layout(location=1) in vec4 color;
++        out vec4 paint;
++        void main() { gl_Position=vec4(position,0,1); paint=color; }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        in vec4 paint; out vec4 color;
++        void main() { color=paint; }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(compute, producer);
++    ANGLE_GL_PROGRAM(render, vertex, fragment);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
++    GLBuffer allocation;
++    glBindBuffer(GL_ARRAY_BUFFER, allocation);
++    std::vector<uint32_t> expected(128, 0xcdcdcdcdu);
++    glBufferData(GL_ARRAY_BUFFER, expected.size() * 4, expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, allocation);
++    glVertexAttribFormat(0, 2, GL_FIXED, GL_FALSE, 0);
++    glVertexAttribFormat(1, 4, GL_FIXED, GL_FALSE, 16);
++    glVertexAttribBinding(0, 10);
++    glVertexAttribBinding(1, 10);
++    glVertexAttribBinding(2, 10);
++    glEnableVertexAttribArray(0);
++    glEnableVertexAttribArray(1);
++    glBindVertexBuffer(10, allocation, 256, 32);
++    for (uint32_t phase = 0; phase < 4; ++phase)
++    {
++        SCOPED_TRACE(phase);
++        const uint32_t base = phase >= 2 ? 128u : 64u;
++        if (phase == 2)
++        {
++            expected.assign(256, 0xcdcdcdcdu);
++            glBufferData(GL_ARRAY_BUFFER, expected.size() * 4, expected.data(), GL_DYNAMIC_DRAW);
++            glBindVertexBuffer(10, allocation, base * 4, 32);
++        }
++        glUseProgram(compute);
++        glUniform1ui(glGetUniformLocation(compute, "phase"), phase);
++        glUniform1ui(glGetUniformLocation(compute, "base"), base);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
++        glUseProgram(render);
++        glDrawArrays(GL_TRIANGLES, 0, 6);
++        ASSERT_GL_NO_ERROR();
++        EXPECT_PIXEL_NEAR(8, 8, static_cast<int>(std::round((.25f + .125f * phase) * 255.f)), 128,
++                          255, 255, 1);
++        constexpr int32_t p[6][2] = {{-65536, -65536}, {65536, -65536}, {-65536, 65536},
++                                     {-65536, 65536},  {65536, -65536}, {65536, 65536}};
++        for (size_t i = 0; i < 6; ++i)
++        {
++            expected[base + i * 8]     = static_cast<uint32_t>(p[i][0]);
++            expected[base + i * 8 + 1] = static_cast<uint32_t>(p[i][1]);
++            expected[base + i * 8 + 4] = 16384 + 8192 * phase;
++            expected[base + i * 8 + 5] = 32768;
++            expected[base + i * 8 + 6] = 65536;
++            expected[base + i * 8 + 7] = 65536;
++        }
++        const auto *actual = static_cast<const uint32_t *>(
++            glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, expected.size() * 4, GL_MAP_READ_BIT));
++        ASSERT_NE(actual, nullptr);
++        for (size_t word = 0; word < expected.size(); ++word)
++        {
++            EXPECT_EQ(actual[word], expected[word]) << word;
++        }
++        EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    }
++}
++
+ // A GPU producer supplies std140 graphics uniforms whose native Metal layout
+ // requires matrix transposition, array repacking and boolean normalization.
+ TEST_P(ComputeDispatchTestMetal, GPUWrittenGraphicsUniformConversionAndBinary)
+diff --git a/src/tests/gl_tests/VertexAttributeTest.cpp b/src/tests/gl_tests/VertexAttributeTest.cpp
+index 65a0b14..f52238e 100644
+--- a/src/tests/gl_tests/VertexAttributeTest.cpp
++++ b/src/tests/gl_tests/VertexAttributeTest.cpp
+@@ -3294,7 +3294,7 @@ void main()
+ TEST_P(VertexAttributeTestES31, UsePpoComputeShaderToUpdateVertexBuffer)
+ {
+     // PPOs are only supported in the Vulkan backend
+-    ANGLE_SKIP_TEST_IF(!isVulkanRenderer());
++    ANGLE_SKIP_TEST_IF(!isVulkanRenderer() && !IsMetal());
+ 
+     initTest();
+     constexpr char kComputeShader[] =
+@@ -3364,7 +3364,7 @@ void main()
+ TEST_P(VertexAttributeTestES31, UseComputeShaderToUpdateVertexBufferSamePpo)
+ {
+     // PPOs are only supported in the Vulkan backend
+-    ANGLE_SKIP_TEST_IF(!isVulkanRenderer());
++    ANGLE_SKIP_TEST_IF(!isVulkanRenderer() && !IsMetal());
+ 
+     initTest();
+     constexpr char kComputeShader[] =

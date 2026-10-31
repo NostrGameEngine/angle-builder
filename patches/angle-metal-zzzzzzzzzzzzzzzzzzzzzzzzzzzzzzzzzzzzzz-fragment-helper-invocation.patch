@@ -1,0 +1,46 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 559498e..d34707c 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -1770,8 +1770,13 @@ void GenMetalTraverser::visitSymbol(TIntermSymbol *symbolNode)
+     const TType &type    = var.getType();
+     ASSERT(var.symbolType() != SymbolType::Empty);
+ 
+-    if (mCompiler.getShaderType() == GL_VERTEX_SHADER &&
+-        var.symbolType() == SymbolType::AngleInternal && var.name() == "vertexIDMetal")
++    if (type.getQualifier() == EvqHelperInvocation)
++    {
++        // Fragment helper state is supplied by Metal, including in user helpers.
++        mOut << "metal::simd_is_helper_thread()";
++    }
++    else if (mCompiler.getShaderType() == GL_VERTEX_SHADER &&
++             var.symbolType() == SymbolType::AngleInternal && var.name() == "vertexIDMetal")
+     {
+         mOut << "(" << sh::mtl::kArrayDrawEmulationConstName << " ? ANGLE_arrayVertexID(";
+         emitNameOf(var);
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index 107e4f9..c98f4a0 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -1209,6 +1209,21 @@ TEST_F(MSLOutputTest, StructAndVarDeclarationSeparationNoCrash3)
+     compile(kShader);
+ }
+ 
++// The GLSL builtin is a per-invocation Metal query, also inside user functions.
++TEST_F(MSLOutputTest, FragmentHelperInvocation)
++{
++    compile(R"(#version 310 es
++        precision highp float;
++        out vec4 color;
++        bool helper() { return gl_HelperInvocation; }
++        void main() {
++            color = vec4(helper() ? dFdx(gl_FragCoord.x) : 0.0);
++        }
++    )");
++    EXPECT_TRUE(foundInCode("metal::simd_is_helper_thread()"));
++    EXPECT_TRUE(notFoundInCode("gl_HelperInvocation"));
++}
++
+ TEST_F(MSLOutputTest, MultisampleInterpolationNoCrash)
+ {
+     getResources()->OES_shader_multisample_interpolation = 1;

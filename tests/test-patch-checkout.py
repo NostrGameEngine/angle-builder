@@ -45,7 +45,8 @@ with tempfile.TemporaryDirectory(prefix="angle-patch-checkout-") as tmp:
                     if not dest.exists():
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         dest.write_bytes(git("show", PIN + ":" + name, cwd=ANGLE))
-        for patch in patches:
+            # Later patches may edit files created by an earlier patch.
+            # Populate and apply each prefix before examining the next input.
             git("apply", "--check", str(patch), cwd=sources)
             git("apply", str(patch), cwd=sources)
             git("apply", "--reverse", "--check", str(patch), cwd=sources)

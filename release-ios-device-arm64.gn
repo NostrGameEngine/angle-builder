@@ -1,0 +1,16 @@
+is_component_build = false
+target_os = "ios"
+target_cpu = "arm64"
+target_environment = "device"
+ios_deployment_target = "18.0"
+ios_enable_code_signing = false
+use_system_xcode = true
+is_debug = false
+angle_assert_always_on = false
+clang_use_chrome_plugins = false
+angle_enable_null = false
+angle_enable_gl = false
+angle_enable_vulkan = false
+angle_enable_wgpu = false
+angle_enable_metal = true
+angle_build_all = false

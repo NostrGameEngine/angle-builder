@@ -1,0 +1,995 @@
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 1c4963e..14ef7f7 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -670,6 +670,9 @@ static const char *GetOperatorString(TOperator op,
+         case TOperator::EOpUnpackHalf2x16:
+             return "ANGLE_unpack_half_2x16";
+ 
++        case TOperator::EOpBarrier:
++            return "ANGLE_barrier";
++
+         case TOperator::EOpNumSamples:
+             return "metal::get_num_samples";
+         case TOperator::EOpSamplePosition:
+@@ -685,7 +688,6 @@ static const char *GetOperatorString(TOperator op,
+         case TOperator::EOpUsubBorrow:
+         case TOperator::EOpUmulExtended:
+         case TOperator::EOpImulExtended:
+-        case TOperator::EOpBarrier:
+         case TOperator::EOpMemoryBarrier:
+         case TOperator::EOpMemoryBarrierAtomicCounter:
+         case TOperator::EOpMemoryBarrierBuffer:
+@@ -867,6 +869,37 @@ void GenMetalTraverser::emitPostQualifier(const EmitVariableDeclarationConfig &e
+             }
+             break;
+ 
++        case TQualifier::EvqNumWorkGroups:
++            if (evdConfig.isMainParameter)
++            {
++                mOut << " [[threadgroups_per_grid]]";
++            }
++            break;
++        case TQualifier::EvqWorkGroupID:
++            if (evdConfig.isMainParameter)
++            {
++                mOut << " [[threadgroup_position_in_grid]]";
++            }
++            break;
++        case TQualifier::EvqLocalInvocationID:
++            if (evdConfig.isMainParameter)
++            {
++                mOut << " [[thread_position_in_threadgroup]]";
++            }
++            break;
++        case TQualifier::EvqGlobalInvocationID:
++            if (evdConfig.isMainParameter)
++            {
++                mOut << " [[thread_position_in_grid]]";
++            }
++            break;
++        case TQualifier::EvqLocalInvocationIndex:
++            if (evdConfig.isMainParameter)
++            {
++                mOut << " [[thread_index_in_threadgroup]]";
++            }
++            break;
++
+         case TQualifier::EvqFrontFacing:
+             if (evdConfig.isMainParameter)
+             {
+@@ -1032,11 +1065,18 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
+                         UNIMPLEMENTED();
+                         break;
+                 }
+-                if (type.getMemoryQualifier().readonly || type.getMemoryQualifier().writeonly)
++                if (type.getMemoryQualifier().readonly)
++                {
++                    mOut << ", metal::access::read>";
++                }
++                else if (type.getMemoryQualifier().writeonly)
++                {
++                    mOut << ", metal::access::write>";
++                }
++                else
+                 {
+-                    UNIMPLEMENTED();
++                    mOut << ", metal::access::read_write>";
+                 }
+-                mOut << ", metal::access::read_write>";
+             }
+             else
+             {
+@@ -1514,6 +1554,11 @@ void GenMetalTraverser::emitOrdinaryVariableDeclaration(
+     etConfig.evdConfig = &evdConfig;
+ 
+     const TType &type = decl.type();
++    if (type.getQualifier() == TQualifier::EvqShared)
++    {
++        ASSERT(!evdConfig.isParameter);
++        mOut << "threadgroup ";
++    }
+     if (type.getQualifier() == TQualifier::EvqClipDistance)
+     {
+         // Clip distance output uses float[n] type instead of metal::array.
+@@ -2066,7 +2111,12 @@ void GenMetalTraverser::emitFunctionReturn(const TFunction &func)
+     if (isMain)
+     {
+         const TStructure *structure = returnType.getStruct();
+-        if (mPipelineStructs.fragmentOut.matches(*structure))
++        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++        {
++            ASSERT(returnType.getBasicType() == EbtVoid);
++            mOut << "kernel ";
++        }
++        else if (mPipelineStructs.fragmentOut.matches(*structure))
+         {
+             if (mCompiler.isEarlyFragmentTestsSpecified())
+             {
+@@ -2177,8 +2227,8 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+     {
+         const TType &returnType     = func.getReturnType();
+         const TStructure *structure = returnType.getStruct();
+-        isTraversingVertexMain      = (mPipelineStructs.vertexOut.matches(*structure)) &&
+-                                 mCompiler.getShaderType() == GL_VERTEX_SHADER;
++        isTraversingVertexMain      = mCompiler.getShaderType() == GL_VERTEX_SHADER && structure &&
++                                      mPipelineStructs.vertexOut.matches(*structure);
+     }
+     emitIndentation();
+     emitFunctionSignature(func);
+diff --git a/src/compiler/translator/msl/Pipeline.cpp b/src/compiler/translator/msl/Pipeline.cpp
+index 4fa250a..4ed6164 100644
+--- a/src/compiler/translator/msl/Pipeline.cpp
++++ b/src/compiler/translator/msl/Pipeline.cpp
+@@ -141,6 +141,22 @@ bool Pipeline::uses(const TVariable &var) const
+                     return false;
+             }
+ 
++        case Type::SharedGlobals:
++            return qualifier == TQualifier::EvqShared;
++
++        case Type::InvocationComputeGlobals:
++            switch (qualifier)
++            {
++                case TQualifier::EvqNumWorkGroups:
++                case TQualifier::EvqWorkGroupID:
++                case TQualifier::EvqLocalInvocationID:
++                case TQualifier::EvqGlobalInvocationID:
++                case TQualifier::EvqLocalInvocationIndex:
++                    return true;
++                default:
++                    return false;
++            }
++
+         case Type::UniformBuffer:
+             switch (qualifier)
+             {
+@@ -196,6 +212,12 @@ Name Pipeline::getStructTypeName(Variant variant) const
+         case Type::InvocationFragmentGlobals:
+             name = VARIANT_NAME(variant, "InvocationFragmentGlobals");
+             break;
++        case Type::InvocationComputeGlobals:
++            name = VARIANT_NAME(variant, "InvocationComputeGlobals");
++            break;
++        case Type::SharedGlobals:
++            name = VARIANT_NAME(variant, "SharedGlobals");
++            break;
+         case Type::Texture:
+             name = VARIANT_NAME(variant, "TextureEnvs");
+             break;
+@@ -246,6 +268,12 @@ Name Pipeline::getStructInstanceName(Variant variant) const
+         case Type::InvocationFragmentGlobals:
+             name = VARIANT_NAME(variant, "invocationFragmentGlobals");
+             break;
++        case Type::InvocationComputeGlobals:
++            name = VARIANT_NAME(variant, "invocationComputeGlobals");
++            break;
++        case Type::SharedGlobals:
++            name = VARIANT_NAME(variant, "sharedGlobals");
++            break;
+         case Type::Texture:
+             name = VARIANT_NAME(variant, "textureEnvs");
+             break;
+@@ -280,8 +308,10 @@ static bool AllowPadding(Pipeline::Type type)
+         case Type::NonConstantGlobals:
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
++        case Type::InvocationComputeGlobals:
+             return true;
+ 
++        case Type::SharedGlobals:
+         case Type::UserUniforms:
+         case Type::Texture:
+         case Type::Image:
+@@ -415,6 +445,8 @@ ModifyStructConfig Pipeline::externalStructModifyConfig() const
+             break;
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
++        case Type::InvocationComputeGlobals:
++        case Type::SharedGlobals:
+         case Type::Texture:
+         case Type::Image:
+         case Type::InstanceId:
+@@ -441,6 +473,8 @@ bool Pipeline::alwaysRequiresLocalVariableDeclarationInMain() const
+         case Type::NonConstantGlobals:
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
++        case Type::InvocationComputeGlobals:
++        case Type::SharedGlobals:
+         case Type::Texture:
+         case Type::InstanceId:
+             return true;
+@@ -458,6 +492,8 @@ bool Pipeline::isPipelineOut() const
+         case Type::NonConstantGlobals:
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
++        case Type::InvocationComputeGlobals:
++        case Type::SharedGlobals:
+         case Type::Texture:
+         case Type::Image:
+         case Type::InstanceId:
+@@ -474,11 +510,15 @@ AddressSpace Pipeline::externalAddressSpace() const
+ {
+     switch (type)
+     {
++        case Type::SharedGlobals:
++            return AddressSpace::Threadgroup;
++
+         case Type::VertexIn:
+         case Type::FragmentIn:
+         case Type::NonConstantGlobals:
+         case Type::InvocationVertexGlobals:
+         case Type::InvocationFragmentGlobals:
++        case Type::InvocationComputeGlobals:
+         case Type::Texture:
+         case Type::Image:
+         case Type::InstanceId:
+@@ -505,6 +545,8 @@ bool PipelineStructs::matches(const TStructure &s, bool internal, bool external)
+         nonConstantGlobals,
+         invocationVertexGlobals,
+         invocationFragmentGlobals,
++        invocationComputeGlobals,
++        sharedGlobals,
+         uniformBuffers,
+         texture,
+         instanceId,
+diff --git a/src/compiler/translator/msl/Pipeline.h b/src/compiler/translator/msl/Pipeline.h
+index 47996f3..f3a7dd4 100644
+--- a/src/compiler/translator/msl/Pipeline.h
++++ b/src/compiler/translator/msl/Pipeline.h
+@@ -59,6 +59,8 @@ class Pipeline
+         NonConstantGlobals,
+         InvocationVertexGlobals,
+         InvocationFragmentGlobals,
++        InvocationComputeGlobals,
++        SharedGlobals,
+         UniformBuffer,
+         Texture,
+         Image,
+@@ -118,6 +120,8 @@ struct PipelineStructs : angle::NonCopyable
+     PipelineScoped<TStructure> nonConstantGlobals;
+     PipelineScoped<TStructure> invocationVertexGlobals;
+     PipelineScoped<TStructure> invocationFragmentGlobals;
++    PipelineScoped<TStructure> invocationComputeGlobals;
++    PipelineScoped<TStructure> sharedGlobals;
+     PipelineScoped<TStructure> uniformBuffers;
+     PipelineScoped<TStructure> texture;
+     PipelineScoped<TStructure> image;
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 164c176..072ad74 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -58,7 +58,6 @@ class ProgramPrelude : public TIntermTraverser
+                 mOut << ";\n";
+                 break;
+             case MetalShaderType::Compute:
+-                ASSERT(0 && "compute shaders not currently supported");
+                 break;
+             default:
+                 break;
+@@ -291,6 +290,7 @@ class ProgramPrelude : public TIntermTraverser
+     void imageLoad();
+     void imageStore();
+     void memoryBarrierImage();
++    void barrier();
+     void interpolateAtCenter();
+     void interpolateAtCentroid();
+     void interpolateAtSample();
+@@ -2900,6 +2900,14 @@ ANGLE_ALWAYS_INLINE auto ANGLE_imageStore(
+ }
+ )")
+ 
++// GLSL barrier() synchronizes the entire workgroup and makes shared writes visible.
++PROGRAM_PRELUDE_DECLARE(barrier, R"(
++ANGLE_ALWAYS_INLINE void ANGLE_barrier()
++{
++    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
++}
++)")
++
+ // TODO(anglebug.com/40096838): When using raster order groups and pixel local storage, which only
+ // accesses the pixel coordinate, we probably only need an execution barrier (mem_flags::mem_none).
+ PROGRAM_PRELUDE_DECLARE(memoryBarrierImage, R"(
+@@ -3880,6 +3888,10 @@ void ProgramPrelude::visitOperator(TOperator op,
+             unpack_half_2x16();
+             break;
+ 
++        case TOperator::EOpBarrier:
++            barrier();
++            break;
++
+         case TOperator::EOpBitfieldExtract:
+         case TOperator::EOpBitfieldInsert:
+         case TOperator::EOpBitfieldReverse:
+@@ -3890,7 +3902,6 @@ void ProgramPrelude::visitOperator(TOperator op,
+         case TOperator::EOpUsubBorrow:
+         case TOperator::EOpUmulExtended:
+         case TOperator::EOpImulExtended:
+-        case TOperator::EOpBarrier:
+         case TOperator::EOpMemoryBarrier:
+         case TOperator::EOpMemoryBarrierAtomicCounter:
+         case TOperator::EOpMemoryBarrierBuffer:
+diff --git a/src/compiler/translator/msl/RewritePipelines.cpp b/src/compiler/translator/msl/RewritePipelines.cpp
+index d45be1a..a7dbf56 100644
+--- a/src/compiler/translator/msl/RewritePipelines.cpp
++++ b/src/compiler/translator/msl/RewritePipelines.cpp
+@@ -145,10 +145,13 @@ class GeneratePipelineStruct : private TIntermRebuild
+                                mPipeline.type == Pipeline::Type::UserUniforms;
+         const bool useAttributeAliasing =
+             mPipeline.type == Pipeline::Type::VertexIn && mCompiler.supportsAttributeAliasing();
+-        const bool modified = TryCreateModifiedStruct(
+-            mCompiler, mSymbolEnv, mIdGen, mPipeline.externalStructModifyConfig(), pipelineStruct,
+-            mPipeline.getStructTypeName(Pipeline::Variant::Modified), modifiedMachineries, isUBO,
+-            !isUniform, useAttributeAliasing);
++        // Shared storage has no external ABI and must never be copied into per-thread storage.
++        const bool modified =
++            mPipeline.type != Pipeline::Type::SharedGlobals &&
++            TryCreateModifiedStruct(mCompiler, mSymbolEnv, mIdGen,
++                                    mPipeline.externalStructModifyConfig(), pipelineStruct,
++                                    mPipeline.getStructTypeName(Pipeline::Variant::Modified),
++                                    modifiedMachineries, isUBO, !isUniform, useAttributeAliasing);
+ 
+         if (modified)
+         {
+@@ -301,6 +304,10 @@ class GeneratePipelineStruct : private TIntermRebuild
+                 for (const TVariable *var : mPipelineVariableList)
+                 {
+                     auto &type = CloneType(var->getType());
++                    if (mPipeline.type == Pipeline::Type::SharedGlobals)
++                    {
++                        type.setQualifier(EvqTemporary);
++                    }
+                     if (mVariableInfos && IsVariableInvariant(*mVariableInfos, var->name()))
+                     {
+                         type.setInvariant(true);
+@@ -338,7 +345,8 @@ PipelineScoped<TVariable> CreatePipelineMainLocalVar(TSymbolTable &symbolTable,
+             symbolTable, *pipelineStruct.external,
+             pipeline.getStructInstanceName(pipelineStruct.isUniform()
+                                                ? Pipeline::Variant::Original
+-                                               : Pipeline::Variant::Modified));
++                                               : Pipeline::Variant::Modified),
++            pipeline.type == Pipeline::Type::SharedGlobals ? EvqShared : EvqTemporary);
+     };
+ 
+     auto populateDistinctInternalMainLocalVar = [&]() {
+@@ -469,7 +477,8 @@ class PipelineFunctionEnv
+                 newFunc                        = &func;
+                 mPipelineMainLocalVar.external = vertexIDMetalVar;
+             }
+-            else if (isMain && (mPipeline.type == Pipeline::Type::InvocationFragmentGlobals))
++            else if (isMain && (mPipeline.type == Pipeline::Type::InvocationFragmentGlobals ||
++                                mPipeline.type == Pipeline::Type::InvocationComputeGlobals))
+             {
+                 std::vector<const TVariable *> variables;
+                 for (const TField *field : mPipelineStruct.external->fields())
+@@ -831,13 +840,18 @@ class UpdatePipelineFunctions : private TIntermRebuild
+                     &AsType(mSymbolEnv, *new TType(TBasicType::EbtInt), *vertexIDMetal));
+                 newBody->appendStatement(assignNode);
+             }
+-            else if (mPipeline.type == Pipeline::Type::InvocationFragmentGlobals)
++            else if (mPipeline.type == Pipeline::Type::InvocationFragmentGlobals ||
++                     mPipeline.type == Pipeline::Type::InvocationComputeGlobals)
+             {
+                 // Populate struct instance with references to global pipeline variables.
++                size_t parameterIndex = mEnv.getFirstParamIdxInMainFn();
+                 for (const TField *field : mPipelineStruct.external->fields())
+                 {
+-                    auto *var        = new TVariable(&mSymbolTable, field->name(), field->type(),
+-                                                     field->symbolType());
++                    const TVariable *var =
++                        mPipeline.type == Pipeline::Type::InvocationComputeGlobals
++                            ? func.getParam(parameterIndex++)
++                            : new TVariable(&mSymbolTable, field->name(), field->type(),
++                                            field->symbolType());
+                     auto *symbol     = new TIntermSymbol(var);
+                     auto &accessNode = AccessField(*mPipelineMainLocalVar.internal, Name(*var));
+                     auto *assignNode = new TIntermBinary(TOperator::EOpAssign, &accessNode, symbol);
+@@ -1076,6 +1090,7 @@ bool sh::RewritePipelines(TCompiler &compiler,
+         {Pipeline::Type::Texture, outStructs.image, nullptr, nullptr},
+         {Pipeline::Type::Image, outStructs.texture, nullptr, nullptr},
+         {Pipeline::Type::NonConstantGlobals, outStructs.nonConstantGlobals, nullptr, nullptr},
++        {Pipeline::Type::SharedGlobals, outStructs.sharedGlobals, nullptr, nullptr},
+         {Pipeline::Type::AngleUniforms, outStructs.angleUniforms,
+          angleUniformsGlobalInstanceVar.getDriverUniformsVariable(), nullptr},
+         {Pipeline::Type::UserUniforms, outStructs.userUniforms, nullptr, nullptr},
+@@ -1087,6 +1102,8 @@ bool sh::RewritePipelines(TCompiler &compiler,
+          nullptr},
+         {Pipeline::Type::InvocationFragmentGlobals, outStructs.invocationFragmentGlobals, nullptr,
+          &inputVaryings},
++        {Pipeline::Type::InvocationComputeGlobals, outStructs.invocationComputeGlobals, nullptr,
++         nullptr},
+         {Pipeline::Type::UniformBuffer, outStructs.uniformBuffers, nullptr, nullptr},
+     };
+ 
+@@ -1099,8 +1116,13 @@ bool sh::RewritePipelines(TCompiler &compiler,
+             (compiler.getShaderType() != GL_FRAGMENT_SHADER &&
+              (info.pipelineType == Pipeline::Type::FragmentIn ||
+               info.pipelineType == Pipeline::Type::FragmentOut ||
+-              info.pipelineType == Pipeline::Type::InvocationFragmentGlobals)))
++              info.pipelineType == Pipeline::Type::InvocationFragmentGlobals)) ||
++            (compiler.getShaderType() != GL_COMPUTE_SHADER &&
++             (info.pipelineType == Pipeline::Type::InvocationComputeGlobals ||
++              info.pipelineType == Pipeline::Type::SharedGlobals)))
++        {
+             continue;
++        }
+ 
+         Pipeline pipeline{info.pipelineType, info.globalInstanceVar};
+         if (!RewritePipeline(compiler, root, idGen, pipeline, symbolEnv, info.variableInfo,
+diff --git a/src/compiler/translator/msl/SymbolEnv.cpp b/src/compiler/translator/msl/SymbolEnv.cpp
+index 4ffc53e..a403e26 100644
+--- a/src/compiler/translator/msl/SymbolEnv.cpp
++++ b/src/compiler/translator/msl/SymbolEnv.cpp
+@@ -18,10 +18,11 @@ using namespace sh;
+ 
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+-constexpr std::array<AddressSpace, 3> kAddressSpaces = {
++constexpr std::array<AddressSpace, 4> kAddressSpaces = {
+     AddressSpace::Constant,
+     AddressSpace::Device,
+     AddressSpace::Thread,
++    AddressSpace::Threadgroup,
+ };
+ 
+ char const *sh::toString(AddressSpace space)
+@@ -34,6 +35,8 @@ char const *sh::toString(AddressSpace space)
+             return "device";
+         case AddressSpace::Thread:
+             return "thread";
++        case AddressSpace::Threadgroup:
++            return "threadgroup";
+     }
+ }
+ 
+diff --git a/src/compiler/translator/msl/SymbolEnv.h b/src/compiler/translator/msl/SymbolEnv.h
+index 804dac4..bc9f84c 100644
+--- a/src/compiler/translator/msl/SymbolEnv.h
++++ b/src/compiler/translator/msl/SymbolEnv.h
+@@ -22,6 +22,7 @@ enum class AddressSpace
+     Constant,
+     Device,
+     Thread,
++    Threadgroup,
+ };
+ 
+ char const *toString(AddressSpace space);
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 64ec28e..d50079a 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -859,7 +859,6 @@ static inline MetalShaderType metalShaderTypeFromGLSL(sh::GLenum shaderType)
+         case GL_FRAGMENT_SHADER:
+             return MetalShaderType::Fragment;
+         case GL_COMPUTE_SHADER:
+-            ASSERT(0 && "compute shaders not currently supported");
+             return MetalShaderType::Compute;
+         default:
+             ASSERT(0 && "Invalid shader type.");
+@@ -963,18 +962,21 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         }
+     }
+ 
+-    ASSERT(getShaderType() != GL_COMPUTE_SHADER && "compute shaders not currently supported");
+-
+     if (compileOptions.useIR)
+     {
+         driverUniforms->findDeclarationAddedByIR(root);
+     }
++    else if (getShaderType() == GL_COMPUTE_SHADER)
++    {
++        driverUniforms->addComputeDriverUniformsToShader(root, &getSymbolTable());
++    }
+     else
+     {
+         driverUniforms->addGraphicsDriverUniformsToShader(root, &getSymbolTable());
+     }
+ 
+-    if (!ReplaceGLDepthRangeWithDriverUniform(this, root, driverUniforms, &getSymbolTable()))
++    if (getShaderType() != GL_COMPUTE_SHADER &&
++        !ReplaceGLDepthRangeWithDriverUniform(this, root, driverUniforms, &getSymbolTable()))
+     {
+         return false;
+     }
+@@ -1008,6 +1010,20 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+             AddBuiltInDeclaration(*root, symbolTable, *BuiltInVariable::gl_VertexID());
+         }
+     }
++    if (getShaderType() == GL_COMPUTE_SHADER)
++    {
++        const TVariable *builtins[] = {
++            BuiltInVariable::gl_NumWorkGroups(), BuiltInVariable::gl_WorkGroupID(),
++            BuiltInVariable::gl_LocalInvocationID(), BuiltInVariable::gl_GlobalInvocationID(),
++            BuiltInVariable::gl_LocalInvocationIndex()};
++        for (const TVariable *builtin : builtins)
++        {
++            if (FindSymbolNode(root, builtin->name()))
++            {
++                AddBuiltInDeclaration(*root, symbolTable, *builtin);
++            }
++        }
++    }
+     SymbolEnv symbolEnv(*this, *root);
+ 
+     bool usesSampleMask = false;
+@@ -1343,12 +1359,18 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+     // as an incoming argument.
+     mValidateASTOptions.validateQualifiers = false;
+ 
++    // Pipeline rewriting lifts global declarations before replacing all uses.
++    // Check variable identity again after the coordinated rewrite is complete.
++    const bool validateVariableReferences          = mValidateASTOptions.validateVariableReferences;
++    mValidateASTOptions.validateVariableReferences = false;
++
+     PipelineStructs pipelineStructs;
+     if (!RewritePipelines(*this, *root, getInputVaryings(), getOutputVaryings(), idGen,
+                           *driverUniforms, symbolEnv, pipelineStructs))
+     {
+         return false;
+     }
++    mValidateASTOptions.validateVariableReferences = validateVariableReferences;
+     if (getShaderType() == GL_VERTEX_SHADER)
+     {
+         // This has to happen after RewritePipelines.
+diff --git a/src/compiler/translator/tree_util/DriverUniform.cpp b/src/compiler/translator/tree_util/DriverUniform.cpp
+index b89d7ed..669d852 100644
+--- a/src/compiler/translator/tree_util/DriverUniform.cpp
++++ b/src/compiler/translator/tree_util/DriverUniform.cpp
+@@ -71,11 +71,22 @@ void DriverUniform::addComputeDriverUniformsToShader(TIntermBlock *root, TSymbol
+     layoutQualifier.blockStorage     = EbsStd140;
+     layoutQualifier.pushConstant     = true;
+ 
+-    const TInterfaceBlock *interfaceBlock = DeclareInterfaceBlock(
+-        symbolTable, driverFieldList, layoutQualifier, kDriverUniformsBlockName);
+-    mDriverUniforms = DeclareInterfaceBlockVariable(root, symbolTable, EvqUniform, interfaceBlock,
+-                                                    layoutQualifier, TMemoryQualifier::Create(), 0,
+-                                                    kDriverUniformsVarName);
++    if (mMode == DriverUniformMode::InterfaceBlock)
++    {
++        const TInterfaceBlock *interfaceBlock = DeclareInterfaceBlock(
++            symbolTable, driverFieldList, layoutQualifier, kDriverUniformsBlockName);
++        mDriverUniforms = DeclareInterfaceBlockVariable(
++            root, symbolTable, EvqUniform, interfaceBlock, layoutQualifier,
++            TMemoryQualifier::Create(), 0, kDriverUniformsVarName);
++    }
++    else
++    {
++        const ImmutableString varName(kDriverUniformsVarNameMSL);
++        auto result =
++            DeclareStructure(root, symbolTable, driverFieldList, EvqUniform,
++                             TMemoryQualifier::Create(), 0, kDriverUniformsBlockName, &varName);
++        mDriverUniforms = result.second;
++    }
+ }
+ 
+ TFieldList *DriverUniform::createUniformFields(TSymbolTable *symbolTable)
+diff --git a/src/tests/angle_white_box_tests.gni b/src/tests/angle_white_box_tests.gni
+index 12adb1c..fdf6fbd 100644
+--- a/src/tests/angle_white_box_tests.gni
++++ b/src/tests/angle_white_box_tests.gni
+@@ -25,5 +25,6 @@ angle_white_box_tests_vulkan_sources = [
+ ]
+ angle_white_box_tests_metal_sources = [
+   "gl_tests/BufferPoolTestMetal.mm",
++  "gl_tests/ComputeShaderTestMetal.mm",
+   "gl_tests/IndirectCommandTestMetal.mm",
+ ]
+diff --git a/src/tests/compiler_tests/MSLOutput_test.cpp b/src/tests/compiler_tests/MSLOutput_test.cpp
+index 63caf4d..3e6ec87 100644
+--- a/src/tests/compiler_tests/MSLOutput_test.cpp
++++ b/src/tests/compiler_tests/MSLOutput_test.cpp
+@@ -52,6 +52,66 @@ class MSLVertexOutputTest : public MSLOutputTestBase
+     MSLVertexOutputTest() : MSLOutputTestBase(GL_VERTEX_SHADER) {}
+ };
+ 
++class MSLComputeOutputTest : public MSLOutputTestBase
++{
++  public:
++    MSLComputeOutputTest() : MSLOutputTestBase(GL_COMPUTE_SHADER) {}
++};
++
++TEST_F(MSLComputeOutputTest, EmptyKernel)
++{
++    compile(R"(#version 310 es
++        layout(local_size_x = 2, local_size_y = 3, local_size_z = 4) in;
++        void main() {}
++    )");
++    EXPECT_TRUE(foundInCode("kernel void main0("));
++}
++
++// Kernel inputs must be forwarded through helper functions without creating
++// module-scope per-invocation variables or graphics stage inputs.
++TEST_F(MSLComputeOutputTest, InvocationBuiltinsInHelper)
++{
++    compile(R"(#version 310 es
++        layout(local_size_x = 2, local_size_y = 3, local_size_z = 4) in;
++        layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D result;
++        uvec4 values() {
++            return uvec4(gl_WorkGroupID + gl_LocalInvocationID + gl_NumWorkGroups,
++                         gl_LocalInvocationIndex + gl_WorkGroupSize.z);
++        }
++        void main() {
++            imageStore(result, ivec2(gl_GlobalInvocationID.xy), values());
++        }
++    )");
++    EXPECT_TRUE(foundInCode("[[threadgroups_per_grid]]"));
++    EXPECT_TRUE(foundInCode("[[threadgroup_position_in_grid]]"));
++    EXPECT_TRUE(foundInCode("[[thread_position_in_threadgroup]]"));
++    EXPECT_TRUE(foundInCode("[[thread_position_in_grid]]"));
++    EXPECT_TRUE(foundInCode("[[thread_index_in_threadgroup]]"));
++    EXPECT_TRUE(notFoundInCode("[[stage_in]]"));
++    EXPECT_TRUE(notFoundInCode("gl_WorkGroupSize"));
++}
++
++TEST_F(MSLComputeOutputTest, SharedMemoryInHelpers)
++{
++    compile(R"(#version 310 es
++        layout(local_size_x = 64) in;
++        layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D result;
++        shared uint scratch[64];
++        void storeValue(uint i) { scratch[i] = i; }
++        uint loadValue(uint i) { return scratch[63u - i]; }
++        void synchronize() { barrier(); }
++        void main() {
++            storeValue(gl_LocalInvocationIndex);
++            synchronize();
++            imageStore(result, ivec2(gl_LocalInvocationIndex, 0),
++                       uvec4(loadValue(gl_LocalInvocationIndex)));
++        }
++    )");
++    EXPECT_TRUE(foundInCode("threadgroup ANGLE_SharedGlobals"));
++    EXPECT_TRUE(foundInCode("threadgroup_barrier(metal::mem_flags::mem_threadgroup)"));
++    EXPECT_TRUE(notFoundInCode("simdgroup_barrier"));
++}
++
+ // Test that having dynamic indexing of a vector inside the right hand side of logical or doesn't
+ // trigger asserts in MSL output.
+ TEST_F(MSLOutputTest, DynamicIndexingOfVectorOnRightSideOfLogicalOr)
+diff --git a/src/tests/gl_tests/ComputeShaderTestMetal.mm b/src/tests/gl_tests/ComputeShaderTestMetal.mm
+new file mode 100644
+index 0000000..2c98e9d
+--- /dev/null
++++ b/src/tests/gl_tests/ComputeShaderTestMetal.mm
+@@ -0,0 +1,342 @@
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Execute MSL translated from GLSL compute shaders without enabling an
++// incomplete public GLES profile. GL program/dispatch tests are separate.
++
++#ifdef UNSAFE_BUFFERS_BUILD
++#    pragma allow_unsafe_buffers
++#endif
++
++#include "test_utils/ANGLETest.h"
++
++#include <cstring>
++#include <memory>
++
++#include "GLSLANG/ShaderLang.h"
++#include "compiler/translator/msl/TranslatorMSL.h"
++#include "libANGLE/Context.h"
++#include "libANGLE/Display.h"
++#include "libANGLE/renderer/metal/ContextMtl.h"
++#include "libANGLE/renderer/metal/DisplayMtl.h"
++
++using namespace angle;
++using namespace rx;
++
++namespace
++{
++
++constexpr char kInvocationShader[] = R"(#version 310 es
++precision highp int;
++layout(local_size_x = 4, local_size_y = 3, local_size_z = 2) in;
++layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D globalResult;
++layout(rgba32ui, binding = 1) uniform writeonly highp uimage2D groupResult;
++
++uvec4 globals() {
++    bool gridMatches = all(equal(gl_NumWorkGroups, uvec3(3, 2, 2)));
++    bool localSizeMatches = all(equal(gl_WorkGroupSize, uvec3(4, 3, 2)));
++    return uvec4(gl_GlobalInvocationID,
++                 gridMatches && localSizeMatches ? gl_LocalInvocationIndex : 0xffffffffu);
++}
++uvec4 groups() {
++    uint localCode = gl_LocalInvocationID.x + 7u * gl_LocalInvocationID.y +
++                     31u * gl_LocalInvocationID.z;
++    return uvec4(gl_WorkGroupID, localCode);
++}
++void main() {
++    ivec2 pixel = ivec2(gl_GlobalInvocationID.x,
++                       gl_GlobalInvocationID.y + 6u * gl_GlobalInvocationID.z);
++    imageStore(globalResult, pixel, globals());
++    imageStore(groupResult, pixel, groups());
++}
++)";
++
++constexpr char kDispatchProducer[] = R"(#version 310 es
++precision highp int;
++layout(local_size_x = 1) in;
++layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D result;
++void main() { imageStore(result, ivec2(0), uvec4(3, 2, 2, 0)); }
++)";
++
++constexpr char kSharedProducer[] = R"(#version 310 es
++precision highp int;
++layout(local_size_x = 128) in;
++layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D result;
++void main() {
++    imageStore(result, ivec2(gl_LocalInvocationIndex, gl_WorkGroupID.x),
++               uvec4(1000u * gl_WorkGroupID.x + 17u));
++}
++)";
++
++// 128 threads span multiple SIMD groups, including 64-wide Metal hardware. Each thread reads a
++// different thread's value, twice, with group-specific seeds to detect leaks
++// between groups as well as missing execution or memory synchronization.
++constexpr char kSharedShader[] = R"(#version 310 es
++precision highp int;
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 2) in;
++layout(rgba32ui, binding = 0) uniform writeonly highp uimage2D result;
++layout(rgba32ui, binding = 1) uniform readonly highp uimage2D sourceImage;
++shared uint scratch[128];
++uint readPartner(uint index) { return scratch[127u - index]; }
++void writeValue(uint index, uint value) { scratch[index] = value; }
++void synchronize() { barrier(); }
++void main() {
++    uint index = gl_LocalInvocationIndex;
++    uint seed = imageLoad(sourceImage, ivec2(index, gl_WorkGroupID.x)).x;
++    writeValue(index, seed + index);
++    synchronize();
++    uint first = readPartner(index);
++    // Prevent a fast thread overwriting a value still needed by another.
++    synchronize();
++    writeValue(index, first + 100u);
++    synchronize();
++    uint second = readPartner(index);
++    imageStore(result, ivec2(index, gl_WorkGroupID.x),
++               uvec4(first, second, index, gl_WorkGroupID.x));
++}
++)";
++
++struct ComputeKernel
++{
++    angle::ObjCPtr<id<MTLLibrary>> library;
++    angle::ObjCPtr<id<MTLComputePipelineState>> pipeline;
++    MTLSize localSize;
++    std::array<int, 8> imageBindings;
++};
++
++class ComputeShaderTestMetal : public ANGLETest<>
++{
++  protected:
++    ComputeShaderTestMetal()
++    {
++        setWindowWidth(8);
++        setWindowHeight(8);
++    }
++
++    ContextMtl *contextMtl()
++    {
++        auto *display    = static_cast<egl::Display *>(getEGLWindow()->getDisplay());
++        gl::ContextID id = {
++            static_cast<GLuint>(reinterpret_cast<uintptr_t>(getEGLWindow()->getContext()))};
++        return mtl::GetImpl(display->getContext(id));
++    }
++
++    void compileKernel(const char *source, ComputeKernel *result)
++    {
++        ASSERT_TRUE(sh::Initialize());
++        ShBuiltInResources resources;
++        sh::InitBuiltInResources(&resources);
++        std::unique_ptr<void, decltype(&sh::Destruct)> compiler(
++            sh::ConstructCompiler(GL_COMPUTE_SHADER, SH_GLES3_1_SPEC, SH_MSL_METAL_OUTPUT,
++                                  &resources),
++            sh::Destruct);
++        ASSERT_NE(compiler, nullptr);
++        ShCompileOptions options                     = {};
++        options.objectCode                           = true;
++        options.validateAST                          = true;
++        options.rescopeGlobalVariables               = true;
++        options.simplifyLoopConditions               = true;
++        options.initializeUninitializedLocals        = true;
++        options.separateCompoundStructDeclarations   = true;
++        options.forceDeferNonConstGlobalInitializers = true;
++        options.removeInactiveVariables              = true;
++        ASSERT_TRUE(sh::Compile(compiler.get(), &source, 1, options))
++            << sh::GetInfoLog(compiler.get());
++        const auto size = sh::GetComputeShaderLocalGroupSize(compiler.get());
++        ASSERT_GT(size[0], 0);
++        ASSERT_GT(size[1], 0);
++        ASSERT_GT(size[2], 0);
++        result->localSize = MTLSizeMake(size[0], size[1], size[2]);
++
++        auto *translator = static_cast<sh::TShHandleBase *>(compiler.get())->getAsTranslatorMSL();
++        ASSERT_NE(translator, nullptr);
++        for (size_t binding = 0; binding < result->imageBindings.size(); ++binding)
++        {
++            result->imageBindings[binding] =
++                translator->getTranslatorMetalReflection()->getRWTextureBinding(binding);
++        }
++
++        const std::string &msl             = sh::GetObjectCode(compiler.get());
++        auto metalOptions                  = angle::adoptObjCPtr([[MTLCompileOptions alloc] init]);
++        metalOptions.get().languageVersion = MTLLanguageVersion2_1;
++        NSError *error                     = nil;
++        result->library                    = angle::adoptObjCPtr([contextMtl()->getMetalDevice()
++            newLibraryWithSource:[NSString stringWithUTF8String:msl.c_str()]
++                         options:metalOptions.get()
++                           error:&error]);
++        ASSERT_NE(result->library.get(), nil)
++            << (error ? error.localizedDescription.UTF8String : "") << "\n"
++            << msl;
++        auto function = angle::adoptObjCPtr([result->library.get() newFunctionWithName:@"main0"]);
++        ASSERT_NE(function.get(), nil);
++        result->pipeline = angle::adoptObjCPtr([contextMtl()->getMetalDevice()
++            newComputePipelineStateWithFunction:function.get()
++                                          error:&error]);
++        ASSERT_NE(result->pipeline.get(), nil)
++            << (error ? error.localizedDescription.UTF8String : "");
++    }
++
++    mtl::TextureRef image(size_t width, size_t height)
++    {
++        auto desc              = angle::adoptObjCPtr([[MTLTextureDescriptor alloc] init]);
++        desc.get().pixelFormat = MTLPixelFormatRGBA32Uint;
++        desc.get().width       = width;
++        desc.get().height      = height;
++        desc.get().storageMode = MTLStorageModePrivate;
++        desc.get().usage       = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++        auto texture           = angle::adoptObjCPtr(
++            [contextMtl()->getMetalDevice() newTextureWithDescriptor:desc.get()]);
++        return mtl::Texture::MakeFromMetal(texture.get());
++    }
++
++    void runSharedMemory()
++    {
++        ComputeKernel kernel, producer;
++        ASSERT_NO_FATAL_FAILURE(compileKernel(kSharedShader, &kernel));
++        ASSERT_NO_FATAL_FAILURE(compileKernel(kSharedProducer, &producer));
++        ASSERT_GE(producer.imageBindings[0], 0);
++        ASSERT_GE(kernel.imageBindings[0], 0);
++        ASSERT_GE(kernel.imageBindings[1], 0);
++        // Ensure this regression actually spans SIMD groups on the tested GPU.
++        ASSERT_GT(kernel.localSize.width * kernel.localSize.height * kernel.localSize.depth,
++                  kernel.pipeline.get().threadExecutionWidth);
++        ASSERT_GT(kernel.pipeline.get().staticThreadgroupMemoryLength, 0u);
++        ContextMtl *context = contextMtl();
++        auto result         = image(128, 4);
++        auto source         = image(128, 4);
++        ASSERT_NE(result, nullptr);
++        ASSERT_NE(source, nullptr);
++        context->getComputeCommandEncoder()
++            ->setComputePipelineState(producer.pipeline.get())
++            .setTextureForWrite(source, producer.imageBindings[0])
++            .dispatch(MTLSizeMake(4, 1, 1), producer.localSize);
++        context->getComputeCommandEncoder()
++            ->setComputePipelineState(kernel.pipeline.get())
++            .setTextureForWrite(result, kernel.imageBindings[0])
++            .setTexture(source, kernel.imageBindings[1])
++            .dispatch(MTLSizeMake(4, 1, 1), kernel.localSize);
++        constexpr size_t kRow = 128 * 4 * sizeof(uint32_t);
++        mtl::BufferRef readback;
++        ASSERT_EQ(mtl::Buffer::MakeBuffer(context, 4 * kRow, &readback), angle::Result::Continue);
++        context->getBlitCommandEncoder()->copyTextureToBuffer(
++            result, 0, mtl::MipmapNativeLevel(0), MTLOriginMake(0, 0, 0), MTLSizeMake(128, 4, 1),
++            readback, 0, kRow, 4 * kRow, MTLBlitOptionNone);
++        auto data = readback->mapReadOnly(context);
++        ASSERT_GE(data.size(), 4 * kRow);
++        for (uint32_t group = 0; group < 4; ++group)
++        {
++            for (uint32_t index = 0; index < 128; ++index)
++            {
++                std::array<uint32_t, 4> actual;
++                std::memcpy(actual.data(), data.data() + group * kRow + index * sizeof(actual),
++                            sizeof(actual));
++                const uint32_t seed                    = 1000 * group + 17;
++                const std::array<uint32_t, 4> expected = {seed + 127 - index, seed + index + 100,
++                                                          index, group};
++                EXPECT_EQ(actual, expected) << group << ":" << index;
++            }
++        }
++        readback->unmap(context);
++        EXPECT_EQ(context->checkCommandBufferError(), angle::Result::Continue);
++    }
++
++    void runInvocations(bool indirect)
++    {
++        ComputeKernel kernel;
++        ASSERT_NO_FATAL_FAILURE(compileKernel(kInvocationShader, &kernel));
++        ASSERT_GE(kernel.imageBindings[0], 0);
++        ASSERT_GE(kernel.imageBindings[1], 0);
++        ContextMtl *context = contextMtl();
++        auto globalResult   = image(12, 24);
++        auto groupResult    = image(12, 24);
++        ASSERT_NE(globalResult, nullptr);
++        ASSERT_NE(groupResult, nullptr);
++
++        mtl::BufferRef arguments;
++        if (indirect)
++        {
++            ComputeKernel producer;
++            ASSERT_NO_FATAL_FAILURE(compileKernel(kDispatchProducer, &producer));
++            ASSERT_GE(producer.imageBindings[0], 0);
++            auto dispatchImage = image(1, 1);
++            ASSERT_EQ(mtl::Buffer::MakeBufferWithStorageMode(context, MTLStorageModePrivate, 512,
++                                                             &arguments),
++                      angle::Result::Continue);
++            context->getComputeCommandEncoder()
++                ->setComputePipelineState(producer.pipeline.get())
++                .setTextureForWrite(dispatchImage, producer.imageBindings[0])
++                .dispatch(MTLSizeMake(1, 1, 1), producer.localSize);
++            context->getBlitCommandEncoder()->copyTextureToBuffer(
++                dispatchImage, 0, mtl::MipmapNativeLevel(0), MTLOriginMake(0, 0, 0),
++                MTLSizeMake(1, 1, 1), arguments, 256, 256, 256, MTLBlitOptionNone);
++        }
++
++        auto *compute = context->getComputeCommandEncoder();
++        compute->setComputePipelineState(kernel.pipeline.get())
++            .setTextureForWrite(globalResult, kernel.imageBindings[0])
++            .setTextureForWrite(groupResult, kernel.imageBindings[1]);
++        if (indirect)
++        {
++            compute->dispatchIndirect(arguments, 256, kernel.localSize);
++        }
++        else
++        {
++            compute->dispatch(MTLSizeMake(3, 2, 2), kernel.localSize);
++        }
++
++        constexpr size_t kRow   = 256;
++        constexpr size_t kImage = 24 * kRow;
++        mtl::BufferRef readback;
++        ASSERT_EQ(mtl::Buffer::MakeBuffer(context, 2 * kImage, &readback), angle::Result::Continue);
++        auto *blit = context->getBlitCommandEncoder();
++        blit->copyTextureToBuffer(globalResult, 0, mtl::MipmapNativeLevel(0),
++                                  MTLOriginMake(0, 0, 0), MTLSizeMake(12, 24, 1), readback, 0, kRow,
++                                  kImage, MTLBlitOptionNone);
++        blit->copyTextureToBuffer(groupResult, 0, mtl::MipmapNativeLevel(0), MTLOriginMake(0, 0, 0),
++                                  MTLSizeMake(12, 24, 1), readback, kImage, kRow, kImage,
++                                  MTLBlitOptionNone);
++        auto data = readback->mapReadOnly(context);
++        ASSERT_GE(data.size(), 2 * kImage);
++        for (uint32_t z = 0; z < 4; ++z)
++        {
++            for (uint32_t y = 0; y < 6; ++y)
++            {
++                for (uint32_t x = 0; x < 12; ++x)
++                {
++                    std::array<uint32_t, 4> global, group;
++                    const size_t offset = (y + 6 * z) * kRow + x * sizeof(global);
++                    std::memcpy(global.data(), data.data() + offset, sizeof(global));
++                    std::memcpy(group.data(), data.data() + kImage + offset, sizeof(group));
++                    const std::array<uint32_t, 4> expectedGlobal = {
++                        x, y, z, x % 4 + 4 * (y % 3 + 3 * (z % 2))};
++                    const std::array<uint32_t, 4> expectedGroup = {
++                        x / 4, y / 3, z / 2, x % 4 + 7 * (y % 3) + 31 * (z % 2)};
++                    EXPECT_EQ(global, expectedGlobal) << x << ":" << y << ":" << z;
++                    EXPECT_EQ(group, expectedGroup) << x << ":" << y << ":" << z;
++                }
++            }
++        }
++        readback->unmap(context);
++        EXPECT_EQ(context->checkCommandBufferError(), angle::Result::Continue);
++    }
++};
++
++TEST_P(ComputeShaderTestMetal, GLSLSharedMemoryAcrossSIMDGroups)
++{
++    runSharedMemory();
++}
++
++TEST_P(ComputeShaderTestMetal, GLSLInvocationBuiltins)
++{
++    runInvocations(false);
++}
++
++TEST_P(ComputeShaderTestMetal, GLSLGPUGeneratedDispatch)
++{
++    runInvocations(true);
++}
++
++}  // namespace
++
++ANGLE_INSTANTIATE_TEST(ComputeShaderTestMetal, ES3_METAL());

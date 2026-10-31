@@ -1,0 +1,363 @@
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+index 4b7aa5e..122119c 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+@@ -130,6 +130,7 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+     {
+         return mMslShaderTranslateInfo[gl::ShaderType::Compute];
+     }
++    angle::Result initializeComputePipelineForLink(mtl::Context *context, gl::InfoLog &infoLog);
+     angle::Result getComputePipeline(ContextMtl *context,
+                                      angle::ObjCPtr<id<MTLComputePipelineState>> *pipelineOut);
+ 
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index d2fcd3d..588a28d 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -924,6 +924,47 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+     mComputePipeline            = nil;
+ }
+ 
++angle::Result ProgramExecutableMtl::initializeComputePipelineForLink(mtl::Context *context,
++                                                                     gl::InfoLog &infoLog)
++{
++    ANGLE_MTL_OBJC_SCOPE
++    {
++        const auto &info = getComputeShaderInfo();
++        auto function = angle::adoptObjCPtr([info.metalLibrary.get() newFunctionWithName:@"main0"]);
++        if (!function)
++        {
++            infoLog << "Metal compute entry point is missing.";
++            return angle::Result::Stop;
++        }
++        id<MTLDevice> device = context->getDisplay()->getMetalDevice();
++        NSError *error       = nil;
++        auto pipeline =
++            angle::adoptObjCPtr([device newComputePipelineStateWithFunction:function.get()
++                                                                      error:&error]);
++        if (!pipeline || error)
++        {
++            infoLog << "Metal compute pipeline creation failed: "
++                    << (error ? error.localizedDescription.UTF8String : "unknown error");
++            return angle::Result::Stop;
++        }
++        const auto &size         = mExecutable->getComputeShaderLocalSize();
++        const size_t invocations = size_t(size[0]) * size_t(size[1]) * size_t(size[2]);
++        if (invocations > pipeline.get().maxTotalThreadsPerThreadgroup)
++        {
++            infoLog << "Compute local size exceeds the Metal pipeline's threadgroup limit.";
++            return angle::Result::Stop;
++        }
++        if (pipeline.get().staticThreadgroupMemoryLength > device.maxThreadgroupMemoryLength)
++        {
++            infoLog << "Compute static threadgroup memory exceeds the Metal device limit.";
++            return angle::Result::Stop;
++        }
++        mComputeFunction = std::move(function);
++        mComputePipeline = std::move(pipeline);
++        return angle::Result::Continue;
++    }
++}
++
+ angle::Result ProgramExecutableMtl::getComputePipeline(
+     ContextMtl *context,
+     angle::ObjCPtr<id<MTLComputePipelineState>> *pipelineOut)
+@@ -944,6 +985,13 @@ void ReadFromDefaultUniformBlockWithElementSize(int componentCount,
+         ANGLE_TRY(context->getPipelineCache().getComputePipeline(context, mComputeFunction.get(),
+                                                                  &mComputePipeline));
+     }
++    else
++    {
++        // Publish the linked state into this context's normal pipeline cache.
++        // Linking may run on a worker and must not touch that cache there.
++        ANGLE_TRY(context->getPipelineCache().getComputePipeline(
++            context, mComputeFunction.get(), &mComputePipeline, mComputePipeline.get()));
++    }
+     *pipelineOut = mComputePipeline;
+     return angle::Result::Continue;
+ }
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index cdc0a74..d9644ae 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -57,16 +57,32 @@
+   public:
+     CompileMslTask(DisplayMtl *displayMtl,
+                    mtl::TranslatedShaderInfo *translatedMslInfo,
+-                   const std::map<std::string, std::string> &substitutionMacros)
++                   const std::map<std::string, std::string> &substitutionMacros,
++                   ProgramExecutableMtl *computeExecutable)
+         : mtl::Context(displayMtl),
+           mTranslatedMslInfo(translatedMslInfo),
+-          mSubstitutionMacros(substitutionMacros)
++          mSubstitutionMacros(substitutionMacros),
++          mComputeExecutable(computeExecutable)
+     {}
+     ~CompileMslTask() override = default;
+ 
+     void operator()() override
+     {
+-        mResult = CreateMslShaderLib(this, mInfoLog, mTranslatedMslInfo, mSubstitutionMacros);
++        // The synchronous path executes before publishing this subtask. A
++        // later scheduler invocation then only collects its stored result.
++        if (mHasRun)
++        {
++            return;
++        }
++        mHasRun = true;
++        if (!mTranslatedMslInfo->metalLibrary)
++        {
++            mResult = CreateMslShaderLib(this, mInfoLog, mTranslatedMslInfo, mSubstitutionMacros);
++        }
++        if (mResult == angle::Result::Continue && mComputeExecutable)
++        {
++            mResult = mComputeExecutable->initializeComputePipelineForLink(this, mInfoLog);
++        }
+     }
+ 
+     angle::Result getResult(const gl::Context *context, gl::InfoLog &infoLog) override
+@@ -75,6 +91,16 @@ void operator()() override
+         {
+             infoLog << mInfoLog.str();
+         }
++        if (mErrorCode == GL_INVALID_OPERATION)
++        {
++            // A native compiler rejection is a link failure, not a GL API
++            // validation error. Keep its diagnostic in the program log.
++            if (mInfoLog.empty())
++            {
++                infoLog << mErrorMessage;
++            }
++            return angle::Result::Stop;
++        }
+         if (mErrorCode != GL_NO_ERROR)
+         {
+             mtl::GetImpl(context)->handleError(mErrorCode, mErrorMessage.c_str(), mErrorFile,
+@@ -101,6 +127,8 @@ void handleError(GLenum glErrorCode,
+   private:
+     mtl::TranslatedShaderInfo *mTranslatedMslInfo;
+     std::map<std::string, std::string> mSubstitutionMacros;
++    ProgramExecutableMtl *mComputeExecutable;
++    bool mHasRun          = false;
+     angle::Result mResult = angle::Result::Continue;
+     gl::InfoLog mInfoLog;
+     GLenum mErrorCode = GL_NO_ERROR;
+@@ -314,7 +342,6 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+     std::vector<std::shared_ptr<LinkSubTask>> *subTasksOut)
+ {
+     ANGLE_TRACE_EVENT0("gpu.angle", "ProgramMtl::compileMslShaderLibs");
+-    gl::InfoLog &infoLog = mState.getExecutable().getInfoLog();
+ 
+     DisplayMtl *displayMtl              = context->getDisplay();
+     ProgramExecutableMtl *executableMtl = getExecutable();
+@@ -337,16 +364,16 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+         translateInfo->metalLibrary = libraryCache.get(translateInfo->metalShaderSource, macros,
+                                                        disableFastMath, usesInvariance);
+ 
+-        if (!translateInfo->metalLibrary)
++        const bool compute = shaderType == gl::ShaderType::Compute;
++        if (!translateInfo->metalLibrary || compute)
+         {
+-            if (asyncCompile)
+-            {
+-                subTasksOut->emplace_back(new CompileMslTask(displayMtl, translateInfo, macros));
+-            }
+-            else
++            auto task = std::make_shared<CompileMslTask>(displayMtl, translateInfo, macros,
++                                                         compute ? executableMtl : nullptr);
++            if (!asyncCompile)
+             {
+-                ANGLE_TRY(CreateMslShaderLib(context, infoLog, translateInfo, macros));
++                (*task)();
+             }
++            subTasksOut->push_back(std::move(task));
+         }
+     }
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_pipeline_cache.h b/src/libANGLE/renderer/metal/mtl_pipeline_cache.h
+index b5bf77c..ab75ff5 100644
+--- a/src/libANGLE/renderer/metal/mtl_pipeline_cache.h
++++ b/src/libANGLE/renderer/metal/mtl_pipeline_cache.h
+@@ -65,7 +65,8 @@ class PipelineCache : angle::NonCopyable
+     angle::Result getComputePipeline(
+         ContextMtl *context,
+         id<MTLFunction> computeShader,
+-        angle::ObjCPtr<id<MTLComputePipelineState>> *outComputePipeline);
++        angle::ObjCPtr<id<MTLComputePipelineState>> *outComputePipeline,
++        id<MTLComputePipelineState> precompiledPipeline = nil);
+ 
+   private:
+     static constexpr unsigned int kMaxPipelines = 128;
+diff --git a/src/libANGLE/renderer/metal/mtl_pipeline_cache.mm b/src/libANGLE/renderer/metal/mtl_pipeline_cache.mm
+index 5f4d5e9..48f2cfd 100644
+--- a/src/libANGLE/renderer/metal/mtl_pipeline_cache.mm
++++ b/src/libANGLE/renderer/metal/mtl_pipeline_cache.mm
+@@ -227,7 +227,8 @@ bool HasValidRenderTarget(const mtl::ContextDevice &device,
+ angle::Result PipelineCache::getComputePipeline(
+     ContextMtl *context,
+     id<MTLFunction> computeShader,
+-    angle::ObjCPtr<id<MTLComputePipelineState>> *outComputePipeline)
++    angle::ObjCPtr<id<MTLComputePipelineState>> *outComputePipeline,
++    id<MTLComputePipelineState> precompiledPipeline)
+ {
+     PipelineKey key;
+     key.computeShader = std::move(computeShader);
+@@ -244,7 +245,14 @@ bool HasValidRenderTarget(const mtl::ContextDevice &device,
+     angle::TrimCache(kMaxPipelines, kGCLimit, "render pipeline", &mPipelineCache);
+ 
+     PipelineVariant newPipeline;
+-    ANGLE_TRY(CreateComputePipelineState(context, key, &newPipeline.computePipeline));
++    if (precompiledPipeline)
++    {
++        newPipeline.computePipeline = precompiledPipeline;
++    }
++    else
++    {
++        ANGLE_TRY(CreateComputePipelineState(context, key, &newPipeline.computePipeline));
++    }
+ 
+     iter = mPipelineCache.Put(std::move(key), std::move(newPipeline));
+ 
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index a81f20e..a1f42b2 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1706,6 +1706,130 @@ TEST_P(ComputeDispatchTestMetal, IntegerBuiltinsAndStorageOutArguments)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++class ComputeLinkValidationTestMetal : public ComputeDispatchTestMetal
++{};
++
++TEST_P(ComputeLinkValidationTestMetal, RejectOversizedNativeSharedMemoryAtLink)
++{
++    GLint sharedLimit = 0;
++    glGetIntegerv(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &sharedLimit);
++    ASSERT_GE(sharedLimit, 16384);
++    // std430 counts this record as 16 bytes. Native Metal float3 tail padding
++    // makes it 32 bytes, exceeding the physical limit only after translation.
++    const std::string source =
++        "#version 310 es\n#define COUNT " + std::to_string(sharedLimit / 32 + 1) + R"(
++        layout(local_size_x=128) in;
++        struct SharedValue { vec3 v; float f; };
++        shared SharedValue scratch[COUNT];
++        layout(std430,binding=0) readonly buffer InputData { vec4 values[COUNT]; } inputData;
++        layout(std430,binding=1) buffer Results { float values[128]; } result;
++        void main() {
++            uint i=gl_LocalInvocationIndex;
++            for (uint j=i;j<uint(COUNT);j+=128u) {
++                scratch[j].v=inputData.values[j].xyz;
++                scratch[j].f=inputData.values[j].w;
++            }
++            barrier();
++            float sum=0.0;
++            for (uint j=i;j<uint(COUNT);j+=128u) {
++                SharedValue v=scratch[(j+1u)%uint(COUNT)];
++                sum+=dot(v.v,vec3(1.0))+v.f;
++            }
++            result.values[i]=sum;
++        }
++    )";
++    GLShader shader(GL_COMPUTE_SHADER);
++    const char *text = source.c_str();
++    glShaderSource(shader, 1, &text, nullptr);
++    glCompileShader(shader);
++    GLint compiled = GL_FALSE;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
++    ASSERT_EQ(compiled, GL_TRUE);
++    GLProgram program;
++    glAttachShader(program, shader);
++    glLinkProgram(program);
++    GLint linked = GL_TRUE;
++    glGetProgramiv(program, GL_LINK_STATUS, &linked);
++    EXPECT_EQ(linked, GL_FALSE);
++    GLint length = 0;
++    glGetProgramiv(program, GL_INFO_LOG_LENGTH, &length);
++    ASSERT_GT(length, 1);
++    std::vector<char> bytes(length);
++    glGetProgramInfoLog(program, length, nullptr, bytes.data());
++    const std::string log(bytes.data());
++    EXPECT_TRUE(log.find("threadgroup") != std::string::npos ||
++                log.find("shared") != std::string::npos)
++        << log;
++    ASSERT_GL_NO_ERROR();
++}
++
++TEST_P(ComputeLinkValidationTestMetal, BinaryCacheAndProgramDeletionBeforeReadback)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x=4) in;
++        layout(std430,binding=0) buffer Results { uvec4 values[4]; } result;
++        shared uvec4 scratch[4];
++        uniform highp uvec4 payload[301];
++        void main() {
++            uint i=gl_LocalInvocationIndex;
++            uvec4 sum=uvec4(0);
++            for (uint j=0u;j<301u;++j) sum+=payload[j]*(j+1u);
++            scratch[i]=sum+i;
++            barrier();
++            result.values[i]=scratch[3u-i];
++        }
++    )";
++    ANGLE_GL_COMPUTE_PROGRAM(program, source);
++    GLProgram restored;
++    reloadProgram(program, restored);
++    GLBuffer result;
++    std::array<uint32_t, 128> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, result);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glUseProgram(restored);
++    for (uint32_t pass = 0; pass < 2; ++pass)
++    {
++        // 4816 bytes exceeds inline constants and deliberately does not have
++        // a 32-byte size. Consecutive pool uploads must remain independent.
++        std::array<uint32_t, 301 * 4> payload;
++        std::array<uint32_t, 4> sums = {};
++        for (uint32_t j = 0; j < 301; ++j)
++        {
++            for (uint32_t lane = 0; lane < 4; ++lane)
++            {
++                const uint32_t value  = 0x10203040u + pass * 31u + j * 12345u + lane * 3u;
++                payload[4 * j + lane] = value;
++                sums[lane] += value * (j + 1u);
++            }
++        }
++        glUniform4uiv(glGetUniformLocation(restored, "payload[0]"), 301, payload.data());
++        glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 0, result, pass * 256, 64);
++        glDispatchCompute(1, 1, 1);
++        for (uint32_t i = 0; i < 4; ++i)
++        {
++            for (uint32_t lane = 0; lane < 4; ++lane)
++            {
++                expected[pass * 64 + 4 * i + lane] = sums[lane] + 3u - i;
++            }
++        }
++    }
++    glUseProgram(0);
++    restored.reset();
++    program.reset();
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    ASSERT_GL_NO_ERROR();
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ class ComputeByteIndirectTestMetal : public ComputeDispatchTestMetal
+ {};
+ 
+@@ -1819,3 +1943,7 @@ ANGLE_INSTANTIATE_TEST(ComputeByteIndirectTestMetal,
+                        ES31_METAL()
+                            .enable(Feature::AlwaysEnableEmulatedMultidrawExtensions)
+                            .disable(Feature::HasCheapRenderPass));
++
++ANGLE_INSTANTIATE_TEST(ComputeLinkValidationTestMetal,
++                       ES31_METAL(),
++                       ES31_METAL().disable(Feature::EnableParallelMtlLibraryCompilation));

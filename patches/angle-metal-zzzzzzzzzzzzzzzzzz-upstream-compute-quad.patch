@@ -1,0 +1,26 @@
+diff --git a/src/tests/gl_tests/ComputeShaderTest.cpp b/src/tests/gl_tests/ComputeShaderTest.cpp
+index 2646edf..eac644d 100644
+--- a/src/tests/gl_tests/ComputeShaderTest.cpp
++++ b/src/tests/gl_tests/ComputeShaderTest.cpp
+@@ -5397,7 +5397,7 @@ void main()
+     ASSERT_GL_NO_ERROR();
+     glBindImageTexture(0, texture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+ 
+-    glDrawArrays(GL_TRIANGLES, 0, 6);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+     ASSERT_GL_NO_ERROR();
+ 
+     // Step 2: load this image through compute
+@@ -5421,9 +5421,11 @@ void main()
+         EXPECT_EQ(1.0, *(ptr + idx));
+     }
+ 
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++
+     // Step3: use the first program sample texture again
+     glUseProgram(program);
+-    glDrawArrays(GL_TRIANGLES, 0, 6);
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+     ASSERT_GL_NO_ERROR();
+ 
+     EXPECT_PIXEL_COLOR_EQ(1, 1, GLColor::white);

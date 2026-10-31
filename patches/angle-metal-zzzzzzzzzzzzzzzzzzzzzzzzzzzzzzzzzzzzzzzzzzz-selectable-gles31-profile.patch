@@ -1,0 +1,236 @@
+diff --git a/gni/angle.gni b/gni/angle.gni
+index 13acd0c..8d0c0e4 100644
+--- a/gni/angle.gni
++++ b/gni/angle.gni
+@@ -253,6 +253,9 @@ declare_args() {
+ 
+   angle_enable_metal = is_apple
+ 
++  # Explicit macOS GLES 3.1/MDI build profile. The baseline stays GLES 3.0.
++  angle_metal_enable_gles31 = false
++
+   # Internal integration tests only. Never use for distributed native packages.
+   angle_metal_enable_compute_tests = false
+ 
+diff --git a/src/libANGLE/renderer/metal/BUILD.gn b/src/libANGLE/renderer/metal/BUILD.gn
+index da7e772..337a22c 100644
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -14,9 +14,14 @@ if (metal_internal_shader_compilation_supported) {
+ assert(is_mac || is_ios)
+ assert(angle_enable_metal)
+ assert(!angle_metal_enable_compute_tests || (is_mac && angle_build_tests))
++assert(!angle_metal_enable_gles31 || is_mac)
++assert(!angle_metal_enable_gles31 || !angle_metal_enable_compute_tests)
+ 
+ config("angle_metal_backend_config") {
+   defines = [ "ANGLE_ENABLE_METAL" ]
++  if (angle_metal_enable_gles31 || angle_metal_enable_compute_tests) {
++    defines += [ "ANGLE_METAL_GLES31" ]
++  }
+   if (angle_metal_enable_compute_tests) {
+     defines += [ "ANGLE_METAL_COMPUTE_TESTS" ]
+   }
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.h b/src/libANGLE/renderer/metal/DisplayMtl.h
+index 7d29fb4..176299d 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.h
++++ b/src/libANGLE/renderer/metal/DisplayMtl.h
+@@ -143,6 +143,7 @@ class DisplayMtl : public DisplayImpl, public ThreadSafeDisplayMtl
+ 
+     // Check whether either of the specified iOS or Mac GPU family is supported
+     bool supportsEitherGPUFamily(uint8_t iOSFamily, uint8_t macFamily) const;
++    bool supportsMetalGLES31() const;
+     bool supportsAppleGPUFamily(uint8_t iOSFamily) const;
+     bool supportsMacGPUFamily(uint8_t macFamily) const;
+     bool supportsDepth24Stencil8PixelFormat() const;
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index b0cfd8c..f7de9d1 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -423,25 +423,44 @@ bool IsMetalDisplayAvailable()
+     }
+ }
+ 
+-gl::Version DisplayMtl::getMaxSupportedESVersion() const
++bool DisplayMtl::supportsMetalGLES31() const
+ {
+ #if defined(ANGLE_METAL_COMPUTE_TESTS)
+-    // Explicitly requested, non-conformant integration profile; normal builds
+-    // retain their production capability gate below.
+-    return gl::Version(3, 1);
+-#else
+-#    if TARGET_OS_SIMULATOR
++    // Preserve the isolated test profile independently of production selection.
++    return true;
++#elif defined(ANGLE_METAL_GLES31) && TARGET_OS_OSX && !TARGET_OS_MACCATALYST
++    // Language-only memory fences require Metal 3.2. Restrict the opt-in profile
++    // to Apple GPUs with the resource features used by the compute/image paths.
++    if (@available(macOS 15.0, *))
++    {
++        return supportsAppleGPUFamily(7) &&
++               mMetalDevice.get().argumentBuffersSupport >= MTLArgumentBuffersTier2 &&
++               mMetalDevice.get().readWriteTextureSupport >= MTLReadWriteTextureTier2 &&
++               mMetalDevice.get().maxThreadsPerThreadgroup.width >= 128 &&
++               mMetalDevice.get().maxThreadgroupMemoryLength >= 16384 &&
++               mMetalDevice.get().maxBufferLength >= (1u << 27);
++    }
++#endif
++    return false;
++}
++
++gl::Version DisplayMtl::getMaxSupportedESVersion() const
++{
++    if (supportsMetalGLES31())
++    {
++        return gl::Version(3, 1);
++    }
++#if TARGET_OS_SIMULATOR
+     // Simulator should be able to support ES3, despite not supporting iOS GPU
+     // Family 3 in its entirety.
+     // FIXME: None of the feature conditions are checked for simulator support.
+     return gl::Version(3, 0);
+-#    else
++#else
+     if (supportsEitherGPUFamily(4, 1))
+     {
+         return mtl::kMaxSupportedGLVersion;
+     }
+     return gl::Version(2, 0);
+-#    endif
+ #endif
+ }
+ 
+@@ -522,6 +541,11 @@ bool IsMetalDisplayAvailable()
+     ANGLE_FEATURE_CONDITION(features, compileJobIsThreadSafe, true);
+     ANGLE_FEATURE_CONDITION(features, linkJobIsThreadSafe, true);
+ 
++    // Selecting the GLES 3.1 build also selects the validated CPU encoding loop
++    // over GPU-resident indirect commands; applications need no test override.
++    ANGLE_FEATURE_CONDITION(features, alwaysEnableEmulatedMultidrawExtensions,
++                            supportsMetalGLES31());
++
+     ANGLE_FEATURE_CONDITION(features, setNeedInitOnInvalidation, true);
+ 
+     // Metal compiler optimizations may remove infinite loops causing crashes later in shader
+@@ -927,54 +951,60 @@ bool IsMetalDisplayAvailable()
+     }
+ 
+     mNativeCaps.maxCombinedShaderOutputResources = 0;
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-    mNativeCaps.maxUniformLocations = maxDefaultUniformVectors + mtl::kMaxShaderSamplers + 4;
+-    mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Compute] = 12;
+-    mNativeCaps.maxCombinedUniformBlocks                        = 2 * mtl::kMaxShaderUBOs + 12;
+-    mNativeCaps.maxUniformBufferBindings                        = mtl::kMaxGLUBOBindings;
+-    mNativeCaps.maxCombinedTextureImageUnits                    = mtl::kMaxGLSamplerBindings;
+-    if (supportsAppleGPUFamily(1))
++#if defined(ANGLE_METAL_GLES31)
++    if (supportsMetalGLES31())
+     {
+-        // Apple GPUs do not impose the 64 KB constant-address-space allocation
+-        // restriction of older Mac GPUs. Keep the frontend's 64 KB ceiling and
+-        // validate the larger blocks in this experimental profile first.
+-        mNativeCaps.maxUniformBlockSize = 64 * 1024;
+-    }
+-    for (gl::ShaderType stage :
+-         {gl::ShaderType::Vertex, gl::ShaderType::Fragment, gl::ShaderType::Compute})
+-    {
+-        mNativeCaps.maxCombinedShaderUniformComponents[stage] =
+-            maxDefaultUniformComponents +
+-            mNativeCaps.maxUniformBlockSize * mNativeCaps.maxShaderUniformBlocks[stage] / 4;
++        mNativeCaps.maxUniformLocations = maxDefaultUniformVectors + mtl::kMaxShaderSamplers + 4;
++        mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Compute] = 12;
++        mNativeCaps.maxCombinedUniformBlocks                        = 2 * mtl::kMaxShaderUBOs + 12;
++        mNativeCaps.maxUniformBufferBindings                        = mtl::kMaxGLUBOBindings;
++        mNativeCaps.maxCombinedTextureImageUnits                    = mtl::kMaxGLSamplerBindings;
++        if (supportsAppleGPUFamily(1))
++        {
++            // Apple GPUs do not impose the 64 KB constant-address-space allocation
++            // restriction of older Mac GPUs. Keep the frontend's 64 KB ceiling and
++            // validate the larger blocks in this experimental profile first.
++            mNativeCaps.maxUniformBlockSize = 64 * 1024;
++        }
++        for (gl::ShaderType stage :
++             {gl::ShaderType::Vertex, gl::ShaderType::Fragment, gl::ShaderType::Compute})
++        {
++            mNativeCaps.maxCombinedShaderUniformComponents[stage] =
++                maxDefaultUniformComponents +
++                mNativeCaps.maxUniformBlockSize * mNativeCaps.maxShaderUniformBlocks[stage] / 4;
++        }
++        mNativeCaps.maxComputeWorkGroupCount = {65535, 65535, 65535};
++        // Use the device dimensions instead of restricting all kernels to the GLES minimum.
++        // Link-time pipeline validation still checks the native kernel's own thread limit.
++        const MTLSize nativeThreadgroupSize = mMetalDevice.get().maxThreadsPerThreadgroup;
++        mNativeCaps.maxComputeWorkGroupSize = {static_cast<GLint>(nativeThreadgroupSize.width),
++                                               static_cast<GLint>(nativeThreadgroupSize.height),
++                                               static_cast<GLint>(nativeThreadgroupSize.depth)};
++        mNativeCaps.maxComputeWorkGroupInvocations =
++            static_cast<GLint>(nativeThreadgroupSize.width);
++        mNativeCaps.maxComputeSharedMemorySize =
++            static_cast<GLint>(mMetalDevice.get().maxThreadgroupMemoryLength);
++        mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Compute] =
++            maxDefaultUniformComponents;
++        mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] =
++            mtl::kMaxComputeStorageBuffers;
++        mNativeCaps.maxCombinedShaderStorageBlocks = mtl::kMaxComputeStorageBuffers;
++        mNativeCaps.maxShaderStorageBufferBindings = mtl::kMaxComputeStorageBuffers;
++        mNativeCaps.maxShaderStorageBlockSize =
++            std::min<GLint64>(mMetalDevice.get().maxBufferLength, 1 << 27);
++        mNativeCaps.shaderStorageBufferOffsetAlignment                  = 256;
++        mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Compute] = mtl::kMaxShaderSamplers;
++        mNativeCaps.maxCombinedShaderOutputResources = mtl::kMaxComputeStorageBuffers + 4;
++        mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Compute] = 1;
++        mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Compute]       = 8;
++        mNativeCaps.maxCombinedAtomicCounterBuffers                        = 1;
++        mNativeCaps.maxCombinedAtomicCounters                              = 8;
++        mNativeCaps.maxAtomicCounterBufferBindings                         = 1;
++        mNativeCaps.maxAtomicCounterBufferSize                             = mtl::kMaxUBOSize;
++        mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute]        = 4;
++        mNativeCaps.maxCombinedImageUniforms                               = 4;
++        mNativeCaps.maxImageUnits = std::max(mNativeCaps.maxImageUnits, 4);
+     }
+-    mNativeCaps.maxComputeWorkGroupCount       = {65535, 65535, 65535};
+-    // Use the device dimensions instead of restricting all kernels to the GLES minimum.
+-    // Link-time pipeline validation still checks the native kernel's own thread limit.
+-    const MTLSize nativeThreadgroupSize        = mMetalDevice.get().maxThreadsPerThreadgroup;
+-    mNativeCaps.maxComputeWorkGroupSize        = {static_cast<GLint>(nativeThreadgroupSize.width),
+-                                                  static_cast<GLint>(nativeThreadgroupSize.height),
+-                                                  static_cast<GLint>(nativeThreadgroupSize.depth)};
+-    mNativeCaps.maxComputeWorkGroupInvocations = static_cast<GLint>(nativeThreadgroupSize.width);
+-    mNativeCaps.maxComputeSharedMemorySize =
+-        static_cast<GLint>(mMetalDevice.get().maxThreadgroupMemoryLength);
+-    mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Compute] = maxDefaultUniformComponents;
+-    mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] = mtl::kMaxComputeStorageBuffers;
+-    mNativeCaps.maxCombinedShaderStorageBlocks                  = mtl::kMaxComputeStorageBuffers;
+-    mNativeCaps.maxShaderStorageBufferBindings                  = mtl::kMaxComputeStorageBuffers;
+-    mNativeCaps.maxShaderStorageBlockSize =
+-        std::min<GLint64>(mMetalDevice.get().maxBufferLength, 1 << 27);
+-    mNativeCaps.shaderStorageBufferOffsetAlignment                  = 256;
+-    mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Compute] = mtl::kMaxShaderSamplers;
+-    mNativeCaps.maxCombinedShaderOutputResources = mtl::kMaxComputeStorageBuffers + 4;
+-    mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Compute] = 1;
+-    mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Compute]       = 8;
+-    mNativeCaps.maxCombinedAtomicCounterBuffers                        = 1;
+-    mNativeCaps.maxCombinedAtomicCounters                              = 8;
+-    mNativeCaps.maxAtomicCounterBufferBindings                         = 1;
+-    mNativeCaps.maxAtomicCounterBufferSize                             = mtl::kMaxUBOSize;
+-    mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute] = 4;
+-    mNativeCaps.maxCombinedImageUniforms                        = 4;
+-    mNativeCaps.maxImageUnits = std::max(mNativeCaps.maxImageUnits, 4);
+ #endif
+ 
+     mNativeCaps.maxTransformFeedbackInterleavedComponents =
+@@ -1045,13 +1075,7 @@ bool IsMetalDisplayAvailable()
+     mNativeExtensions.robustnessEXT               = true;
+     mNativeExtensions.robustnessKHR               = true;
+     mNativeExtensions.textureBorderClampOES       = false;  // not implemented yet
+-#if defined(ANGLE_METAL_COMPUTE_TESTS)
+-    mNativeExtensions.multiDrawIndirectEXT = true;
+-#else
+-    // The production profile must not expose entry points whose primitive and
+-    // index conversions are still being integrated in the internal test build.
+-    mNativeExtensions.multiDrawIndirectEXT = false;
+-#endif
++    mNativeExtensions.multiDrawIndirectEXT        = supportsMetalGLES31();
+     mNativeExtensions.translatedShaderSourceANGLE = true;
+     mNativeExtensions.discardFramebufferEXT       = true;
+ 

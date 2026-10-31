@@ -1,0 +1,250 @@
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 7094ec2..58139f6 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -988,11 +988,14 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ {
+     ANGLE_CHECK(
+         this,
+-        type != gl::DrawElementsType::UnsignedByte && mode != gl::PrimitiveMode::TriangleFan &&
+-            mode != gl::PrimitiveMode::LineLoop && !getState().isPrimitiveRestartEnabled() &&
+-            !requiresIndexRewrite(getState(), mode) &&
++        mode != gl::PrimitiveMode::TriangleFan && mode != gl::PrimitiveMode::LineLoop &&
++            !getState().isPrimitiveRestartEnabled() && !requiresIndexRewrite(getState(), mode) &&
+             !getState().isTransformFeedbackActiveUnpaused() && !context->hasAnyActiveClientAttrib(),
+         "Indexed indirect draw requires GPU index conversion for this state", GL_INVALID_OPERATION);
++    mtl::BufferSlice indexBuffer;
++    gl::DrawElementsType nativeType;
++    ANGLE_TRY(mtl::GetImpl(getState().getVertexArray())
++                  ->getIndexBufferForIndirect(context, type, &indexBuffer, &nativeType));
+     ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
+     if (mCullAllPolygons && gl::IsPolygonMode(mode))
+     {
+@@ -1003,11 +1006,10 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     if (!noOp)
+     {
+         gl::Buffer *arguments = getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
+-        gl::Buffer *indices   = getState().getVertexArray()->getElementArrayBuffer();
+-        mRenderEncoder.drawIndexedIndirect(mtl::GetPrimitiveType(mode), mtl::GetIndexType(type),
+-                                           mtl::GetImpl(indices)->getCurrentBuffer(), 0,
+-                                           mtl::GetImpl(arguments)->getCurrentBuffer(),
+-                                           reinterpret_cast<uintptr_t>(indirect));
++        mRenderEncoder.drawIndexedIndirect(
++            mtl::GetPrimitiveType(mode), mtl::GetIndexType(nativeType), indexBuffer.buffer(),
++            indexBuffer.offset(), mtl::GetImpl(arguments)->getCurrentBuffer(),
++            reinterpret_cast<uintptr_t>(indirect));
+     }
+     return checkCommandBufferError();
+ }
+diff --git a/src/libANGLE/renderer/metal/VertexArrayMtl.h b/src/libANGLE/renderer/metal/VertexArrayMtl.h
+index 6115160..fc6ac3f 100644
+--- a/src/libANGLE/renderer/metal/VertexArrayMtl.h
++++ b/src/libANGLE/renderer/metal/VertexArrayMtl.h
+@@ -66,6 +66,13 @@ class VertexArrayMtl : public VertexArrayImpl
+                                           mtl::BufferSlice *outIndexBuffer,
+                                           gl::DrawElementsType *outIndexBufferType);
+ 
++    // Indirect commands keep their firstIndex in GPU memory. Promote the
++    // complete index allocation without the direct-draw CPU fallback.
++    angle::Result getIndexBufferForIndirect(const gl::Context *context,
++                                            gl::DrawElementsType type,
++                                            mtl::BufferSlice *bufferOut,
++                                            gl::DrawElementsType *typeOut);
++
+   private:
+     void reset(ContextMtl *context);
+ 
+@@ -77,7 +84,8 @@ class VertexArrayMtl : public VertexArrayImpl
+     angle::Result convertIndexBuffer(const gl::Context *glContext,
+                                      gl::DrawElementsType indexType,
+                                      size_t offset,
+-                                     mtl::BufferSlice *outIdxBuffer);
++                                     mtl::BufferSlice *outIdxBuffer,
++                                     bool gpuOnly = false);
+     angle::Result streamIndexBufferFromClient(const gl::Context *glContext,
+                                               gl::DrawElementsType indexType,
+                                               size_t indexCount,
+diff --git a/src/libANGLE/renderer/metal/VertexArrayMtl.mm b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+index 9c66ebc..e9d6627 100644
+--- a/src/libANGLE/renderer/metal/VertexArrayMtl.mm
++++ b/src/libANGLE/renderer/metal/VertexArrayMtl.mm
+@@ -952,10 +952,26 @@ void AppendSimpleDrawCommandRanges(std::vector<DrawCommandRange> &drawCommands,
+     return angle::Result::Continue;
+ }
+ 
++angle::Result VertexArrayMtl::getIndexBufferForIndirect(const gl::Context *context,
++                                                        gl::DrawElementsType type,
++                                                        mtl::BufferSlice *bufferOut,
++                                                        gl::DrawElementsType *typeOut)
++{
++    *typeOut = type;
++    if (type == gl::DrawElementsType::UnsignedByte)
++    {
++        *typeOut = gl::DrawElementsType::UnsignedShort;
++        return convertIndexBuffer(context, type, 0, bufferOut, true);
++    }
++    *bufferOut = mtl::BufferSlice(mtl::GetImpl(getElementArrayBuffer())->getCurrentBuffer());
++    return angle::Result::Continue;
++}
++
+ angle::Result VertexArrayMtl::convertIndexBuffer(const gl::Context *glContext,
+                                                  gl::DrawElementsType indexType,
+                                                  size_t offset,
+-                                                 mtl::BufferSlice *outIdxBuffer)
++                                                 mtl::BufferSlice *outIdxBuffer,
++                                                 bool gpuOnly)
+ {
+     size_t offsetModulo = offset % mtl::kIndexBufferOffsetAlignment;
+     ASSERT(offsetModulo != 0 || indexType == gl::DrawElementsType::UnsignedByte);
+@@ -992,8 +1008,8 @@ void AppendSimpleDrawCommandRanges(std::vector<DrawCommandRange> &drawCommands,
+     conversion->bufferPool.releaseInFlightBuffers(contextMtl);
+     mtl::BufferSlice converted;
+ 
+-    if ((!display->getFeatures().hasCheapRenderPass.enabled &&
+-         contextMtl->getRenderCommandEncoder()))
++    if (!gpuOnly && (!display->getFeatures().hasCheapRenderPass.enabled &&
++                     contextMtl->getRenderCommandEncoder()))
+     {
+         angle::Span<uint8_t> destination;
+         ANGLE_TRY(conversion->bufferPool.allocateAndMap(contextMtl, convertedIndexSize,
+@@ -1009,10 +1025,15 @@ void AppendSimpleDrawCommandRanges(std::vector<DrawCommandRange> &drawCommands,
+     {
+         mtl::BufferSlice source =
+             mtl::BufferSlice(idxBuffer->getCurrentBuffer()).subslice(offsetModulo);
+-        ANGLE_TRY(conversion->bufferPool.allocate(contextMtl, convertedIndexSize, &converted));
+-        ANGLE_TRY(display->getUtils().convertIndexBufferGPU(
+-            contextMtl, indexType, static_cast<uint32_t>(indexCount), source, converted,
+-            glState.isPrimitiveRestartEnabled()));
++        ANGLE_TRY(conversion->bufferPool.allocate(
++            contextMtl, std::max(convertedIndexSize, size_t(mtl::kIndexBufferOffsetAlignment)),
++            &converted));
++        if (indexCount != 0)
++        {
++            ANGLE_TRY(display->getUtils().convertIndexBufferGPU(
++                contextMtl, indexType, static_cast<uint32_t>(indexCount), source, converted,
++                glState.isPrimitiveRestartEnabled()));
++        }
+     }
+     ANGLE_TRY(conversion->bufferPool.commit(contextMtl));
+     conversion->dirty  = false;
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index 005f099..13ecf7c 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1219,6 +1219,116 @@ TEST_P(ComputeDispatchTestMetal, ZeroDispatchAndFrontendValidation)
+     EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
+     ASSERT_GL_NO_ERROR();
+ }
++class ComputeByteIndirectTestMetal : public ComputeDispatchTestMetal
++{};
++
++TEST_P(ComputeByteIndirectTestMetal, GPUGeneratedIndicesAndTightMultiDraw)
++{
++    constexpr char producer[] = R"(#version 310 es
++        layout(local_size_x = 1) in;
++        layout(std430, binding = 0) buffer Commands { uint words[]; } commands;
++        layout(std430, binding = 1) buffer Indices { uint words[]; } indices;
++        uniform bool visible;
++        uniform bool split;
++        uniform uint second;
++        void main() {
++            // Two guard bytes precede the six indices. baseVertex is -1.
++            indices.words[0] = visible ? 0x0201fbfau : 0x0101fbfau;
++            indices.words[1] = visible ? 0x04020303u : 0x01010101u;
++            commands.words[64] = split ? 3u : 6u;
++            commands.words[65] = 1u;
++            commands.words[66] = 2u;
++            commands.words[67] = 0xffffffffu;
++            commands.words[68] = 0u;
++            commands.words[second] = 3u;
++            commands.words[second + 1u] = 1u;
++            commands.words[second + 2u] = 5u;
++            commands.words[second + 3u] = 0xffffffffu;
++            commands.words[second + 4u] = 0u;
++        }
++    )";
++    constexpr char vertex[]   = R"(#version 310 es
++        void main() {
++            vec2 p = vec2((gl_VertexID & 1) == 0 ? -1 : 1,
++                          (gl_VertexID & 2) == 0 ? -1 : 1);
++            gl_Position = vec4(p, 0, 1);
++        }
++    )";
++    constexpr char fragment[] = R"(#version 310 es
++        precision highp float;
++        uniform vec4 paint;
++        out vec4 color;
++        void main() { color = paint; }
++    )";
++    ASSERT_TRUE(EnsureGLExtensionEnabled("GL_EXT_multi_draw_indirect"));
++    ANGLE_GL_COMPUTE_PROGRAM(compute, producer);
++    ANGLE_GL_PROGRAM(render, vertex, fragment);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
++    GLBuffer commands, indices;
++    std::array<uint32_t, 128> initial;
++    initial.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, commands);
++    glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(initial), initial.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, commands);
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(initial), initial.data(), GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, indices);
++    for (uint32_t frame = 0; frame < 6; ++frame)
++    {
++        const bool visible     = (frame & 1) == 0;
++        const uint32_t variant = frame % 3;
++        glClearColor(0, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT);
++        glUseProgram(compute);
++        glUniform1i(glGetUniformLocation(compute, "visible"), visible);
++        glUniform1i(glGetUniformLocation(compute, "split"), variant != 0);
++        glUniform1ui(glGetUniformLocation(compute, "second"), variant == 1 ? 69 : 72);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT);
++        glUseProgram(render);
++        // Start a raster pass immediately before conversion. Its attachment
++        // contents must survive even when the indirect geometry is degenerate.
++        glUniform4f(glGetUniformLocation(render, "paint"), 1, 0, 0, 1);
++        glEnable(GL_SCISSOR_TEST);
++        glScissor(0, 0, 1, 1);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        glDisable(GL_SCISSOR_TEST);
++        glUniform4f(glGetUniformLocation(render, "paint"), 0, 1, 0, 1);
++        const void *offset = reinterpret_cast<const void *>(256);
++        if (variant == 0)
++        {
++            glDrawElementsIndirect(GL_TRIANGLES, GL_UNSIGNED_BYTE, offset);
++        }
++        else
++        {
++            glMultiDrawElementsIndirectEXT(GL_TRIANGLES, GL_UNSIGNED_BYTE, offset, 2,
++                                           variant == 1 ? 0 : 32);
++        }
++        ASSERT_GL_NO_ERROR();
++        EXPECT_PIXEL_RECT_EQ(1, 1, 15, 15, visible ? GLColor::green : GLColor::black);
++        EXPECT_PIXEL_COLOR_EQ(0, 0, visible ? GLColor::green : GLColor::red);
++    }
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, indices);
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(initial), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    EXPECT_EQ(actual[0], 0x0101fbfau);
++    EXPECT_EQ(actual[1], 0x01010101u);
++    for (size_t i = 2; i < initial.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], initial[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ }  // namespace
+ ANGLE_INSTANTIATE_TEST(ComputeDispatchTestMetal,
+                        ES31_METAL().enable(Feature::AlwaysEnableEmulatedMultidrawExtensions));
++
++ANGLE_INSTANTIATE_TEST(ComputeByteIndirectTestMetal,
++                       ES31_METAL()
++                           .enable(Feature::AlwaysEnableEmulatedMultidrawExtensions)
++                           .disable(Feature::HasCheapRenderPass));

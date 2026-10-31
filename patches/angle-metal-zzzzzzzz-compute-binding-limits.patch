@@ -1,0 +1,97 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 6bfa43d..19c9bd8 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -877,11 +877,11 @@ bool IsMetalDisplayAvailable()
+ 
+     mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Vertex]   = mtl::kMaxShaderUBOs;
+     mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Fragment] = mtl::kMaxShaderUBOs;
+-    mNativeCaps.maxCombinedUniformBlocks                         = mtl::kMaxGLUBOBindings;
++    mNativeCaps.maxCombinedUniformBlocks                         = 2 * mtl::kMaxShaderUBOs;
+ 
+     // Note that we currently implement textures as combined image+samplers, so the limit is
+     // the minimum of supported samplers and sampled images.
+-    mNativeCaps.maxCombinedTextureImageUnits                         = mtl::kMaxGLSamplerBindings;
++    mNativeCaps.maxCombinedTextureImageUnits                         = 2 * mtl::kMaxShaderSamplers;
+     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Fragment] = mtl::kMaxShaderSamplers;
+     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Vertex]   = mtl::kMaxShaderSamplers;
+ 
+@@ -927,6 +927,9 @@ bool IsMetalDisplayAvailable()
+ #if defined(ANGLE_METAL_COMPUTE_TESTS)
+     mNativeCaps.maxUniformLocations = maxDefaultUniformVectors + mtl::kMaxShaderSamplers + 4;
+     mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Compute] = 12;
++    mNativeCaps.maxCombinedUniformBlocks                        = 2 * mtl::kMaxShaderUBOs + 12;
++    mNativeCaps.maxUniformBufferBindings                        = mtl::kMaxGLUBOBindings;
++    mNativeCaps.maxCombinedTextureImageUnits                    = mtl::kMaxGLSamplerBindings;
+     mNativeCaps.maxCombinedShaderUniformComponents[gl::ShaderType::Compute] =
+         maxDefaultUniformComponents + mtl::kMaxUBOSize * 12 / 4;
+     mNativeCaps.maxComputeWorkGroupCount       = {65535, 65535, 65535};
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 3542395..cdc0a74 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -34,7 +34,7 @@
+ 
+ namespace
+ {
+-constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435035;  // MCP5
++constexpr uint32_t kMetalProgramBinaryVersion = 0x4d435036;  // MCP6
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index be6413f..d6e5de6 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -155,8 +155,8 @@ constexpr uint32_t kTextureToBufferBlittingAlignment = 256;
+ constexpr size_t kConstantBufferOffsetAlignment = 32;  // Metal3 minimum constant buffer alignment.
+ 
+ // Front end binding limits
+-constexpr uint32_t kMaxGLSamplerBindings = 2 * kMaxShaderSamplers;
+-constexpr uint32_t kMaxGLUBOBindings     = 2 * kMaxShaderUBOs;
++constexpr uint32_t kMaxGLSamplerBindings = 3 * kMaxShaderSamplers;
++constexpr uint32_t kMaxGLUBOBindings     = 3 * kMaxShaderUBOs;
+ 
+ // Binding index start for vertex data buffers:
+ constexpr uint32_t kVboBindingIndexStart = 0;
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index ca3a440..8aff93d 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -52,6 +52,16 @@ TEST_P(ComputeDispatchTestMetal, StorageRangesUniformsAndBinary)
+         glGetIntegerv(limit, &value);
+         RecordProperty("Limit_" + std::to_string(limit), value);
+     }
++    GLint units = 0, bindings = 0, blocks = 0;
++    glGetIntegerv(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, &units);
++    glGetIntegerv(GL_MAX_UNIFORM_BUFFER_BINDINGS, &bindings);
++    glGetIntegerv(GL_MAX_COMBINED_UNIFORM_BLOCKS, &blocks);
++    EXPECT_EQ(units, 48);
++    EXPECT_EQ(bindings, 48);
++    EXPECT_EQ(blocks, 44);
++    RecordProperty("CombinedTextureImageUnits", units);
++    RecordProperty("UniformBufferBindings", bindings);
++    RecordProperty("CombinedUniformBlocks", blocks);
+     constexpr char source[] = R"(#version 310 es
+         layout(local_size_x = 8) in;
+         layout(std430, binding = 5) readonly buffer InputData { uint prefix; uint values[]; } inputData;
+@@ -603,8 +613,8 @@ TEST_P(ComputeDispatchTestMetal, StorageAndUniformBlockArrays)
+         GLint initialBinding = -1;
+         glGetActiveUniformBlockiv(restored, block, GL_UNIFORM_BLOCK_BINDING, &initialBinding);
+         EXPECT_EQ(initialBinding, static_cast<GLint>(i));
+-        glUniformBlockBinding(restored, block, 20 + i);
+-        glBindBufferRange(GL_UNIFORM_BUFFER, 20 + i, allocation, 1536 + i * 256, 32);
++        glUniformBlockBinding(restored, block, 36 + i);
++        glBindBufferRange(GL_UNIFORM_BUFFER, 36 + i, allocation, 1536 + i * 256, 32);
+     }
+     glUseProgram(restored);
+     glDispatchCompute(1, 1, 1);
+@@ -1046,7 +1056,7 @@ TEST_P(ComputeDispatchTestMetal, SixteenSamplersAndFourImages)
+     const std::array<GLint, 4> outputUnits = {20, 21, 22, 23};
+     for (uint32_t i = 0; i < 16; ++i)
+     {
+-        inputUnits[i] = 15 - static_cast<GLint>(i);
++        inputUnits[i] = 47 - static_cast<GLint>(i);
+         glActiveTexture(GL_TEXTURE0 + inputUnits[i]);
+         glBindTexture(GL_TEXTURE_2D, inputs[i]);
+         glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32UI, 1, 1);

@@ -1,0 +1,224 @@
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 58139f6..755fa2b 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -19,6 +19,7 @@
+ #include "libANGLE/Display.h"
+ #include "libANGLE/Query.h"
+ #include "libANGLE/TransformFeedback.h"
++#include "libANGLE/renderer/ProgramPipelineImpl.h"
+ #include "libANGLE/renderer/metal/BufferMtl.h"
+ #include "libANGLE/renderer/metal/CompilerMtl.h"
+ #include "libANGLE/renderer/metal/DisplayMtl.h"
+@@ -183,6 +184,44 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     return attribs.getAsInt(EGL_CONTEXT_METAL_OWNERSHIP_IDENTITY_ANGLE, 0);
+ }
+ 
++// Compute pipelines use the component program's executable so uniforms,
++// resource binding changes and executable lifetime keep their original owner.
++class ProgramPipelineMtl final : public ProgramPipelineImpl
++{
++  public:
++    explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipelineImpl(state)
++    {}
++
++    angle::Result link(const gl::Context *context,
++                       const gl::ProgramMergedVaryings &,
++                       const gl::ProgramVaryingPacking &) override
++    {
++        bool computeOnly = bool(mState.getShaderProgramExecutable(gl::ShaderType::Compute));
++        for (gl::ShaderType type : mState.getExecutable().getLinkedShaderStages())
++        {
++            computeOnly = computeOnly && type == gl::ShaderType::Compute;
++        }
++        ANGLE_CHECK(mtl::GetImpl(context), computeOnly,
++                    "Metal separable pipelines currently require a compute stage only",
++                    GL_INVALID_OPERATION);
++        return angle::Result::Continue;
++    }
++};
++
++const gl::ProgramExecutable *GetComputeProgramExecutable(const gl::State &state)
++{
++    if (!state.getProgram() && state.getProgramPipeline())
++    {
++        const auto &component =
++            state.getProgramPipeline()->getShaderProgramExecutable(gl::ShaderType::Compute);
++        if (component)
++        {
++            return component.get();
++        }
++    }
++    return state.getProgramExecutable();
++}
++
+ }  // namespace
+ 
+ ContextMtl::ContextMtl(const gl::State &state,
+@@ -1598,9 +1637,7 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ // Program Pipeline object creation
+ ProgramPipelineImpl *ContextMtl::createProgramPipeline(const gl::ProgramPipelineState &data)
+ {
+-    // NOTE(hqle): ES 3.0
+-    UNIMPLEMENTED();
+-    return nullptr;
++    return new ProgramPipelineMtl(data);
+ }
+ 
+ // Memory object creation.
+@@ -1622,20 +1659,22 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+                                           GLuint numGroupsY,
+                                           GLuint numGroupsZ)
+ {
+-    auto *executable = mtl::GetImpl(context->getState().getProgramExecutable());
++    const auto *computeProgram = GetComputeProgramExecutable(context->getState());
++    auto *executable           = mtl::GetImpl(computeProgram);
+     mtl::ComputeCommandEncoder *encoder;
+     ANGLE_TRY(executable->setupDispatch(context, &encoder));
+-    const auto &size = context->getState().getProgramExecutable()->getComputeShaderLocalSize();
++    const auto &size = computeProgram->getComputeShaderLocalSize();
+     encoder->dispatch(MTLSizeMake(numGroupsX, numGroupsY, numGroupsZ),
+                       MTLSizeMake(size[0], size[1], size[2]));
+     return checkCommandBufferError();
+ }
+ angle::Result ContextMtl::dispatchComputeIndirect(const gl::Context *context, GLintptr indirect)
+ {
+-    auto *executable = mtl::GetImpl(context->getState().getProgramExecutable());
++    const auto *computeProgram = GetComputeProgramExecutable(context->getState());
++    auto *executable           = mtl::GetImpl(computeProgram);
+     mtl::ComputeCommandEncoder *encoder;
+     ANGLE_TRY(executable->setupDispatch(context, &encoder));
+-    const auto &size   = context->getState().getProgramExecutable()->getComputeShaderLocalSize();
++    const auto &size   = computeProgram->getComputeShaderLocalSize();
+     gl::Buffer *buffer = context->getState().getTargetBuffer(gl::BufferBinding::DispatchIndirect);
+     encoder->dispatchIndirect(mtl::GetImpl(buffer)->getCurrentBuffer(),
+                               static_cast<size_t>(indirect),
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index d9644ae..2a59695 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -286,9 +286,10 @@ void load(std::vector<std::shared_ptr<LinkSubTask>> *linkSubTasksOut,
+ 
+ void ProgramMtl::setBinaryRetrievableHint(bool retrievable) {}
+ 
+-void ProgramMtl::setSeparable(bool separable)
++void ProgramMtl::setSeparable(bool)
+ {
+-    UNIMPLEMENTED();
++    // The frontend owns this state. Compute components keep their linked
++    // resource maps and uniforms when installed in a program pipeline.
+ }
+ 
+ void ProgramMtl::prepareForLink(const gl::ShaderMap<ShaderImpl *> &shaders)
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index a1f42b2..afbae10 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1830,6 +1830,107 @@ TEST_P(ComputeLinkValidationTestMetal, BinaryCacheAndProgramDeletionBeforeReadba
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++TEST_P(ComputeLinkValidationTestMetal, SeparableComputeUniformOwnershipAndBinary)
++{
++    constexpr char source[] = R"(#version 310 es
++        layout(local_size_x=4) in;
++        layout(std430,binding=5) buffer OutputData { uvec4 values[4]; } result;
++        uniform uint seed;
++        void main() {
++            uint i=gl_LocalInvocationIndex;
++            result.values[i]=uvec4(seed+i,seed,0,1);
++        }
++    )";
++    GLShader shader(GL_COMPUTE_SHADER);
++    const char *text = source;
++    glShaderSource(shader, 1, &text, nullptr);
++    glCompileShader(shader);
++    GLint compiled = GL_FALSE;
++    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
++    ASSERT_EQ(compiled, GL_TRUE);
++    GLProgram program;
++    glProgramParameteri(program, GL_PROGRAM_SEPARABLE, GL_TRUE);
++    glAttachShader(program, shader);
++    glLinkProgram(program);
++    GLint linked = GL_FALSE;
++    glGetProgramiv(program, GL_LINK_STATUS, &linked);
++    ASSERT_EQ(linked, GL_TRUE);
++    GLProgramPipeline pipeline;
++    glUseProgram(0);
++    glBindProgramPipeline(pipeline);
++    glUseProgramStages(pipeline, GL_COMPUTE_SHADER_BIT, program);
++    glActiveShaderProgram(pipeline, program);
++    GLBuffer result, commands;
++    std::array<uint32_t, 192> expected;
++    expected.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_SHADER_STORAGE_BUFFER, result);
++    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(expected), expected.data(), GL_DYNAMIC_DRAW);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 5, result, 0, 64);
++    GLuint block = glGetProgramResourceIndex(program, GL_SHADER_STORAGE_BLOCK, "OutputData");
++    ASSERT_NE(block, GL_INVALID_INDEX);
++    const GLenum property = GL_BUFFER_BINDING;
++    GLint binding         = -1;
++    glGetProgramResourceiv(program, GL_SHADER_STORAGE_BLOCK, block, 1, &property, 1, nullptr,
++                           &binding);
++    ASSERT_EQ(binding, 5);
++    glUniform1ui(glGetUniformLocation(program, "seed"), 29);
++    glValidateProgramPipeline(pipeline);
++    GLint valid = GL_FALSE;
++    glGetProgramPipelineiv(pipeline, GL_VALIDATE_STATUS, &valid);
++    ASSERT_EQ(valid, GL_TRUE);
++    glDispatchCompute(1, 1, 1);
++    ASSERT_GL_NO_ERROR();
++    GLProgram restored;
++    glProgramParameteri(restored, GL_PROGRAM_SEPARABLE, GL_TRUE);
++    reloadProgram(program, restored);
++    glProgramUniform1ui(restored, glGetUniformLocation(restored, "seed"), 89);
++    glUseProgramStages(pipeline, GL_COMPUTE_SHADER_BIT, restored);
++    block = glGetProgramResourceIndex(restored, GL_SHADER_STORAGE_BLOCK, "OutputData");
++    ASSERT_NE(block, GL_INVALID_INDEX);
++    glGetProgramResourceiv(restored, GL_SHADER_STORAGE_BLOCK, block, 1, &property, 1, nullptr,
++                           &binding);
++    ASSERT_EQ(binding, 5);
++    // The active uniform target remains the first program; execution must use
++    // the newly installed compute component, including its local size of four.
++    glUniform1ui(glGetUniformLocation(program, "seed"), 7);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 5, result, 256, 64);
++    glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, commands);
++    const std::array<uint32_t, 3> groups = {1, 1, 1};
++    glBufferData(GL_DISPATCH_INDIRECT_BUFFER, sizeof(groups), groups.data(), GL_DYNAMIC_DRAW);
++    glDispatchComputeIndirect(0);
++    ASSERT_GL_NO_ERROR();
++    // Update the component without changing the installed pipeline stage.
++    glProgramUniform1ui(restored, glGetUniformLocation(restored, "seed"), 101);
++    glBindBufferRange(GL_SHADER_STORAGE_BUFFER, 5, result, 512, 64);
++    glDispatchCompute(1, 1, 1);
++    ASSERT_GL_NO_ERROR();
++    program.reset();
++    restored.reset();
++    glActiveShaderProgram(pipeline, 0);
++    glUseProgramStages(pipeline, GL_COMPUTE_SHADER_BIT, 0);
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    for (uint32_t pass = 0; pass < 3; ++pass)
++    {
++        for (uint32_t i = 0; i < 4; ++i)
++        {
++            const uint32_t seed             = pass == 0 ? 29 : pass == 1 ? 89 : 101;
++            expected[pass * 64 + 4 * i]     = seed + i;
++            expected[pass * 64 + 4 * i + 1] = seed;
++            expected[pass * 64 + 4 * i + 2] = 0;
++            expected[pass * 64 + 4 * i + 3] = 1;
++        }
++    }
++    const auto *actual = static_cast<const uint32_t *>(
++        glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++    ASSERT_NE(actual, nullptr);
++    for (size_t i = 0; i < expected.size(); ++i)
++    {
++        EXPECT_EQ(actual[i], expected[i]) << i;
++    }
++    EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    ASSERT_GL_NO_ERROR();
++}
++
+ class ComputeByteIndirectTestMetal : public ComputeDispatchTestMetal
+ {};
+ 

@@ -1,0 +1,16 @@
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 02ae5d8..36ca9ae 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -1067,7 +1067,11 @@ uint32_t height(GLuint glLevel) const
+ 
+     // Create actual texture object:
+     mSlices              = 1;
++    // Immutable image storage may be accessed through any GLES-compatible image format.
++    // Metal requires PixelFormatView usage at allocation time for those aliases.
+     bool allowFormatView =
++        (mState.getImmutableFormat() &&
++         contextMtl->getNativeFormatCaps(format.metalFormat).writable) ||
+         format.hasDepthAndStencilBits() ||
+         needsFormatViewForPixelLocalStorage(
+             contextMtl->getDisplay()->getNativePixelLocalStorageOptions(), format);

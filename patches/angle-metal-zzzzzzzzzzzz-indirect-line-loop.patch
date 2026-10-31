@@ -1,0 +1,466 @@
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 2f299d3..b4a3880 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -454,6 +454,11 @@ class ContextMtl : public ContextImpl, public mtl::Context
+                                      GLint baseVertex,
+                                      GLuint baseInstance);
+ 
++    angle::Result prepareIndirectLineLoop(const mtl::BufferRef &arguments,
++                                          size_t argumentOffset,
++                                          const mtl::BufferSlice &indices,
++                                          gl::DrawElementsType nativeIndexType,
++                                          mtl::BufferSlice *closing);
+     angle::Result drawLineLoopArraysNonInstanced(const gl::Context *context,
+                                                  GLint first,
+                                                  GLsizei count);
+@@ -634,6 +639,7 @@ class ContextMtl : public ContextImpl, public mtl::Context
+     // Lineloop and TriFan index buffer
+     mtl::BufferPool mLineLoopIndexBuffer;
+     mtl::BufferPool mLineLoopLastSegmentIndexBuffer;
++    angle::ObjCPtr<id<MTLFunction>> mIndirectLineLoopFunction;
+     mtl::BufferPool mTriFanIndexBuffer;
+     // one buffer can be reused for any starting vertex in DrawArrays()
+     mtl::BufferRef mTriFanArraysIndexBuffer;
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 755fa2b..4aeeb2a 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -47,6 +47,9 @@
+ 
+ namespace
+ {
++constexpr size_t kIndirectLineLoopPacketSize    = 8 * sizeof(uint32_t);
++constexpr size_t kIndirectLineLoopIndicesOffset = 6 * sizeof(uint32_t);
++
+ #if TARGET_OS_OSX
+ // Unlimited triangle fan buffers
+ constexpr uint32_t kMaxTriFanLineLoopBuffersPerFrame = 0;
+@@ -988,6 +991,85 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+     return drawElementsImpl(context, mode, count, type, indices, 0, baseVertex, 0);
+ }
+ 
++angle::Result ContextMtl::prepareIndirectLineLoop(const mtl::BufferRef &arguments,
++                                                  size_t argumentOffset,
++                                                  const mtl::BufferSlice &indices,
++                                                  gl::DrawElementsType nativeIndexType,
++                                                  mtl::BufferSlice *closing)
++{
++    if (!mIndirectLineLoopFunction)
++    {
++        mtl::TranslatedShaderInfo shader;
++        shader.metalShaderSource = std::make_shared<const std::string>(R"(
++#include <metal_stdlib>
++using namespace metal;
++kernel void main0(const device uint *source [[buffer(0)]],
++                  device uint *destination [[buffer(1)]],
++                  const device uchar *indices [[buffer(2)]],
++                  constant uint &indexSize [[buffer(3)]])
++{
++    const uint count = source[0];
++    const uint instances = source[1];
++    const bool visible = count > 1u && instances > 0u;
++    // Native indexed indirect arguments, a padding word, then two UInt32 indices.
++    destination[0] = visible ? 2u : 0u;
++    destination[1] = instances;
++    destination[2] = 0u;
++    destination[3] = indexSize ? source[3] : 0u;
++    destination[4] = indexSize ? source[4] : source[3];
++    uint first = 0u, last = 0u;
++    if (visible)
++    {
++        const size_t begin = source[2];
++        const size_t end = begin + size_t(count) - 1u;
++        if (indexSize == 2u)
++        {
++            const device ushort *data = reinterpret_cast<const device ushort *>(indices);
++            first = data[begin]; last = data[end];
++        }
++        else if (indexSize == 4u)
++        {
++            const device uint *data = reinterpret_cast<const device uint *>(indices);
++            first = data[begin]; last = data[end];
++        }
++        else
++        {
++            first = uint(begin); last = uint(end);
++        }
++    }
++    destination[6] = last;
++    destination[7] = first;
++}
++)");
++        gl::InfoLog log;
++        ANGLE_TRY(CreateMslShaderLib(this, log, &shader, {}));
++        mIndirectLineLoopFunction =
++            angle::adoptObjCPtr([shader.metalLibrary.get() newFunctionWithName:@"main0"]);
++        ANGLE_CHECK(this, mIndirectLineLoopFunction, "Missing indirect line-loop kernel",
++                    GL_INVALID_OPERATION);
++    }
++    angle::ObjCPtr<id<MTLComputePipelineState>> pipeline;
++    ANGLE_TRY(
++        getPipelineCache().getComputePipeline(this, mIndirectLineLoopFunction.get(), &pipeline));
++    mLineLoopLastSegmentIndexBuffer.releaseInFlightBuffers(this);
++    ANGLE_TRY(mLineLoopLastSegmentIndexBuffer.allocate(this, kIndirectLineLoopPacketSize, closing));
++    ANGLE_TRY(mLineLoopLastSegmentIndexBuffer.commit(this));
++    const uint32_t indexSize =
++        nativeIndexType == gl::DrawElementsType::InvalidEnum
++            ? 0
++            : static_cast<uint32_t>(gl::GetDrawElementsTypeSize(nativeIndexType));
++    auto *encoder = getComputeCommandEncoder();
++    encoder->setComputePipelineState(pipeline.get());
++    encoder->setBuffer(arguments, argumentOffset, 0);
++    encoder->setBufferForWrite(closing->buffer(), closing->offset(), 1);
++    // The unused array-draw input remains bound for Metal argument validation.
++    encoder->setBuffer(indexSize ? indices.buffer() : arguments,
++                       indexSize ? indices.offset() : argumentOffset, 2);
++    encoder->setData(indexSize, 3);
++    encoder->dispatch(MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
++    return angle::Result::Continue;
++}
++
+ angle::Result ContextMtl::drawArraysIndirect(const gl::Context *context,
+                                              gl::PrimitiveMode mode,
+                                              const void *indirect)
+@@ -996,10 +1078,19 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+     // conversions explicit while the public GLES 3.1 profile remains gated.
+     ANGLE_CHECK(
+         this,
+-        mode != gl::PrimitiveMode::TriangleFan && mode != gl::PrimitiveMode::LineLoop &&
+-            !requiresIndexRewrite(getState(), mode) &&
++        mode != gl::PrimitiveMode::TriangleFan && !requiresIndexRewrite(getState(), mode) &&
+             !getState().isTransformFeedbackActiveUnpaused() && !context->hasAnyActiveClientAttrib(),
+         "Indirect draw requires GPU primitive conversion for this state", GL_INVALID_OPERATION);
++    const auto arguments = mtl::GetImpl(getState().getTargetBuffer(gl::BufferBinding::DrawIndirect))
++                               ->getCurrentBuffer();
++    const size_t offset  = reinterpret_cast<uintptr_t>(indirect);
++    const bool lineLoop  = mode == gl::PrimitiveMode::LineLoop;
++    mtl::BufferSlice closing;
++    if (lineLoop)
++    {
++        ANGLE_TRY(prepareIndirectLineLoop(arguments, offset, {}, gl::DrawElementsType::InvalidEnum,
++                                          &closing));
++    }
+     ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
+     if (mCullAllPolygons && gl::IsPolygonMode(mode))
+     {
+@@ -1012,10 +1103,16 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+         setupDraw(context, 0, 0, 1, gl::DrawElementsType::InvalidEnum, nullptr, false, &noOp));
+     if (!noOp)
+     {
+-        gl::Buffer *arguments = getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
+-        mRenderEncoder.drawIndirect(mtl::GetPrimitiveType(mode),
+-                                    mtl::GetImpl(arguments)->getCurrentBuffer(),
+-                                    reinterpret_cast<uintptr_t>(indirect));
++        mRenderEncoder.drawIndirect(
++            mtl::GetPrimitiveType(lineLoop ? gl::PrimitiveMode::LineStrip : mode), arguments,
++            offset);
++        if (lineLoop)
++        {
++            mRenderEncoder.drawIndexedIndirect(MTLPrimitiveTypeLine, MTLIndexTypeUInt32,
++                                               closing.buffer(),
++                                               closing.offset() + kIndirectLineLoopIndicesOffset,
++                                               closing.buffer(), closing.offset());
++        }
+     }
+     return checkCommandBufferError();
+ }
+@@ -1027,14 +1124,23 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+ {
+     ANGLE_CHECK(
+         this,
+-        mode != gl::PrimitiveMode::TriangleFan && mode != gl::PrimitiveMode::LineLoop &&
+-            !getState().isPrimitiveRestartEnabled() && !requiresIndexRewrite(getState(), mode) &&
++        mode != gl::PrimitiveMode::TriangleFan && !getState().isPrimitiveRestartEnabled() &&
++            !requiresIndexRewrite(getState(), mode) &&
+             !getState().isTransformFeedbackActiveUnpaused() && !context->hasAnyActiveClientAttrib(),
+         "Indexed indirect draw requires GPU index conversion for this state", GL_INVALID_OPERATION);
+     mtl::BufferSlice indexBuffer;
+     gl::DrawElementsType nativeType;
+     ANGLE_TRY(mtl::GetImpl(getState().getVertexArray())
+                   ->getIndexBufferForIndirect(context, type, &indexBuffer, &nativeType));
++    const auto arguments = mtl::GetImpl(getState().getTargetBuffer(gl::BufferBinding::DrawIndirect))
++                               ->getCurrentBuffer();
++    const size_t offset  = reinterpret_cast<uintptr_t>(indirect);
++    const bool lineLoop  = mode == gl::PrimitiveMode::LineLoop;
++    mtl::BufferSlice closing;
++    if (lineLoop)
++    {
++        ANGLE_TRY(prepareIndirectLineLoop(arguments, offset, indexBuffer, nativeType, &closing));
++    }
+     ANGLE_TRY(resyncDrawFramebufferIfNeeded(context));
+     if (mCullAllPolygons && gl::IsPolygonMode(mode))
+     {
+@@ -1044,11 +1150,17 @@ explicit ProgramPipelineMtl(const gl::ProgramPipelineState &state) : ProgramPipe
+     ANGLE_TRY(setupDraw(context, 0, 0, 1, type, nullptr, false, &noOp));
+     if (!noOp)
+     {
+-        gl::Buffer *arguments = getState().getTargetBuffer(gl::BufferBinding::DrawIndirect);
+         mRenderEncoder.drawIndexedIndirect(
+-            mtl::GetPrimitiveType(mode), mtl::GetIndexType(nativeType), indexBuffer.buffer(),
+-            indexBuffer.offset(), mtl::GetImpl(arguments)->getCurrentBuffer(),
+-            reinterpret_cast<uintptr_t>(indirect));
++            mtl::GetPrimitiveType(lineLoop ? gl::PrimitiveMode::LineStrip : mode),
++            mtl::GetIndexType(nativeType), indexBuffer.buffer(), indexBuffer.offset(), arguments,
++            offset);
++        if (lineLoop)
++        {
++            mRenderEncoder.drawIndexedIndirect(MTLPrimitiveTypeLine, MTLIndexTypeUInt32,
++                                               closing.buffer(),
++                                               closing.offset() + kIndirectLineLoopIndicesOffset,
++                                               closing.buffer(), closing.offset());
++        }
+     }
+     return checkCommandBufferError();
+ }
+diff --git a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+index afbae10..724203e 100644
+--- a/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
++++ b/src/tests/gl_tests/ComputeDispatchTestMetal.cpp
+@@ -1198,6 +1198,246 @@ TEST_P(ComputeDispatchTestMetal, NestedImageArraysAndAliases)
+     ASSERT_GL_NO_ERROR();
+ }
+ 
++TEST_P(ComputeDispatchTestMetal, GPUGeneratedLineLoopIndirectAndMultiDraw)
++{
++    constexpr char producer[]       = R"(#version 310 es
++        layout(local_size_x=1) in;
++        layout(std430,binding=0) buffer Commands { uint words[]; } commands;
++        layout(std430,binding=1) buffer Indices { uint words[]; } indices;
++        uniform uint indexSize, count, instances, second;
++        void main() {
++            for (uint i=0u;i<6u;++i) indices.words[i]=0xcdcdcdcdu;
++            if (indexSize==1u) { indices.words[0]=0x0504fbfau; indices.words[1]=0xfdfc0706u; }
++            if (indexSize==2u) { indices.words[1]=0x00050004u; indices.words[2]=0x00070006u; }
++            if (indexSize==4u) for (uint i=0u;i<4u;++i) indices.words[2u+i]=4u+i;
++            commands.words[64]=count;
++            commands.words[65]=instances;
++            commands.words[66]=indexSize==0u ? 3u : 2u;
++            commands.words[67]=indexSize==0u ? 0u : 0xffffffffu;
++            commands.words[68]=0u;
++            commands.words[second]=0u;
++            commands.words[second+1u]=1u;
++            commands.words[second+2u]=0u;
++            commands.words[second+3u]=0u;
++            commands.words[second+4u]=0u;
++        }
++    )";
++    constexpr char vertex[]         = R"(#version 310 es
++        void main() {
++            int i=gl_VertexID-3;
++            vec2 p=vec2(i==0 || i==3 ? -0.75 : 0.5, i<2 ? -0.5 : 0.5);
++            p.x+=float(gl_InstanceID)*0.25;
++            gl_Position=vec4(p,0,1);
++        }
++    )";
++    constexpr char fragment[]       = R"(#version 310 es
++        precision highp float;
++        out vec4 color;
++        void main() { color=vec4(0,1,0,1); }
++    )";
++    constexpr char markerVertex[]   = R"(#version 310 es
++        void main() {
++            vec2 p=gl_VertexID==0 ? vec2(-1,-1) : gl_VertexID==1 ? vec2(3,-1) : vec2(-1,3);
++            gl_Position=vec4(p,0,1);
++        }
++    )";
++    constexpr char markerFragment[] = R"(#version 310 es
++        precision highp float;
++        out vec4 color;
++        void main() { color=vec4(0,0,1,1); }
++    )";
++    constexpr char tinyProducer[]   = R"(#version 310 es
++        layout(local_size_x=1) in;
++        layout(std430,binding=0) buffer Command { uint words[]; } command;
++        uniform bool indexed;
++        void main() {
++            command.words[0]=4u; command.words[1]=2u;
++            command.words[2]=indexed ? 2u : 3u;
++            command.words[3]=indexed ? 0xffffffffu : 0u;
++            if (indexed) command.words[4]=0u;
++        }
++    )";
++    ASSERT_TRUE(EnsureGLExtensionEnabled("GL_EXT_multi_draw_indirect"));
++    ANGLE_GL_COMPUTE_PROGRAM(compute, producer);
++    ANGLE_GL_COMPUTE_PROGRAM(tinyCompute, tinyProducer);
++    ANGLE_GL_PROGRAM(render, vertex, fragment);
++    ANGLE_GL_PROGRAM(marker, markerVertex, markerFragment);
++    GLVertexArray vao;
++    glBindVertexArray(vao);
++    GLBuffer commands, indices, referenceIndices;
++    std::array<uint32_t, 128> expectedCommands;
++    expectedCommands.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_DRAW_INDIRECT_BUFFER, commands);
++    glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(expectedCommands), expectedCommands.data(),
++                 GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, commands);
++    std::array<uint32_t, 32> expectedIndices;
++    expectedIndices.fill(0xcdcdcdcdu);
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(expectedIndices), expectedIndices.data(),
++                 GL_DYNAMIC_DRAW);
++    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, indices);
++    const std::array<uint32_t, 4> reference = {3, 4, 5, 6};
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, referenceIndices);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(reference), reference.data(), GL_STATIC_DRAW);
++    auto begin = [&]() {
++        glClearColor(1, 0, 0, 1);
++        glClear(GL_COLOR_BUFFER_BIT);
++        glUseProgram(marker);
++        glEnable(GL_SCISSOR_TEST);
++        glScissor(0, 0, 1, 1);
++        glDrawArrays(GL_TRIANGLES, 0, 3);
++        glDisable(GL_SCISSOR_TEST);
++        glUseProgram(render);
++    };
++    const std::array<GLenum, 4> types = {GL_NONE, GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT,
++                                         GL_UNSIGNED_INT};
++    for (uint32_t format = 0; format < 4; ++format)
++    {
++        for (uint32_t multi = 0; multi < 2; ++multi)
++        {
++            for (uint32_t scenario = 0; scenario < 4; ++scenario)
++            {
++                const uint32_t count     = scenario == 1 ? 1 : scenario == 2 ? 0 : 4;
++                const uint32_t instances = scenario == 3 ? 0 : 2;
++                const uint32_t indexSize = format == 0 ? 0 : format == 1 ? 1 : format == 2 ? 2 : 4;
++                const uint32_t stride    = scenario % 2 == 0 ? 0 : 32;
++                const uint32_t second    = 64 + (stride ? stride / 4 : indexSize ? 5 : 4);
++                begin();
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, referenceIndices);
++                if (format == 0)
++                {
++                    glDrawArraysInstanced(GL_LINE_LOOP, 3, count, instances);
++                }
++                else
++                {
++                    glDrawElementsInstanced(GL_LINE_LOOP, count, GL_UNSIGNED_INT, nullptr,
++                                            instances);
++                }
++                std::array<GLColor, 256> referencePixels;
++                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, referencePixels.data());
++                ASSERT_GL_NO_ERROR();
++                EXPECT_EQ(referencePixels[0], GLColor::blue);
++                if (count == 4 && instances != 0)
++                {
++                    EXPECT_GT(
++                        std::count(referencePixels.begin(), referencePixels.end(), GLColor::green),
++                        20);
++                }
++                glUseProgram(compute);
++                glUniform1ui(glGetUniformLocation(compute, "indexSize"), indexSize);
++                glUniform1ui(glGetUniformLocation(compute, "count"), count);
++                glUniform1ui(glGetUniformLocation(compute, "instances"), instances);
++                glUniform1ui(glGetUniformLocation(compute, "second"), second);
++                glDispatchCompute(1, 1, 1);
++                glMemoryBarrier(GL_COMMAND_BARRIER_BIT | GL_ELEMENT_ARRAY_BARRIER_BIT);
++                begin();
++                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
++                const void *offset = reinterpret_cast<const void *>(256);
++                if (format == 0)
++                {
++                    if (multi)
++                    {
++                        glMultiDrawArraysIndirectEXT(GL_LINE_LOOP, offset, 2, stride);
++                    }
++                    else
++                    {
++                        glDrawArraysIndirect(GL_LINE_LOOP, offset);
++                    }
++                }
++                else
++                {
++                    if (multi)
++                    {
++                        glMultiDrawElementsIndirectEXT(GL_LINE_LOOP, types[format], offset, 2,
++                                                       stride);
++                    }
++                    else
++                    {
++                        glDrawElementsIndirect(GL_LINE_LOOP, types[format], offset);
++                    }
++                }
++                ASSERT_GL_NO_ERROR();
++                std::array<GLColor, 256> pixels;
++                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++                EXPECT_EQ(pixels, referencePixels) << format << ' ' << multi << ' ' << scenario;
++                EXPECT_EQ(pixels[0], GLColor::blue);
++                expectedCommands[64] = count;
++                expectedCommands[65] = instances;
++                expectedCommands[66] = indexSize ? 2 : 3;
++                expectedCommands[67] = indexSize ? 0xffffffffu : 0u;
++                expectedCommands[68] = 0;
++                for (uint32_t i = 0; i < 5; ++i)
++                {
++                    expectedCommands[second + i] = i == 1 ? 1 : 0;
++                }
++            }
++        }
++    }
++    for (uint32_t i = 0; i < 4; ++i)
++    {
++        expectedIndices[2 + i] = 4 + i;
++    }
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    auto check = [&](GLuint buffer, const auto &expected) {
++        glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
++        const auto *actual = static_cast<const uint32_t *>(
++            glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(expected), GL_MAP_READ_BIT));
++        ASSERT_NE(actual, nullptr);
++        for (size_t i = 0; i < expected.size(); ++i)
++        {
++            EXPECT_EQ(actual[i], expected[i]) << i;
++        }
++        EXPECT_EQ(glUnmapBuffer(GL_SHADER_STORAGE_BUFFER), GL_TRUE);
++    };
++    check(indices, expectedIndices);
++    check(commands, expectedCommands);
++    // Minimal argument allocations exercise the array kernel branch without
++    // an extra fifth argument word, and the complete 20-byte indexed packet.
++    GLBuffer tiny;
++    for (bool indexed : {false, true})
++    {
++        begin();
++        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, referenceIndices);
++        if (indexed)
++        {
++            glDrawElementsInstanced(GL_LINE_LOOP, 4, GL_UNSIGNED_INT, nullptr, 2);
++        }
++        else
++        {
++            glDrawArraysInstanced(GL_LINE_LOOP, 3, 4, 2);
++        }
++        std::array<GLColor, 256> referencePixels;
++        glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, referencePixels.data());
++        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, tiny);
++        glBufferData(GL_DRAW_INDIRECT_BUFFER, indexed ? 20 : 16, nullptr, GL_DYNAMIC_DRAW);
++        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, tiny);
++        glUseProgram(tinyCompute);
++        glUniform1i(glGetUniformLocation(tinyCompute, "indexed"), indexed);
++        glDispatchCompute(1, 1, 1);
++        glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
++        begin();
++        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices);
++        if (indexed)
++        {
++            glDrawElementsIndirect(GL_LINE_LOOP, GL_UNSIGNED_INT, nullptr);
++        }
++        else
++        {
++            glDrawArraysIndirect(GL_LINE_LOOP, nullptr);
++        }
++        ASSERT_GL_NO_ERROR();
++        std::array<GLColor, 256> pixels;
++        glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++        EXPECT_EQ(pixels, referencePixels);
++        EXPECT_EQ(pixels[0], GLColor::blue);
++    }
++    glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
++    const std::array<uint32_t, 5> expectedTiny = {4, 2, 2, 0xffffffffu, 0};
++    check(tiny, expectedTiny);
++    ASSERT_GL_NO_ERROR();
++}
++
+ TEST_P(ComputeDispatchTestMetal, ZeroDispatchAndFrontendValidation)
+ {
+     constexpr char source[] = R"(#version 310 es
