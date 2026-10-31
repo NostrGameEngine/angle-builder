@@ -1,8 +1,8 @@
 diff --git a/BUILD.gn b/BUILD.gn
-index 66aa7ab..fece7b8 100644
+index f38d9e8..3e677ec 100644
 --- a/BUILD.gn
 +++ b/BUILD.gn
-@@ -1240,29 +1240,25 @@ angle_source_set("angle_gl_enum_utils") {
+@@ -1248,29 +1248,25 @@ angle_source_set("angle_gl_enum_utils") {
  }
  
  if (angle_use_wayland) {
@@ -47,7 +47,7 @@ index 66aa7ab..fece7b8 100644
    }
  }
 diff --git a/gni/angle.gni b/gni/angle.gni
-index bde26da..12803d2 100644
+index a34718d..c4840f6 100644
 --- a/gni/angle.gni
 +++ b/gni/angle.gni
 @@ -20,6 +20,10 @@ if (!defined(checkout_angle_partition_alloc)) {
@@ -85,12 +85,12 @@ index 4eef711..0587f2e 100644
  
      data_deps = []
 diff --git a/src/libANGLE/renderer/vulkan/DisplayVk.cpp b/src/libANGLE/renderer/vulkan/DisplayVk.cpp
-index 072ab0b..5f07f11 100644
+index b18687e..6b20346 100644
 --- a/src/libANGLE/renderer/vulkan/DisplayVk.cpp
 +++ b/src/libANGLE/renderer/vulkan/DisplayVk.cpp
-@@ -32,65 +32,86 @@ namespace rx
- namespace
- {
+@@ -35,65 +35,86 @@ namespace
+ constexpr uint32_t kDisplayVkScratchBufferLifetime = 1000u;
+ 
  // Query surface format and colorspace support.
 -void GetSupportedFormatColorspaces(VkPhysicalDevice physicalDevice,
 -                                   const angle::FeaturesVk &featuresVk,
@@ -227,7 +227,7 @@ index 072ab0b..5f07f11 100644
  vk::UseDebugLayers ShouldLoadDebugLayers(const egl::AttributeMap &attribs)
 @@ -321,15 +342,14 @@ ShareGroupImpl *DisplayVk::createShareGroup(const egl::ShareGroupState &state)
  
- bool DisplayVk::isConfigFormatSupported(VkFormat format) const
+ bool ThreadSafeDisplayVk::isConfigFormatSupported(VkFormat format) const
  {
 -    // Requires VK_GOOGLE_surfaceless_query extension to be supported.
 -    ASSERT(mRenderer->getFeatures().supportsSurfacelessQueryExtension.enabled);
@@ -244,9 +244,14 @@ index 072ab0b..5f07f11 100644
          {
              return true;
          }
-@@ -342,37 +362,31 @@ bool DisplayVk::isSurfaceFormatColorspacePairSupported(VkSurfaceKHR surface,
-                                                        VkFormat format,
-                                                        VkColorSpaceKHR colorspace) const
+@@ -339,40 +359,34 @@ bool ThreadSafeDisplayVk::isConfigFormatSupported(VkFormat format) const
+ }
+ 
+ bool ThreadSafeDisplayVk::isSurfaceFormatColorspacePairSupported(VkSurfaceKHR surface,
+-                                                                 VkFormat format,
+-                                                                 VkColorSpaceKHR colorspace) const
++                                                       VkFormat format,
++                                                       VkColorSpaceKHR colorspace) const
  {
 -    if (mSupportedColorspaceFormatsMap.size() > 0)
 +    // A temporary native surface is suitable for discovering EGL capabilities,
@@ -301,12 +306,12 @@ index 072ab0b..5f07f11 100644
      return false;
  }
  
-@@ -381,33 +395,36 @@ bool DisplayVk::isColorspaceSupported(VkColorSpaceKHR colorspace) const
+@@ -381,33 +395,36 @@ bool ThreadSafeDisplayVk::isColorspaceSupported(VkColorSpaceKHR colorspace) cons
      return mSupportedColorspaceFormatsMap.count(colorspace) > 0;
  }
  
--void DisplayVk::initSupportedSurfaceFormatColorspaces()
-+bool DisplayVk::cacheSupportedSurfaceFormatColorspaces(VkSurfaceKHR surface)
+-void ThreadSafeDisplayVk::initSupportedSurfaceFormatColorspaces()
++bool ThreadSafeDisplayVk::cacheSupportedSurfaceFormatColorspaces(VkSurfaceKHR surface)
  {
 -    const angle::FeaturesVk &featuresVk = mRenderer->getFeatures();
 -    if (featuresVk.supportsSurfacelessQueryExtension.enabled &&
@@ -347,7 +352,7 @@ index 072ab0b..5f07f11 100644
 +    return true;
 +}
 +
-+void DisplayVk::initSupportedSurfaceFormatColorspaces()
++void ThreadSafeDisplayVk::initSupportedSurfaceFormatColorspaces()
 +{
 +    mSupportedColorspaceFormatsMap.clear();
 +    mSurfaceFormatsAreSurfaceSpecific = false;
@@ -362,13 +367,14 @@ index 072ab0b..5f07f11 100644
  }
  
 diff --git a/src/libANGLE/renderer/vulkan/DisplayVk.h b/src/libANGLE/renderer/vulkan/DisplayVk.h
-index e688eef..e14c30d 100644
+index cf872e2..753159c 100644
 --- a/src/libANGLE/renderer/vulkan/DisplayVk.h
 +++ b/src/libANGLE/renderer/vulkan/DisplayVk.h
-@@ -131,6 +131,15 @@ class DisplayVk : public DisplayImpl, public vk::GlobalOps, public ThreadSafeDis
-     ThreadSafeDisplayImpl *getThreadSafeDisplayImpl() override { return this; }
+@@ -49,9 +49,19 @@ class ThreadSafeDisplayVk : public ThreadSafeDisplayImpl, public vk::ErrorContex
  
    protected:
+     bool isColorspaceSupported(VkColorSpaceKHR colorspace) const;
+-    void initSupportedSurfaceFormatColorspaces();
 +    virtual void initSupportedSurfaceFormatColorspaces();
 +    bool cacheSupportedSurfaceFormatColorspaces(VkSurfaceKHR surface);
 +    void clearSupportedSurfaceFormatColorspaces()
@@ -377,28 +383,14 @@ index e688eef..e14c30d 100644
 +        mSurfaceFormatsAreSurfaceSpecific = false;
 +    }
 +    bool hasSupportedSurfaceFormats() const { return !mSupportedColorspaceFormatsMap.empty(); }
-+
-     void generateExtensions(egl::DisplayExtensions *outExtensions) const override;
  
    private:
-@@ -141,7 +150,6 @@ class DisplayVk : public DisplayImpl, public vk::GlobalOps, public ThreadSafeDis
-     virtual angle::Result waitNativeImpl();
- 
-     bool isColorspaceSupported(VkColorSpaceKHR colorspace) const;
--    void initSupportedSurfaceFormatColorspaces();
- 
-     // vk::GlobalOps
-     void putBlob(const angle::BlobCacheKey &key, const angle::MemoryBuffer &value) override;
-@@ -153,6 +161,9 @@ class DisplayVk : public DisplayImpl, public vk::GlobalOps, public ThreadSafeDis
- 
-     angle::ScratchBuffer mScratchBuffer;
- 
-+    // A real-surface probe describes only that surface; re-query application windows.
++    // A native probe cannot authorize formats on other application surfaces.
 +    bool mSurfaceFormatsAreSurfaceSpecific = false;
 +
-     // Map of supported colorspace and associated surface format set.
-     angle::HashMap<VkColorSpaceKHR, std::unordered_set<VkFormat>> mSupportedColorspaceFormatsMap;
- };
+     // Map of supported colorspace and associated surface format set. This is thread-safe because
+     // it's populated once during initialization under the display lock and is only ever queried
+     // afterwards.
 diff --git a/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp b/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp
 index ac737b4..7dc906a 100644
 --- a/src/libANGLE/renderer/vulkan/linux/wayland/DisplayVkWayland.cpp

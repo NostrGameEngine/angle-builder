@@ -14,4 +14,4 @@ xcrun clang++ -std=c++17 -fobjc-arc -I "$ANGLE_DIR/include" \
   -Wl,-rpath,"$native_dir" -framework AppKit -framework Metal -framework QuartzCore \
   -o "$test_dir/metal-hdr-probe"
 # ANGLE's dylib install names may be relative to the native library directory.
-(cd "$native_dir" && "$test_dir/metal-hdr-probe")
+(cd "$native_dir" && MTL_DEBUG_LAYER=1 "$test_dir/metal-hdr-probe")

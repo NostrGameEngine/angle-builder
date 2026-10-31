@@ -1,8 +1,8 @@
 diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
-index b309c96..4a546f3 100644
+index a18eadf..04aba53 100644
 --- a/src/libANGLE/renderer/metal/DisplayMtl.mm
 +++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
-@@ -464,6 +464,13 @@ bool IsMetalDisplayAvailable()
+@@ -463,6 +463,13 @@ bool IsMetalDisplayAvailable()
  
  void DisplayMtl::generateExtensions(egl::DisplayExtensions *outExtensions) const
  {
@@ -16,7 +16,7 @@ index b309c96..4a546f3 100644
      outExtensions->createContextRobustness    = true;
      outExtensions->iosurfaceClientBuffer      = true;
      outExtensions->surfacelessContext         = true;
-@@ -631,6 +638,17 @@ bool IsMetalDisplayAvailable()
+@@ -634,6 +641,17 @@ bool IsMetalDisplayAvailable()
          configs.add(config);
      }
  
@@ -35,7 +35,7 @@ index b309c96..4a546f3 100644
  }
  
 diff --git a/src/libANGLE/renderer/metal/SurfaceMtl.mm b/src/libANGLE/renderer/metal/SurfaceMtl.mm
-index 6e80d9b..cf1cc96 100644
+index ce671ec..84ec784 100644
 --- a/src/libANGLE/renderer/metal/SurfaceMtl.mm
 +++ b/src/libANGLE/renderer/metal/SurfaceMtl.mm
 @@ -85,6 +85,14 @@
@@ -55,7 +55,7 @@ index 6e80d9b..cf1cc96 100644
  
 @@ -424,6 +432,12 @@
  
- egl::Error WindowSurfaceMtl::initialize(const egl::Display *display)
+ egl::Error WindowSurfaceMtl::initialize(const egl::ThreadSafeDisplay *display)
  {
 +    const bool hdr = mState.attributes.get(EGL_GL_COLORSPACE_KHR, EGL_GL_COLORSPACE_LINEAR_KHR) ==
 +                     EGL_GL_COLORSPACE_SCRGB_LINEAR_EXT;
