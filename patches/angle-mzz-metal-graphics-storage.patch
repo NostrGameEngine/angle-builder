@@ -1,0 +1,775 @@
+diff --git a/src/common/metal_shader_bindings.h b/src/common/metal_shader_bindings.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6826bc9b2b28b14b86f1712ad23616044b1f1a1d
+--- /dev/null
++++ b/src/common/metal_shader_bindings.h
+@@ -0,0 +1,29 @@
++// Copyright 2026 The ANGLE Project Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMMON_METAL_SHADER_BINDINGS_H_
++#define COMMON_METAL_SHADER_BINDINGS_H_
++
++#include <cstdint>
++
++namespace angle
++{
++namespace metal
++{
++// Metal's documented buffer-argument table has 31 entries per function on all
++// GPU families accepted by the opt-in GLES 3.1 profile. This is an API/family
++// limit, not an MTLDevice property.
++constexpr uint32_t kBufferArgumentCount = 31;
++// Slots preceding this index belong to ANGLE's vertex and internal resources.
++constexpr uint32_t kGraphicsStorageFirstBinding = 26;
++// The final table entry is reserved for a graphics atomic-counter buffer.
++constexpr uint32_t kGraphicsStorageEndBinding = kBufferArgumentCount - 1;
++constexpr uint32_t kGraphicsStorageBindingCount =
++    kGraphicsStorageEndBinding - kGraphicsStorageFirstBinding;
++// The driver uniform buffer uses a 16-byte-aligned array indexed by Metal slot.
++constexpr uint32_t kGraphicsStorageSizeSlots = (kBufferArgumentCount + 3) / 4 * 4;
++}  // namespace metal
++}  // namespace angle
++
++#endif  // COMMON_METAL_SHADER_BINDINGS_H_
+diff --git a/src/compiler/translator/msl/DriverUniformMetal.cpp b/src/compiler/translator/msl/DriverUniformMetal.cpp
+index 3ef26ffca44b5ba06e763b531803bbbddd641b02..65fcd2e6a4ff9686c68352efe3c41cfa2192b49a 100644
+--- a/src/compiler/translator/msl/DriverUniformMetal.cpp
++++ b/src/compiler/translator/msl/DriverUniformMetal.cpp
+@@ -58,13 +58,19 @@ TFieldList *DriverUniformMetal::createUniformFields(TSymbolTable *symbolTable)
+         driverFieldList->push_back(driverUniformField);
+     }
+ 
++    // Physical Metal buffer slots are reflected into the graphics executable.
++    // Keep each slot's GL-bound range size for runtime array length().
++    auto *sizes = new TType(EbtUInt, EbpHigh, EvqGlobal, 2);
++    sizes->makeArray(kMetalGraphicsStorageSizeSlots);
++    driverFieldList->push_back(new TField(sizes, ImmutableString("storageBufferSizes"),
++                                         TSourceLoc(), SymbolType::AngleInternal));
+     return driverFieldList;
+ }
+ 
+ TFieldList *DriverUniformMetal::createComputeUniformFields(TSymbolTable *symbolTable)
+ {
+     auto *fields = DriverUniform::createComputeUniformFields(symbolTable);
+-    auto *sizes  = new TType(EbtUInt, EbpHigh, EvqGlobal);
++    auto *sizes  = new TType(EbtUInt, EbpHigh, EvqGlobal, 2);
+     sizes->makeArray(kMetalComputeStorageBuffers);
+     fields->push_back(new TField(sizes, ImmutableString("storageBufferSizes"), TSourceLoc(),
+                                  SymbolType::AngleInternal));
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index cb4fff7493345ea2c59ba63590cc678339fed4a2..a1d1b472e6fa17bf60036c356fc6349a2c5e3393 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -3639,7 +3639,7 @@ bool GenMetalTraverser::visitBranch(Visit, TIntermBranch *branchNode)
+         {
+             if (isTraversingVertexMain)
+             {
+-                mOut << "#if TRANSFORM_FEEDBACK_ENABLED\n";
++                mOut << "#if TRANSFORM_FEEDBACK_ENABLED && !TRANSFORM_FEEDBACK_WITH_RASTERIZATION\n";
+                 emitIndentation();
+                 mOut << "return;\n";
+                 emitIndentation();
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 1a25f9b83501fbff7df0de0b532a388c0932d2bb..aa85afb1323b3a6f575c75fb2b8acb32dd3c5f10 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -297,6 +297,7 @@ class ProgramPrelude : public TIntermTraverser
+     void imageStore();
+     void memoryBarrierImage();
+     void storageArgument();
++    void storageArrayLength();
+     void storageAtomics();
+     void computeMemoryFences();
+     void barrier();
+@@ -331,7 +332,7 @@ class ProgramPrelude : public TIntermTraverser
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ PROGRAM_PRELUDE_DECLARE(transform_feedback_guard, R"(
+-#if TRANSFORM_FEEDBACK_ENABLED
++#if TRANSFORM_FEEDBACK_ENABLED && !TRANSFORM_FEEDBACK_WITH_RASTERIZATION
+     #define __VERTEX_OUT(args) void
+ #else
+     #define __VERTEX_OUT(args) args
+@@ -3433,6 +3434,16 @@ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texturecube<T, Acc
+ )",
+                         imageSize())
+ 
++// Runtime SSBO lengths use a 64-bit byte range even though GLSL returns int.
++PROGRAM_PRELUDE_DECLARE(storageArrayLength, R"(
++ANGLE_ALWAYS_INLINE int ANGLE_storageArrayLength(metal::uint2 size, uint offset, uint stride)
++{
++    ulong bytes = (ulong(size.y) << 32) | ulong(size.x);
++    ulong elements = bytes >= ulong(offset) ? (bytes - ulong(offset)) / ulong(stride) : 0ul;
++    return int(metal::min(elements, ulong(0x7fffffffu)));
++}
++)")
++
+ // Memory-only GLSL barriers must be legal in divergent control flow. A Metal
+ // threadgroup_barrier or simdgroup_barrier would add an execution rendezvous.
+ PROGRAM_PRELUDE_DECLARE(computeMemoryFences, R"(
+@@ -3610,6 +3621,7 @@ ProgramPrelude::FuncToEmitter ProgramPrelude::BuildFuncToEmitter()
+     putAngle("flatten", EMIT_METHOD(flattenArray));
+     putAngle("inout", EMIT_METHOD(inout));
+     putAngle("out", EMIT_METHOD(out));
++    putAngle("storageArrayLength", EMIT_METHOD(storageArrayLength));
+     putAngle("computeMemoryBarrier", EMIT_METHOD(computeMemoryFences));
+     putAngle("computeGroupMemoryBarrier", EMIT_METHOD(computeMemoryFences));
+     putAngle("computeMemoryBarrierBuffer", EMIT_METHOD(computeMemoryFences));
+diff --git a/src/compiler/translator/msl/StorageBuffer.cpp b/src/compiler/translator/msl/StorageBuffer.cpp
+index 5935dc0c7d518a99e36db8d491138d8e9e6d3e63..098288148a8c5ca1f050b4515d020e2381602e0d 100644
+--- a/src/compiler/translator/msl/StorageBuffer.cpp
++++ b/src/compiler/translator/msl/StorageBuffer.cpp
+@@ -239,17 +239,14 @@ class LowerArrayLength : public TIntermRebuild
+             mValid = false;
+             return node;
+         }
+-        auto *length = new TIntermBinary(
+-            EOpDiv,
+-            new TIntermBinary(EOpSub, size->deepCopy(),
+-                              CreateUIntNode(static_cast<unsigned int>(access.offset))),
+-            CreateUIntNode(static_cast<unsigned int>(stride)));
+-        auto *clamped = new TIntermTernary(
+-            new TIntermBinary(EOpGreaterThanEqual, size,
+-                              CreateUIntNode(static_cast<unsigned int>(access.offset))),
+-            length, CreateUIntNode(0));
+-        return *TIntermAggregate::CreateConstructor(TType(EbtInt, EbpHigh),
+-                                                    new TIntermSequence{clamped});
++        // A buffer's bound range can exceed 4 GiB even on devices where the
++        // maximum declared block size is smaller. Preserve both halves of its
++        // length until after the offset and array stride have been applied.
++        auto *args = new TIntermSequence{
++            size, CreateUIntNode(static_cast<unsigned int>(access.offset)),
++            CreateUIntNode(static_cast<unsigned int>(stride))};
++        return mEnv.callFunctionOverload(Name("storageArrayLength"), TType(EbtInt, EbpHigh),
++                                         *args);
+     }
+     bool mValid = true;
+     SymbolEnv &mEnv;
+@@ -383,7 +380,8 @@ class WrapStorageArguments : public TIntermRebuild
+             return node;
+         }
+         auto &arguments = *node.getSequence();
+-        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++        // Metal 3.2 supports device memory fences in render and compute functions.
++        // The GLES 3.1 Metal profile is already gated on this language version.
+         {
+             const char *fence = nullptr;
+             switch (function->getBuiltInOp())
+diff --git a/src/compiler/translator/msl/StorageBuffer.h b/src/compiler/translator/msl/StorageBuffer.h
+index 5d9db5cb1600d002a9bbd1cf34fe092c9f4e03c7..b4bdd694f6ee57124fed6c6734822e2a73246aef 100644
+--- a/src/compiler/translator/msl/StorageBuffer.h
++++ b/src/compiler/translator/msl/StorageBuffer.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPILER_TRANSLATOR_MSL_STORAGEBUFFER_H_
+ #define COMPILER_TRANSLATOR_MSL_STORAGEBUFFER_H_
+ 
++#include "common/metal_shader_bindings.h"
+ #include "compiler/translator/IntermNode.h"
+ #include "compiler/translator/msl/Layout.h"
+ 
+@@ -17,6 +18,9 @@ class DriverUniformMetal;
+ // Compute reserves slots 0..7 for storage, 19/17 for default/driver uniforms,
+ // and 24 for the UBO argument buffer. GL binding points are resolved at link time.
+ constexpr size_t kMetalComputeStorageBuffers = 8;
++constexpr size_t kMetalGraphicsStorageBufferStart = angle::metal::kGraphicsStorageFirstBinding;
++constexpr size_t kMetalGraphicsStorageBuffers = angle::metal::kGraphicsStorageBindingCount;
++constexpr size_t kMetalGraphicsStorageSizeSlots = angle::metal::kGraphicsStorageSizeSlots;
+ // Compute does not use vertex attributes or transform feedback. Keep the driver
+ // and default uniform slots fixed so program stages retain their existing ABI.
+ constexpr size_t kMetalComputeUniformBuffers                            = 12;
+diff --git a/src/compiler/translator/msl/TranslatorMSL.cpp b/src/compiler/translator/msl/TranslatorMSL.cpp
+index 1524676ae9c6dc1b0c84fed95f325441695ed7d2..a155b876b76c956b3fa6fb67636677a5b9c0a132 100644
+--- a/src/compiler/translator/msl/TranslatorMSL.cpp
++++ b/src/compiler/translator/msl/TranslatorMSL.cpp
+@@ -882,13 +882,6 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+     {
+         return false;
+     }
+-    if (getShaderType() != GL_COMPUTE_SHADER && atomicCounters)
+-    {
+-        // These optional graphics-stage limits are zero. Reject the shader
+-        // cleanly before reaching MSL's compute-only atomic-counter lowering.
+-        getInfoSink().info << "Metal graphics atomic counters are not supported.\n";
+-        return false;
+-    }
+ 
+     TSymbolTable &symbolTable = getSymbolTable();
+     IdGen idGen;
+@@ -988,18 +981,19 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+     else if (getShaderType() == GL_COMPUTE_SHADER)
+     {
+         driverUniforms->addComputeDriverUniformsToShader(root, &getSymbolTable());
+-        if (atomicCounters &&
+-            !RewriteAtomicCounters(this, root, &getSymbolTable(),
+-                                   driverUniforms->getAcbBufferOffsets(), nullptr, 1))
+-        {
+-            return false;
+-        }
+     }
+     else
+     {
+         driverUniforms->addGraphicsDriverUniformsToShader(root, &getSymbolTable());
+     }
+ 
++    if (!compileOptions.useIR && atomicCounters &&
++        !RewriteAtomicCounters(this, root, &getSymbolTable(),
++                               driverUniforms->getAcbBufferOffsets(), nullptr, 1))
++    {
++        return false;
++    }
++
+     if (getShaderType() != GL_COMPUTE_SHADER &&
+         !ReplaceGLDepthRangeWithDriverUniform(this, root, driverUniforms, &getSymbolTable()))
+     {
+@@ -1385,23 +1379,20 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+                 const bool atomic  = oldVar.symbolType() == SymbolType::AngleInternal &&
+                                      type.getInterfaceBlock()->name() == "ANGLEAtomicCounters";
+                 const size_t count = type.getArraySizeProduct();
+-                if (getShaderType() != GL_COMPUTE_SHADER)
+-                {
+-                    getInfoSink().info << "Metal graphics storage blocks are not supported.\n";
+-                    storageSupported = false;
+-                    return;
+-                }
++                const bool compute = getShaderType() == GL_COMPUTE_SHADER;
++                const size_t storageLimit = compute ? kMetalComputeStorageBuffers
++                                                    : kMetalGraphicsStorageBuffers;
+                 if (!atomic && (uniform ? computeUniformIndex + count > kMetalComputeUniformBuffers
+-                                        : storageIndex + count > kMetalComputeStorageBuffers))
++                                        : storageIndex + count > storageLimit))
+                 {
+-                    getInfoSink().info << "Metal compute supports at most eight storage block "
+-                                          "elements and twelve uniform block elements.\n";
++                    getInfoSink().info << "Metal shader buffer binding limit exceeded.\n";
+                     storageSupported = false;
+                     return;
+                 }
+-                const size_t index = atomic    ? 22
++                const size_t index = atomic    ? (compute ? 22 : angle::metal::kGraphicsStorageEndBinding)
+                                      : uniform ? kMetalComputeUniformSlots[computeUniformIndex]
+-                                               : storageIndex;
++                                     : compute ? storageIndex
++                                               : kMetalGraphicsStorageBufferStart + storageIndex;
+                 StorageBufferInfo info{index, type.getLayoutQualifier().blockStorage,
+                                        type.getLayoutQualifier().matrixPacking,
+                                        type.getMemoryQualifier().readonly,
+@@ -1446,7 +1437,7 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+                             static_cast<size_t>(compileOptions.metal.UBOArgumentBufferBindingIndex))
+                     {
+                         getInfoSink().info
+-                            << "Metal compute buffer bindings overlap reserved uniform slots.\n";
++                            << "Metal shader buffer bindings overlap reserved uniform slots.\n";
+                         storageSupported = false;
+                         return;
+                     }
+@@ -1472,7 +1463,8 @@ bool TranslatorMSL::translateImpl(TInfoSinkBase &sink,
+         return false;
+     }
+ 
+-    if (storageIndex && (compileOptions.metal.defaultUniformsBindingIndex <
++    if (getShaderType() == GL_COMPUTE_SHADER && storageIndex &&
++        (compileOptions.metal.defaultUniformsBindingIndex <
+                              static_cast<int>(kMetalComputeStorageBuffers) ||
+                          compileOptions.metal.driverUniformsBindingIndex <
+                              static_cast<int>(kMetalComputeStorageBuffers) ||
+diff --git a/src/libANGLE/Context.inl.h b/src/libANGLE/Context.inl.h
+index ea2f05eeb4b7663c26d576e2bb2882d3e306115a..2423397360e7ffb3840e6a91f04bb88ad8508c6e 100644
+--- a/src/libANGLE/Context.inl.h
++++ b/src/libANGLE/Context.inl.h
+@@ -188,6 +188,7 @@ ANGLE_INLINE void Context::drawArrays(PrimitiveMode mode, GLint first, GLsizei c
+     ANGLE_CONTEXT_TRY(prepareForDraw(mode));
+     ANGLE_CONTEXT_TRY(mImplementation->drawArrays(this, mode, first, count));
+     MarkTransformFeedbackBufferUsage(this, count, 1);
++    MarkShaderStorageUsage(this);
+ }
+ 
+ ANGLE_INLINE void Context::drawElements(PrimitiveMode mode,
+@@ -204,6 +205,7 @@ ANGLE_INLINE void Context::drawElements(PrimitiveMode mode,
+ 
+     ANGLE_CONTEXT_TRY(prepareForDraw(mode));
+     ANGLE_CONTEXT_TRY(mImplementation->drawElements(this, mode, count, type, indices));
++    MarkShaderStorageUsage(this);
+ }
+ 
+ ANGLE_INLINE void Context::bindBuffer(BufferBinding target, BufferID buffer)
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index b57d392ea75b9adffbe9e361d7f5b1bba8c5c0e0..7c147afa4ed4ab9caf426dceeb22662a90a53370 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -13,6 +13,8 @@
+ #import <Metal/Metal.h>
+ #import <mach/mach_types.h>
+ 
++#include <array>
++
+ #include "common/Optional.h"
+ #include "image_util/loadimage.h"
+ #include "libANGLE/Context.h"
+@@ -321,6 +323,10 @@ class ContextMtl : public ContextImpl, public mtl::Context
+     void serverWaitEvent(id<MTLEvent> event, uint64_t value);
+ 
+     void markResourceWrittenByCommandBuffer(const mtl::ResourceRef &resource);
++    void setGraphicsStorageBufferSizes(
++        gl::ShaderType stage,
++        const std::array<mtl::StorageBufferSize, mtl::kGraphicsStorageSizeSlots> &sizes,
++        mtl::RenderCommandEncoder *encoder);
+ 
+     const mtl::ClearColorValue &getClearColorValue() const;
+     const mtl::WriteMaskArray &getWriteMaskArray() const;
+@@ -599,6 +605,7 @@ class ContextMtl : public ContextImpl, public mtl::Context
+         int32_t xfbVerticesPerInstance;
+         uint32_t coverageMask;  // Metal specific
+         uint32_t unused2[2];
++        std::array<mtl::StorageBufferSize, mtl::kGraphicsStorageSizeSlots> storageBufferSizes;
+     };
+     static_assert(sizeof(DriverUniforms) % (sizeof(uint32_t) * 4) == 0,
+                   "DriverUniforms should be 16 bytes aligned");
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 3d04c766f7bf3ead65dd4d94e36a64027acb40a1..1a45c376cabe2359d27d7a02460ae17d181deb29 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -63,11 +63,16 @@
+         /* Normal draw call */                                                              \
+         DRAW_PROC(false);                                                                   \
+     }                                                                                       \
++    else if (getDisplay()->supportsMetalGLES31() && !mState.isRasterizerDiscardEnabled())   \
++    {                                                                                       \
++        /* Modern Apple GPUs can capture and rasterize in one vertex invocation. */         \
++        invalidateRenderPipeline();                                                         \
++        DRAW_PROC(false);                                                                   \
++    }                                                                                       \
+     else                                                                                    \
+     {                                                                                       \
+         /* First pass: write to XFB buffers in vertex shader, fragment shader inactive */   \
+-        bool rasterizationEnabled = mRenderPipelineDesc.getRasterizationType() !=           \
+-                                    mtl::RenderPipelineRasterization::Disabled;             \
++        bool rasterizationEnabled = !mState.isRasterizerDiscardEnabled();                  \
+         if (rasterizationEnabled)                                                           \
+         {                                                                                   \
+             invalidateRenderPipeline();                                                     \
+@@ -3132,7 +3137,10 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+         }
+     }
+ 
+-    if (xfbPass && !mDirtyBits.test(DIRTY_BIT_DRIVER_UNIFORMS))
++    const bool captureWithRaster = getDisplay()->supportsMetalGLES31() &&
++                                   mState.isTransformFeedbackActiveUnpaused() &&
++                                   !mState.isRasterizerDiscardEnabled();
++    if ((xfbPass || captureWithRaster) && !mDirtyBits.test(DIRTY_BIT_DRIVER_UNIFORMS))
+     {
+         // If handleDirtyDriverUniforms() was not called and this is XFB pass, we still need to
+         // update XFB related uniforms
+@@ -3264,6 +3272,15 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+     return angle::Result::Continue;
+ }
+ 
++void ContextMtl::setGraphicsStorageBufferSizes(
++    gl::ShaderType stage,
++    const std::array<mtl::StorageBufferSize, mtl::kGraphicsStorageSizeSlots> &sizes,
++    mtl::RenderCommandEncoder *encoder)
++{
++    mDriverUniforms.storageBufferSizes = sizes;
++    encoder->setData(stage, mDriverUniforms, mtl::kDriverUniformsBindingIndex);
++}
++
+ angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context,
+                                                     GLint drawCallFirstVertex,
+                                                     uint32_t verticesPerInstance)
+@@ -3417,10 +3434,15 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+         renderPassDesc.populateRenderPipelineOutputDesc(mBlendDescArray,
+                                                         &mRenderPipelineDesc.outputDescriptor);
+ 
+-        if (xfbPass)
++        const bool captureWithRaster = getDisplay()->supportsMetalGLES31() &&
++                                       mState.isTransformFeedbackActiveUnpaused() &&
++                                       !mState.isRasterizerDiscardEnabled();
++        if (xfbPass || captureWithRaster)
+         {
+-            // In XFB pass, we disable fragment shader.
+-            mRenderPipelineDesc.setRasterizationType(mtl::RenderPipelineRasterization::Disabled);
++            mRenderPipelineDesc.setRasterizationType(
++                captureWithRaster
++                    ? mtl::RenderPipelineRasterization::EnabledWithTransformFeedback
++                    : mtl::RenderPipelineRasterization::Disabled);
+         }
+         else if (mState.isRasterizerDiscardEnabled())
+         {
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 88a5509cc0eff8c53d0789db6a5015caa5b519ab..02d33ae4c32a9ccd6d71e1621c2fe44f56f08220 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -989,24 +989,47 @@ bool IsMetalDisplayAvailable()
+             static_cast<GLint>(mMetalDevice.get().maxThreadgroupMemoryLength);
+         mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Compute] =
+             maxDefaultUniformComponents;
++        mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Vertex] =
++            mtl::kMaxGraphicsStorageBuffers;
++        mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Fragment] =
++            mtl::kMaxGraphicsStorageBuffers;
+         mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] =
+             mtl::kMaxComputeStorageBuffers;
+         mNativeCaps.maxCombinedShaderStorageBlocks = mtl::kMaxComputeStorageBuffers;
+         mNativeCaps.maxShaderStorageBufferBindings = mtl::kMaxComputeStorageBuffers;
+-        mNativeCaps.maxShaderStorageBlockSize =
+-            std::min<GLint64>(mMetalDevice.get().maxBufferLength, 1 << 27);
++        // Bound block declarations to ANGLE's 32-bit static layout representation.
++        mNativeCaps.maxShaderStorageBlockSize = std::min<GLint64>(
++            mMetalDevice.get().maxBufferLength, std::numeric_limits<uint32_t>::max());
+         mNativeCaps.shaderStorageBufferOffsetAlignment                  = 256;
+         mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Compute] = mtl::kMaxShaderSamplers;
+-        mNativeCaps.maxCombinedShaderOutputResources = mtl::kMaxComputeStorageBuffers + 4;
+         mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Compute] = 1;
+         mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Compute]       = 8;
+-        mNativeCaps.maxCombinedAtomicCounterBuffers                        = 1;
+-        mNativeCaps.maxCombinedAtomicCounters                              = 8;
++        for (gl::ShaderType stage : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
++        {
++            mNativeCaps.maxShaderAtomicCounterBuffers[stage] =
++                mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Compute];
++            mNativeCaps.maxShaderAtomicCounters[stage] =
++                mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Compute];
++        }
++        mNativeCaps.maxCombinedAtomicCounterBuffers = std::max(
++            mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Compute],
++            mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Vertex] +
++                mNativeCaps.maxShaderAtomicCounterBuffers[gl::ShaderType::Fragment]);
++        mNativeCaps.maxCombinedAtomicCounters = std::max(
++            mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Compute],
++            mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Vertex] +
++                mNativeCaps.maxShaderAtomicCounters[gl::ShaderType::Fragment]);
+         mNativeCaps.maxAtomicCounterBufferBindings                         = 1;
+         mNativeCaps.maxAtomicCounterBufferSize                             = mtl::kMaxUBOSize;
+         mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute]        = 4;
+         mNativeCaps.maxCombinedImageUniforms                               = 4;
+         mNativeCaps.maxImageUnits = std::max(mNativeCaps.maxImageUnits, 4);
++        // Storage blocks and color targets use independent Metal argument tables.
++        // Derive the aggregate GLES link limit from both supported pipeline types.
++        mNativeCaps.maxCombinedShaderOutputResources = std::max(
++            mNativeCaps.maxCombinedShaderStorageBlocks + mNativeCaps.maxDrawBuffers,
++            mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] +
++                mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute]);
+     }
+ #endif
+ 
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+index 9d31522163817e9e89ad053a4aeb54d93cee9842..13b582bdccd4f1aebfa93ef42657bc08ff4c9a27 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.h
+@@ -267,6 +267,9 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+                                  bool forceUpdate,
+                                  gl::ShaderType selectedStage = gl::ShaderType::InvalidEnum);
+ 
++    angle::Result encodeGraphicsStorageBuffers(const gl::Context *glContext,
++                                               gl::ShaderType stage,
++                                               mtl::RenderCommandEncoder *encoder);
+     angle::Result updateUniformBuffers(ContextMtl *context,
+                                        mtl::RenderCommandEncoder *cmdEncoder,
+                                        const mtl::RenderPipelineDesc &pipelineDesc,
+@@ -299,11 +302,10 @@ class ProgramExecutableMtl : public ProgramExecutableImpl
+     angle::ObjCPtr<id<MTLFunction>> mComputeFunction;
+     angle::ObjCPtr<id<MTLComputePipelineState>> mComputePipeline;
+ 
+-    // Translated metal version for transform feedback only vertex shader:
+-    // - Metal doesn't allow vertex shader to write to both buffers and to stage output
+-    // (gl_Position). Need a special version of vertex shader that only writes to transform feedback
+-    // buffers.
++    // Separate translated variants capture with rasterization disabled or enabled.
++    // The combined variant is used only by the supported Metal GLES 3.1 profile.
+     mtl::TranslatedShaderInfo mMslXfbOnlyVertexShaderInfo;
++    mtl::TranslatedShaderInfo mMslXfbRasterVertexShaderInfo;
+ 
+     // Compiled native shader object variants:
+     // - Vertex shader: One with emulated rasterization discard, one with true rasterization
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index c23630f829767527ccf3b2dc385b94cb75927d76..38d3254123155ec0fa64bab79af7ccb672168e8c 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -9,6 +9,7 @@
+ #include "libANGLE/renderer/metal/ProgramExecutableMtl.h"
+ 
+ #include <array>
++#include <limits>
+ 
+ #include "common/span_util.h"
+ #include "common/unsafe_buffers.h"
+@@ -412,6 +413,7 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         mMslShaderTranslateInfo[shaderType].reset();
+     }
+     mMslXfbOnlyVertexShaderInfo.reset();
++    mMslXfbRasterVertexShaderInfo.reset();
+ }
+ 
+ ProgramExecutableMtl::~ProgramExecutableMtl() {}
+@@ -439,6 +441,7 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         mCurrentShaderVariants[shaderType] = nullptr;
+     }
+     mMslXfbOnlyVertexShaderInfo.reset();
++    mMslXfbRasterVertexShaderInfo.reset();
+ 
+     for (auto &specialization : mVertexShaderVariants)
+     {
+@@ -470,6 +473,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     mComputePipeline = nil;
+     loadTranslatedShaders(stream);
+     loadShaderInternalInfo(stream);
++    mMslXfbRasterVertexShaderInfo = mMslShaderTranslateInfo[gl::ShaderType::Vertex];
++    mMslXfbRasterVertexShaderInfo.metalLibrary = nullptr;
+     ANGLE_TRY(loadDefaultUniformBlocksInfo(contextMtl, stream));
+     return loadInterfaceBlockInfo(stream);
+ }
+@@ -923,6 +928,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ {
+     mMslShaderTranslateInfo     = std::move(shaders);
+     mMslXfbOnlyVertexShaderInfo = mMslShaderTranslateInfo[gl::ShaderType::Vertex];
++    mMslXfbRasterVertexShaderInfo = mMslShaderTranslateInfo[gl::ShaderType::Vertex];
++    mMslXfbRasterVertexShaderInfo.metalLibrary = nullptr;
+     mComputeFunction            = nil;
+     mComputePipeline            = nil;
+ }
+@@ -1028,7 +1035,7 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         buffers[slot] = mtl::GetImpl(binding.get())->getCurrentBuffer();
+         offsets[slot] = static_cast<size_t>(binding.getOffset());
+         driver.storageBufferSizes[slot] =
+-            static_cast<uint32_t>(gl::GetBoundBufferAvailableSize(binding));
++            mtl::EncodeStorageBufferSize(gl::GetBoundBufferAvailableSize(binding));
+     }
+     // Resource classes share the same allocation and dependency tracking used by
+     // graphics. MarkShaderStorageUsage in the frontend invalidates GL caches.
+@@ -1278,6 +1285,7 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     {
+         if (auto *owner = getGraphicsStageOwner(stage))
+         {
++            ANGLE_TRY(owner->encodeGraphicsStorageBuffers(glContext, stage, encoder));
+             ANGLE_TRY(owner->commitUniforms(context, encoder, stage));
+             ANGLE_TRY(owner->updateTextures(glContext, encoder, forceTexturesSetting, stage));
+         }
+@@ -1357,6 +1365,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                 : nullptr;
+     }
+ 
++    for (gl::ShaderType stage : {gl::ShaderType::Vertex, gl::ShaderType::Fragment})
++        ANGLE_TRY(encodeGraphicsStorageBuffers(glContext, stage, cmdEncoder));
+     ANGLE_TRY(commitUniforms(context, cmdEncoder));
+     ANGLE_TRY(updateTextures(glContext, cmdEncoder, forceTexturesSetting));
+ 
+@@ -1387,8 +1397,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+ 
+     if (shaderType == gl::ShaderType::Vertex)
+     {
+-        // For vertex shader, we need to create 3 variants, one with emulated rasterization
+-        // discard, one with true rasterization discard and one without.
++        // Cache vertex variants for normal rasterization, emulated or real discard,
++        // and transform feedback captured together with rasterization.
+         shaderVariant = &mVertexShaderVariants[renderPipelineDesc.getArrayDrawEmulation()]
+                                               [renderPipelineDesc.getRasterizationType()];
+         if (shaderVariant->metalShader)
+@@ -1398,17 +1408,24 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+             return angle::Result::Continue;
+         }
+ 
+-        if (renderPipelineDesc.getRasterizationType() == mtl::RenderPipelineRasterization::Disabled)
++        const bool xfbOnly = renderPipelineDesc.getRasterizationType() ==
++                             mtl::RenderPipelineRasterization::Disabled;
++        const bool xfbWithRaster = renderPipelineDesc.getRasterizationType() ==
++                                   mtl::RenderPipelineRasterization::EnabledWithTransformFeedback;
++        if (xfbOnly || xfbWithRaster)
+         {
+-            // Special case: XFB output only vertex shader.
+             ASSERT(!mExecutable->getLinkedTransformFeedbackVaryings().empty());
+-            translatedMslInfo = &mMslXfbOnlyVertexShaderInfo;
++            translatedMslInfo = xfbOnly ? &mMslXfbOnlyVertexShaderInfo
++                                        : &mMslXfbRasterVertexShaderInfo;
+             if (!translatedMslInfo->metalLibrary)
+             {
+-                // Lazily compile XFB only shader
++                std::map<std::string, std::string> macros = {{"TRANSFORM_FEEDBACK_ENABLED", "1"}};
++                if (xfbWithRaster)
++                    macros["TRANSFORM_FEEDBACK_WITH_RASTERIZATION"] = "1";
++                if (mMslShaderTranslateInfo[gl::ShaderType::Vertex].requiresComputeMemoryFences)
++                    macros["ANGLE_METAL_COMPUTE_MEMORY_FENCES"] = "1";
+                 gl::InfoLog infoLog;
+-                ANGLE_TRY(CreateMslShaderLib(context, infoLog, &mMslXfbOnlyVertexShaderInfo,
+-                                             {{"TRANSFORM_FEEDBACK_ENABLED", "1"}}));
++                ANGLE_TRY(CreateMslShaderLib(context, infoLog, translatedMslInfo, macros));
+                 translatedMslInfo->metalLibrary.get().label = @"TransformFeedback";
+             }
+         }
+@@ -1914,6 +1931,60 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     return angle::Result::Continue;
+ }
+ 
++angle::Result ProgramExecutableMtl::encodeGraphicsStorageBuffers(
++    const gl::Context *glContext, gl::ShaderType stage, mtl::RenderCommandEncoder *encoder)
++{
++    auto *context = mtl::GetImpl(glContext);
++    if (!mCurrentShaderVariants[stage])
++    {
++        return angle::Result::Continue;
++    }
++    const auto &info = mMslShaderTranslateInfo[stage];
++    const auto &blocks = mExecutable->getShaderStorageBlocks();
++    std::array<mtl::StorageBufferSize, mtl::kGraphicsStorageSizeSlots> sizes = {};
++    bool active = false;
++    for (size_t block = 0; block < blocks.size(); ++block)
++    {
++        if (block >= info.actualSSBOBindings.size())
++        {
++            continue;
++        }
++        const uint32_t slot = info.actualSSBOBindings[block];
++        if (slot < mtl::kGraphicsStorageBufferBindingStart ||
++            slot >= mtl::kGraphicsStorageBufferBindingStart + mtl::kMaxGraphicsStorageBuffers)
++        {
++            continue;
++        }
++        const auto &binding = glContext->getState().getIndexedShaderStorageBuffer(
++            mExecutable->getShaderStorageBlockBinding(block));
++        ANGLE_CHECK(context, binding.get(), "Missing shader storage buffer", GL_INVALID_OPERATION);
++        auto *buffer = mtl::GetImpl(binding.get());
++        encoder->setBufferForWrite(stage, buffer->getCurrentBuffer(),
++                                   static_cast<size_t>(binding.getOffset()), slot);
++        sizes[slot] = mtl::EncodeStorageBufferSize(gl::GetBoundBufferAvailableSize(binding));
++        active = true;
++    }
++    if (active)
++    {
++        context->setGraphicsStorageBufferSizes(stage, sizes, encoder);
++    }
++    for (const auto &counter : mExecutable->getAtomicCounterBuffers())
++    {
++        if (!counter.isActive(stage))
++        {
++            continue;
++        }
++        const auto &binding = glContext->getState().getIndexedAtomicCounterBuffer(
++            counter.pod.inShaderBinding);
++        ANGLE_CHECK(context, binding.get(), "Missing graphics atomic counter buffer",
++                    GL_INVALID_OPERATION);
++        encoder->setBufferForWrite(stage, mtl::GetImpl(binding.get())->getCurrentBuffer(),
++                                   static_cast<size_t>(binding.getOffset()),
++                                   angle::metal::kGraphicsStorageEndBinding);
++    }
++    return angle::Result::Continue;
++}
++
+ angle::Result ProgramExecutableMtl::updateXfbBuffers(ContextMtl *context,
+                                                      mtl::RenderCommandEncoder *cmdEncoder,
+                                                      const mtl::RenderPipelineDesc &pipelineDesc)
+@@ -1921,10 +1992,12 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     const gl::State &glState                 = context->getState();
+     gl::TransformFeedback *transformFeedback = glState.getCurrentTransformFeedback();
+ 
+-    if (pipelineDesc.rasterizationEnabled() || !glState.isTransformFeedbackActiveUnpaused() ||
++    const bool writesXfb = !pipelineDesc.rasterizationEnabled() ||
++        pipelineDesc.getRasterizationType() ==
++            mtl::RenderPipelineRasterization::EnabledWithTransformFeedback;
++    if (!writesXfb || !glState.isTransformFeedbackActiveUnpaused() ||
+         ANGLE_UNLIKELY(!transformFeedback))
+     {
+-        // XFB output can only be used with rasterization disabled.
+         return angle::Result::Continue;
+     }
+ 
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index 05fe54dfc45580e0e4d84490dfd3273f75d1b286..b9d74e4fba2a2dd2ff440796daef6a4e1853c888 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -35,7 +35,7 @@
+ namespace
+ {
+ constexpr uint32_t kMetalProgramBinaryVersion =
+-    0x4d43503b;  // MCP11: procedural array instance and clipping specialization
++    0x4d43503c;  // Graphics shader storage buffer driver uniforms and bindings
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/mtl_common.h b/src/libANGLE/renderer/metal/mtl_common.h
+index f9283178768ce4c9ded2d79b2c571b125bf855ed..9d95876d34928ddd3af724cae5c6898b722c9f2a 100644
+--- a/src/libANGLE/renderer/metal/mtl_common.h
++++ b/src/libANGLE/renderer/metal/mtl_common.h
+@@ -18,6 +18,7 @@
+ #include <string>
+ 
+ #include "common/Optional.h"
++#include "common/metal_shader_bindings.h"
+ #include "common/PackedEnums.h"
+ #include "common/angleutils.h"
+ #include "common/apple/ObjCPtr.h"
+@@ -89,12 +90,17 @@ namespace mtl
+ // Must match DriverUniformMetal::createComputeUniformFields. Sizes describe
+ // GL-visible storage ranges, not the remaining bytes in a Metal allocation.
+ constexpr size_t kMaxComputeStorageBuffers = 8;
++using StorageBufferSize = std::array<uint32_t, 2>;
++inline StorageBufferSize EncodeStorageBufferSize(uint64_t size)
++{
++    return {static_cast<uint32_t>(size), static_cast<uint32_t>(size >> 32)};
++}
+ struct alignas(16) ComputeDriverUniforms
+ {
+-    std::array<uint32_t, 4> acbBufferOffsets                           = {};
+-    std::array<uint32_t, kMaxComputeStorageBuffers> storageBufferSizes = {};
++    std::array<uint32_t, 4> acbBufferOffsets = {};
++    std::array<StorageBufferSize, kMaxComputeStorageBuffers> storageBufferSizes = {};
+ };
+-static_assert(sizeof(ComputeDriverUniforms) == 48);
++static_assert(sizeof(ComputeDriverUniforms) == 80);
+ 
+ constexpr uint32_t kMaxVertexAttribs = gl::MAX_VERTEX_ATTRIBS;
+ // Note: This is the max number of render targets the backend supports.
+@@ -122,7 +128,7 @@ constexpr size_t kSharedMemBufferMaxBufSizeHint = 256 * 1024;
+ constexpr size_t kDefaultAttributeSize = 4 * sizeof(float);
+ 
+ // Metal limits
+-constexpr uint32_t kMaxShaderBuffers     = 31;
++constexpr uint32_t kMaxShaderBuffers     = angle::metal::kBufferArgumentCount;
+ constexpr uint32_t kMaxShaderSamplers    = 16;
+ constexpr size_t kInlineConstDataMaxSize = 4 * 1024;
+ constexpr size_t kDefaultUniformsMaxSize = 16 * 1024;
+@@ -175,6 +181,12 @@ constexpr uint32_t kTransformFeedbackBindingIndex = kDefaultUniformsBindingIndex
+ // Binding index for UBO's argument buffer
+ constexpr uint32_t kUBOArgumentBufferBindingIndex = kTransformFeedbackBindingIndex + 4;
+ constexpr uint32_t kArrayDrawCommandBufferBindingIndex = 25;
++// These binding indices are ANGLE's reservation within Metal's per-stage table.
++constexpr uint32_t kGraphicsStorageBufferBindingStart =
++    angle::metal::kGraphicsStorageFirstBinding;
++constexpr uint32_t kMaxGraphicsStorageBuffers = angle::metal::kGraphicsStorageBindingCount;
++constexpr uint32_t kGraphicsStorageSizeSlots = angle::metal::kGraphicsStorageSizeSlots;
++static_assert(kGraphicsStorageBufferBindingStart == kArrayDrawCommandBufferBindingIndex + 1);
+ 
+ constexpr uint32_t kStencilMaskAll = 0xff;  // Only 8 bits stencil is supported
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.mm b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+index 01d36730484300d4b2b66465fd125aad3f4e8baa..b31a2cc9481efba4fb6676235bed69f7d28c5bac 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+@@ -562,9 +562,11 @@ void GenerateTransformFeedbackEmulationOutputs(
+         std::string bufferName = GetXfbBufferNameMtl(bufferIndex);
+ 
+         xfbBindings += ", ";
+-        // TODO: offset from last used buffer binding from front end
+-        // XFB buffer is allocated slot starting from last discrete Metal buffer slot.
+-        uint32_t bindingPoint               = kMaxShaderBuffers - 1 - bufferIndex;
++        // Keep transform feedback in its reserved range, separate from the
++        // graphics SSBO and atomic-counter slots at the end of the table.
++        static_assert(kTransformFeedbackBindingIndex + kMaxShaderXFBs <=
++                      kUBOArgumentBufferBindingIndex);
++        uint32_t bindingPoint               = kTransformFeedbackBindingIndex + bufferIndex;
+         xfbBindingRemapOut->at(bufferIndex) = bindingPoint;
+         xfbBindings +=
+             "device float* ANGLE_" + bufferName + " [[buffer(" + Str(bindingPoint) + ")]]";
+diff --git a/src/libANGLE/renderer/metal/mtl_state_cache.h b/src/libANGLE/renderer/metal/mtl_state_cache.h
+index f70410ebb0253fba07ae888cf228f5e5c9e6b64b..87767935ab64747bdb48e62948f0cf6cdb3e8aa5 100644
+--- a/src/libANGLE/renderer/metal/mtl_state_cache.h
++++ b/src/libANGLE/renderer/metal/mtl_state_cache.h
+@@ -576,6 +576,9 @@ enum class RenderPipelineRasterization : uint32_t
+     // simulate the discard.
+     EmulatedDiscard,
+ 
++    // Rasterize and write transform feedback from the same vertex invocation.
++    EnabledWithTransformFeedback,
++
+     EnumCount,
+ };
+ 

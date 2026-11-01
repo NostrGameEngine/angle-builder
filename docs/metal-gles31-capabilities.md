@@ -7,24 +7,25 @@ it is not a conformance certification.
 The current selectable profile is documented in [Selecting a Metal GLES
 profile](selecting-metal-gles-profile.md). The default remains GLES 3.0; the
 explicit `gles31` build exposes GLES 3.1 and MDI on eligible devices without the
-internal compute-test flag. Public EGL, compute, synchronization and GPU-generated
-MDI probes also pass on an A14 iPhone 12 with iOS 27.0.1 and Metal validation;
-see [physical-device tests](ios-device-metal-tests.md). The full mustpass results
-below concern the macOS internal profile and do not establish iOS conformance.
+internal compute-test flag. Public EGL, compute, graphics storage, atomic-counter,
+transform-feedback, synchronization and GPU-generated MDI probes also pass on an
+A14 iPhone 12 with iOS 27.0.1 and Metal validation; see [physical-device tests](ios-device-metal-tests.md).
+The full mustpass results below concern the macOS internal profile and do not
+establish iOS conformance.
 
 | Area | Source evidence | Limits and validation scope |
 | --- | --- | --- |
 | Context profile | `DisplayMtl::getMaxSupportedESVersion` selects GLES 3.0 or the explicitly enabled GLES 3.1 profile under device gates | The maximum conformant version remains GLES 3.0 |
 | Compute translation | Kernels, five native invocation/grid inputs and constant workgroup size execute through native and public GLES tests | Broad validation on Apple M2/macOS 27.2; focused public EGL probes also pass on A14/iOS 27.0.1 |
 | Compute programs | Public GLES compute programs link, dispatch and reload binaries in the isolated internal profile; default uniforms, direct byte-layout UBOs and sampler/image resource maps | Resource limits and program binaries verified in the internal profile |
-| SSBOs | Byte-addressed std140/std430, range-based `.length()`, GL binding remapping, shared allocations, descriptor arrays, helper out/inout and native integer atomics pass GPU tests | Robust access remains unexposed; graphics-stage SSBO counts are zero |
+| SSBOs | Compute, vertex and fragment support byte-addressed storage, range-based `.length()`, block arrays, rebinding and integer atomics | Graphics binding capacity follows the Metal family limit and ANGLE reservations; robustness remains unexposed |
 | Direct/indirect dispatch | Standard GLES direct dispatch and GPU-generated indirect dispatch execute through `ProgramExecutableMtl::setupDispatch` | GPU-produced arguments and complete AOSP GLES 3.1 mustpass coverage on M2 |
-| Images and atomics | Public GLES image arrays, 16 samplers plus four images, nested descriptor aliases and all eight signed/unsigned shared/device atomic functions pass targeted GPU tests | Graphics images/image atomics and robustness extensions remain unexposed |
+| Images and atomics | The experimental profile provides image loads/stores in compute, vertex and fragment, with four image descriptors per stage and 16 simultaneous samplers; shared/device buffer atomic functions are also implemented | Graphics image aliases have the restrictions described below; image atomics and robustness extensions remain unexposed |
 | Shared memory | Threadgroup references, shared integer atomics, execution barriers and divergent memory-only fences pass GPU tests | Device/pipeline workgroup limits; no robustness extension claim |
-| Command memory barriers | Internal ES 3.1 profile closes encoders conservatively, preserves attachments and tracks allocation dependencies without a CPU wait; by-region uses the same stronger path | Conservative encoder boundaries; optional graphics storage writes unexposed |
+| Command memory barriers | Internal ES 3.1 profile closes encoders conservatively, preserves attachments and tracks allocation dependencies without a CPU wait; by-region uses the same stronger path | Compute-to-graphics-to-compute storage passes the public EGL probe; encoder boundaries remain conservative |
 | Draw indirect | Public GLES native topologies and UInt8/UInt16/UInt32 indexed commands are encoded without CPU argument reads; GPU-generated indexed test covers negative baseVertex | Topology/index conversions covered; no robust-access extension claim |
 | Multi-draw indirect | GPU-resident commands, full command-range validation, stride-domain checks and overlapping commands and five upstream MDI regressions | CPU loop of native indirect draws; microbenchmark is not app performance |
-| Separable programs | Compute and graphics pipelines use installed component executables; GPU-converted UBOs, explicit varying locations and binary reload pass targeted and upstream tests | Optional graphics storage, geometry and tessellation remain unexposed |
+| Separable programs | Compute and graphics pipelines use installed component executables; GPU-converted UBOs, graphics storage, explicit varying locations and binary reload pass targeted tests | Geometry and tessellation remain unexposed |
 | Attachmentless framebuffers | Device-derived sample limit and default raster sample propagation pass all 72 dEQP cases | Complete profile and device-family validation |
 | Texture gather | Core float/int/uint/shadow samplers, channels, offsets and array layer selection translate to native Metal gather operations | Optional GPU-shader5 gather forms remain unexposed; complete profile validation |
 | Multisample textures | `TextureMtl::setStorageMultisample` and `textureMultisampleANGLE` exist | 2D MSAA and interpolation covered; multisample arrays/sample shading optional |
@@ -94,12 +95,30 @@ GL block reflection includes the block array element when assigning actual slots
 Runtime SSBO lengths select the corresponding range-size metadata. UBO arrays
 use the twelve reserved compute slots, including the gaps at 17/19.
 
-Atomic counters reuse ANGLE's common counter-to-storage lowering, restricted to
-one compute counter-buffer binding. Its byte-addressed device buffer uses slot
-22 and the exact GL range offset; driver offset corrections remain zero. Default
-uniform layout excludes atomic counters. The common shader-write invalidation
-also notifies buffers written exclusively through atomic counter bindings, so
-cached vertex/index/uniform conversions cannot retain old data.
+The GLES 3.1 profile also supports SSBOs in vertex and fragment shaders. Metal
+documents a fixed buffer argument table size for every GPU family supported by
+the profile. ANGLE derives the per-stage storage count from that table after
+reserving its attribute, uniform, transform-feedback, indirect-draw, ray-query
+and atomic-counter slots. The result is a backend limit, not a claim that Metal
+itself has only that many SSBOs. Buffer allocation size comes from the selected
+`MTLDevice`; the reported maximum SSBO block size is also bounded by ANGLE's
+static block-layout representation. Bound range lengths are carried as 64-bit
+metadata for GLSL runtime arrays.
+
+Atomic counters reuse ANGLE's common counter-to-storage lowering with one GL
+counter-buffer binding. Graphics stages and compute use separate native slots
+with the exact GL range offset; default uniform layout excludes the counters.
+The common shader-write invalidation also notifies buffers written through
+counter bindings, so cached vertex/index/uniform conversions are refreshed.
+The public Metal profile probe exercises simultaneous graphics-stage limits,
+range rebinding, program binary reload and compute-to-graphics-to-compute use.
+On the supported profile, transform feedback and rasterization share a single
+vertex pass, so buffer side effects and captured outputs come from the same
+invocation. The older two-pass path remains for devices outside that profile.
+The probe covers discard and rasterization, separate feedback buffers, instanced
+and consecutive draws, nonzero first vertices and reloaded program binaries.
+This graphics coverage has passed on Apple M2/macOS and A14/iOS with Metal API
+and Shader Validation enabled; it is not a full-conformance claim.
 
 ## Aggregate storage values
 
@@ -111,7 +130,7 @@ separate gather/scatter helpers, so writing `.xy` does not read or write `.z`.
 Signed storage increments retain wraparound and pre/post return semantics.
 The native Metal nested-array spelling uses nested `metal::array` types.
 
-## Compute image descriptors
+## Image descriptors
 
 Compute texture slots are distinct from sampler slots. The native encoder accepts
 16 sampled textures together with four image descriptors; unused sampler/image
@@ -124,8 +143,48 @@ Tests use non-identity GL unit assignments, independently read each written text
 through a sampler, and preserve SSBO guard regions. They exercise implicit-LOD
 compute sampling, imageSize, write-only rgba32ui arrays and read/write r32ui arrays.
 Layered 3D, 2D-array and cube images use native mip views. Non-layered volume
-slices, null descriptors and compatible format views are covered below. Optional
-graphics-stage image access remains unexposed.
+slices, null descriptors and compatible format views are covered below.
+
+The experimental profile also exposes up to four image uniforms each in vertex
+and fragment shaders, with a combined limit of eight. These are ANGLE's current
+resource-slot limits, not measurements of the GPU's maximum. Each stage can use
+16 samplers and four images simultaneously. Its tests cover image loads/stores,
+arrays and layered/sliced textures, rebinding, a compute-to-graphics-to-compute
+sequence, coexistence with SSBOs and ray queries, program pipelines and binary
+reload. These graphics-image tests have run on Apple M2/macOS with Metal API and
+shader validation. On an iPhone 12/A14 with both validations enabled, the shared
+EGL probe also covers vertex, fragment and compute aliases, binary reload,
+rebinding, four read/write images, a 2D/3D slice overlap, compatible SNORM and
+integer views, and a synchronized workgroup exchange. The extended macOS cases
+have not all been run on the phone. These tests do not establish complete GLES
+conformance. On M2, dEQP passes 20 image layout-binding cases, 54 two-dimensional
+format reinterpretations and 13 two-dimensional load/store cases; the twelve
+early-fragment image tests report `NotSupported` because they require the separate
+`GL_OES_shader_image_atomic` extension.
+
+Metal forbids passing the same texture to more than one argument of a shader
+when any of those arguments can write. The Metal backend groups image bindings
+that refer to the same GL texture and mip level and routes each writable group
+through one native read/write texture. This includes vertex, fragment and
+compute shaders, image arrays, different image units, and a single 2D slice
+overlapping a layered 3D, array or cube binding. Rebinding and program-binary
+reload preserve the mapping. An unsigned view of the texture's pixel bits is
+converted to each image unit's declared format, including compatible formats
+of equal size and RGBA8_SNORM. The profile requests device-wide texture
+coherence and uses a texture fence for writes through the shared view. Shaders
+and applications must still issue the GLES memory and execution barriers their
+algorithms require; the internal texture fence does not replace those barriers.
+
+There are still important boundaries. Sampling a GL texture in the same
+shader stage in which it is a writable image is rejected with
+`GL_INVALID_OPERATION`; overlapping image units whose formats require
+incompatible-sized views are also rejected. These errors are stricter than GLES.
+Alias detection
+currently compares GL texture objects, so separately imported texture objects
+sharing the same storage are not covered. Applications must not use those
+objects as writable aliases until shared-storage identity is handled. The
+validated alias path is gated by the existing GLES 3.1 profile requirements;
+it is not evidence of complete GLES conformance on every Metal device.
 
 ## Byte indices in indirect draws
 
@@ -256,13 +315,15 @@ handles and buffer 23 supplies four slice indices. Both native handles are rebou
 on every dispatch. Selected mip views retain the original allocation, so writes
 through a slice are visible through overlapping image3D/image2D bindings in the
 same shader after its image memory fence. No temporary slice copy is involved.
-The current binary ABI is MCP11; older native resource/array-packet records are rejected.
+The binary format has been advanced for the shared-image metadata; incompatible
+older native resource and array-packet records are rejected.
 
 Immutable writable textures permit Metal pixel-format views at creation, including
 RGBA8 storage accessed as R32UI. Null bindings return zero sizes/loads and discard
-stores. Tests cover aliases, slice changes, same-slice writes, mixed 2D/3D/null
-bindings, out-of-bounds stores, binary reload and deletion with queued commands.
-Full image format compatibility still needs systematic coverage.
+stores. Tests cover aliases, slice changes, mixed 2D/3D/null bindings,
+out-of-bounds stores, binary reload, deletion with queued commands, and
+reinterpretation among the supported 32-, 64- and 128-bit image formats. These
+targeted cases do not replace a complete image-format conformance run.
 
 The internal profile uses device workgroup dimensions and validates each native
 pipeline at link. Apple GPUs additionally expose 64 KB uniform blocks, with
@@ -287,7 +348,7 @@ four-byte GL component layout and normalizing every nonzero word to one. Targete
 GPU coverage includes noncanonical input words, assignment return values, helper
 inout, swizzles, binary reload and complete source/output/guard comparisons.
 The upstream storage suite executes 54 tests with no failures, and records four
-explicit skips for graphics SSBO capabilities that are declared as zero.
+explicit skips for graphics SSBO capabilities that were zero in that earlier run.
 
 Direct fan/loop, restart and last-provoking conversions reuse the ordered GPU
 primitive-list converter. Direct calls upload their CPU-known command fields;
@@ -347,11 +408,11 @@ to that binding. Observer masks retain shared bindings while any enabled attribu
 uses them. A dedicated compute-to-vertex case checks two fixed-point converted
 views, a disabled sharing attribute, GPU rewrites and buffer storage replacement.
 
-Active graphics atomic counters are rejected cleanly because their declared stage
-limits are zero. Inactive atomic-counter barriers reuse ANGLE's common removal
-pass. The upstream negative shader and inactive-barrier cases execute without
-translator assertions. Tests requiring nonzero graphics counters/storage query
-the applicable stage limits before running.
+Graphics atomic counters and storage are exposed in the supported GLES 3.1
+profile. Inactive atomic-counter barriers reuse ANGLE's common removal pass.
+The historical upstream negative shader and inactive-barrier runs below predate
+the graphics capabilities; they do not measure the new paths. Applications and
+tests must query the applicable stage limits.
 
 The wider upstream ES 3.1 runner executes 121 cases with 51 explicit optional
 skips. Stable-geometry culling independently verifies three complete rendered

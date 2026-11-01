@@ -7,9 +7,13 @@ textures, 128 threads per threadgroup, 16 KiB threadgroup memory and a 128 MiB
 maximum buffer length. These requirements describe this implementation's
 supported profile, not universal GLES 3.1 requirements.
 
-The direct EGL, compute, synchronization and compute-to-MDI probes have passed
-on an iPhone 12 with an Apple A14 GPU and iOS 27.0.1, with Metal API and Shader
-Validation enabled. That device reports Apple GPU family 7, tier 2 argument
+The direct EGL, compute, graphics storage, image load/store and alias,
+atomic-counter, transform-feedback, synchronization and compute-to-MDI probes
+have passed on an iPhone 12 with an Apple A14 GPU and iOS 27.0.1, with Metal API
+and Shader Validation enabled. The alias probe covers vertex, fragment and
+compute stages, binary reload and rebinding, mixed 2D/3D views, mixed SNORM and
+integer formats, four read/write images and a workgroup exchange. That device
+reports Apple GPU family 7, tier 2 argument
 buffers, tier 2 read/write textures, 1024 threads per threadgroup, 32 KiB
 threadgroup memory and a 2 GiB maximum buffer length. The simulator's smaller
 feature set does not describe this physical GPU.
@@ -46,8 +50,11 @@ test can be repeated; `xcrun devicectl device uninstall app --device DEVICE
 org.ngengine.angle.deviceprobe` removes this test app and its data.
 
 The app first measures Metal capabilities, then runs the shared direct EGL probes
-for context selection, compute, shared memory, fences, GPU-generated indirect
-dispatch and compute-to-MDI rendering. It checks three reference images plus
+for context selection, compute, graphics storage, vertex/fragment image loads and
+stores, aliased graphics and compute images with mixed views and formats,
+counters, transform feedback,
+shared memory, fences, GPU-generated indirect dispatch and compute-to-MDI rendering.
+It checks three reference images plus
 command and counter guards. Metal API and Shader Validation are requested and
 their activation must appear in the runtime log. Private ANGLE feature overrides
 remain empty.

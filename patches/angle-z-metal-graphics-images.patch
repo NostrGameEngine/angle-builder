@@ -1,0 +1,804 @@
+diff --git a/src/common/metal_shader_bindings.h b/src/common/metal_shader_bindings.h
+index 6826bc9..5813fbe 100644
+--- a/src/common/metal_shader_bindings.h
++++ b/src/common/metal_shader_bindings.h
+@@ -23,6 +23,10 @@ constexpr uint32_t kGraphicsStorageBindingCount =
+     kGraphicsStorageEndBinding - kGraphicsStorageFirstBinding;
+ // The driver uniform buffer uses a 16-byte-aligned array indexed by Metal slot.
+ constexpr uint32_t kGraphicsStorageSizeSlots = (kBufferArgumentCount + 3) / 4 * 4;
++// Byte offset of storageBufferSizes in the graphics driver-uniform ABI.
++constexpr uint32_t kGraphicsStorageSizeOffsetBytes = 64;
++// Image slot reflection retains the GLSL readonly qualifier in its high bit.
++constexpr uint32_t kReadOnlyImageBindingBit = uint32_t{1} << 31;
+ }  // namespace metal
+ }  // namespace angle
+ 
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 27a3527..4e318b9 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -4,9 +4,11 @@
+ // found in the LICENSE file.
+ //
+ 
++#include <algorithm>
+ #include <cctype>
+ #include <map>
+ 
++#include "common/metal_shader_bindings.h"
+ #include "common/system_utils.h"
+ #include "common/unsafe_buffers.h"
+ #include "compiler/translator/BaseTypes.h"
+@@ -229,7 +231,8 @@ class GenMetalTraverser : public TIntermTraverser
+     bool mRasterOrderGroupsSupported       = false;
+     bool mStorageAccessSupported           = true;
+     bool mEmittingNativeImages             = false;
+-    void emitComputeImageInitialization(const TVariable &parameter);
++    bool useWrappedImages() const;
++    void emitImageInitialization(const TVariable &parameter, const TVariable *driverUniforms);
+     std::vector<StorageAggregateLayout> mStorageLayouts;
+     std::unordered_map<std::string, size_t> mStorageLayoutIndices;
+     size_t mStorageLoopIndex     = 0;
+@@ -263,6 +266,12 @@ GenMetalTraverser::GenMetalTraverser(const TCompiler &compiler,
+                                   ShFragmentSynchronizationType::RasterOrderGroups_Metal)
+ {}
+ 
++bool GenMetalTraverser::useWrappedImages() const
++{
++    return mCompiler.getShaderType() == GL_COMPUTE_SHADER ||
++           (mCompiler.getShaderVersion() >= 310 && !mCompiler.hasPixelLocalStorageUniforms());
++}
++
+ void GenMetalTraverser::emitIndentation()
+ {
+     ASSERT(mIndentLevel >= 0);
+@@ -1122,8 +1131,7 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
+             {
+                 if (IsImage2D(basicType))
+                 {
+-                    mOut << (mCompiler.getShaderType() == GL_COMPUTE_SHADER &&
+-                                     !mEmittingNativeImages
++                    mOut << (useWrappedImages() && !mEmittingNativeImages
+                                  ? "ANGLE_image2d<"
+                                  : "metal::texture2d<");
+                 }
+@@ -1450,7 +1458,7 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+     }
+ 
+     if (IsImage(type.getBasicType()) &&
+-        (mCompiler.getShaderType() != GL_COMPUTE_SHADER || mEmittingNativeImages))
++        (!useWrappedImages() || mEmittingNativeImages))
+     {
+         const size_t imageSlot = mMainTextureIndex;
+         mOut << " [[";
+@@ -1460,11 +1468,15 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+         }
+         mOut << "texture(" << mMainTextureIndex << ")]]";
+         TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
+-        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++        if (useWrappedImages())
+         {
+             TInfoSinkBase mappedName;
+             Name(field).emit(mappedName, kUserVariableNamePrefix);
+-            reflection->addComputeImageBinding(mappedName.c_str(), mMainTextureIndex);
++            const bool readOnly = mCompiler.getShaderType() != GL_COMPUTE_SHADER &&
++                                  type.getMemoryQualifier().readonly;
++            reflection->addComputeImageBinding(
++                mappedName.c_str(), mMainTextureIndex |
++                    (readOnly ? angle::metal::kReadOnlyImageBindingBit : 0));
+             // Retain declared-unit reflection for the native translation tests.
+             // Runtime GLES bindings use the uniform-name map above.
+             if (type.getLayoutQualifier().binding >= 0 &&
+@@ -1611,9 +1623,9 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+         mOut << "/* byte-addressed storage block */";
+         return;
+     }
+-    const bool computeImages = mCompiler.getShaderType() == GL_COMPUTE_SHADER &&
++    const bool wrappedImages = useWrappedImages() &&
+                                mPipelineStructs.texture.matches(*type.getStruct());
+-    if (computeImages && !mEmittingNativeImages)
++    if (wrappedImages && !mEmittingNativeImages)
+     {
+         mEmittingNativeImages = true;
+         emitStructDeclaration(type);
+@@ -1622,7 +1634,7 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+     }
+     mOut << "struct ";
+     emitBareTypeName(type, {});
+-    if (computeImages && mEmittingNativeImages)
++    if (wrappedImages && mEmittingNativeImages)
+     {
+         mOut << "_Native";
+     }
+@@ -1689,7 +1701,7 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+         mOut << ";\n";
+     }
+ 
+-    if (computeImages && mEmittingNativeImages)
++    if (wrappedImages && mEmittingNativeImages && mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+     {
+         emitIndentation();
+         mOut << "constant uint *ANGLE_imageLayers [[buffer(23)]];\n";
+@@ -2758,6 +2770,7 @@ void GenMetalTraverser::emitFunctionSignature(const TFunction &func)
+     mOut << "(";
+ 
+     bool emitComma          = false;
++    bool hasDriverUniforms  = false;
+     const size_t paramCount = func.getParamCount();
+     for (size_t i = 0; i < paramCount; ++i)
+     {
+@@ -2768,9 +2781,21 @@ void GenMetalTraverser::emitFunctionSignature(const TFunction &func)
+         emitComma = true;
+ 
+         const TVariable &param = *func.getParam(i);
++        const TStructure *structure = param.getType().getStruct();
++        hasDriverUniforms |= structure && mPipelineStructs.angleUniforms.matches(*structure);
+         emitFunctionParameter(func, param);
+     }
+ 
++    if (isMain && mCompiler.getShaderType() != GL_COMPUTE_SHADER && useWrappedImages() &&
++        !mPipelineStructs.texture.isTotallyEmpty() && !hasDriverUniforms)
++    {
++        if (emitComma)
++            mOut << ", ";
++        mOut << "constant metal::uint2 *ANGLE_graphicsImageDriver [[buffer("
++             << mDriverUniformsBindingIndex << ")]]";
++        emitComma = true;
++    }
++
+     if (isTraversingVertexMain)
+     {
+         if (emitComma)
+@@ -2853,7 +2878,7 @@ void GenMetalTraverser::emitFunctionParameter(const TFunction &func, const TVari
+     const TType &type           = param.getType();
+     const TStructure *structure = type.getStruct();
+ 
+-    if (isMain && mCompiler.getShaderType() == GL_COMPUTE_SHADER && structure &&
++    if (isMain && useWrappedImages() && structure &&
+         mPipelineStructs.texture.matches(*structure))
+     {
+         emitNameOf(*structure);
+@@ -2973,7 +2998,8 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+     emitFunctionSignature(func);
+     mOut << "\n";
+     const TVariable *images = nullptr;
+-    if (func.isMain() && mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++    const TVariable *driverUniforms = nullptr;
++    if (func.isMain() && useWrappedImages())
+     {
+         for (size_t parameter = 0; parameter < func.getParamCount(); ++parameter)
+         {
+@@ -2983,12 +3009,16 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+             {
+                 images = candidate;
+             }
++            if (structure && mPipelineStructs.angleUniforms.matches(*structure))
++            {
++                driverUniforms = candidate;
++            }
+         }
+     }
+     if (images)
+     {
+         emitOpenBrace();
+-        emitComputeImageInitialization(*images);
++        emitImageInitialization(*images, driverUniforms);
+     }
+     body.traverse(this);
+     if (images)
+@@ -3002,7 +3032,8 @@ bool GenMetalTraverser::visitFunctionDefinition(Visit, TIntermFunctionDefinition
+     return false;
+ }
+ 
+-void GenMetalTraverser::emitComputeImageInitialization(const TVariable &parameter)
++void GenMetalTraverser::emitImageInitialization(const TVariable &parameter,
++                                                const TVariable *driverUniforms)
+ {
+     emitIndentation();
+     emitType(parameter.getType(), {});
+@@ -3055,8 +3086,31 @@ void GenMetalTraverser::emitComputeImageInitialization(const TVariable &paramete
+                 mOut << ", ";
+                 emitMember(true, true);
+                 mOut << ", ";
+-                emitNameOf(parameter);
+-                mOut << "_native.ANGLE_imageLayers[" << slot + element << "]}";
++                if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++                {
++                    emitNameOf(parameter);
++                    mOut << "_native.ANGLE_imageLayers[" << slot + element << "]";
++                }
++                else if (driverUniforms)
++                {
++                    emitNameOf(*driverUniforms);
++                    mOut << ".";
++                    const auto &fields = driverUniforms->getType().getStruct()->fields();
++                    auto it = std::find_if(fields.begin(), fields.end(), [](const TField *field) {
++                        return field->name() == "storageBufferSizes";
++                    });
++                    ASSERT(it != fields.end());
++                    emitNameOf(**it);
++                    mOut << "[" << slot + element << "].x";
++                }
++                else
++                {
++                    static_assert(angle::metal::kGraphicsStorageSizeOffsetBytes % 8 == 0);
++                    mOut << "ANGLE_graphicsImageDriver["
++                         << angle::metal::kGraphicsStorageSizeOffsetBytes / 8 + slot + element
++                         << "].x";
++                }
++                mOut << "}";
+             }
+             mOut << ";\n";
+         }
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 10cdebc..c85fcef 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -328,6 +328,8 @@ class ContextMtl : public ContextImpl, public mtl::Context
+         gl::ShaderType stage,
+         const std::array<mtl::StorageBufferSize, mtl::kGraphicsStorageSizeSlots> &sizes,
+         mtl::RenderCommandEncoder *encoder);
++    void setGraphicsImageLayers(gl::ShaderType stage, const std::array<uint32_t, 4> &layers,
++                                mtl::RenderCommandEncoder *encoder);
+ 
+     const mtl::ClearColorValue &getClearColorValue() const;
+     const mtl::WriteMaskArray &getWriteMaskArray() const;
+@@ -611,6 +613,8 @@ class ContextMtl : public ContextImpl, public mtl::Context
+     };
+     static_assert(sizeof(DriverUniforms) % (sizeof(uint32_t) * 4) == 0,
+                   "DriverUniforms should be 16 bytes aligned");
++    static_assert(offsetof(DriverUniforms, storageBufferSizes) ==
++                  angle::metal::kGraphicsStorageSizeOffsetBytes);
+ 
+     struct DefaultAttribute
+     {
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 489b4a0..1aa2a55 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -3028,7 +3028,8 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+ 
+     // This must be called before render command encoder is started.
+     bool textureChanged = false;
+-    if (mDirtyBits.test(DIRTY_BIT_TEXTURES))
++    if (mDirtyBits.test(DIRTY_BIT_TEXTURES) ||
++        mState.getProgramExecutable()->getActiveImagesMask().any())
+     {
+         textureChanged = true;
+         ANGLE_TRY(handleDirtyActiveTextures(context));
+@@ -3294,6 +3295,17 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+     encoder->setData(stage, mDriverUniforms, mtl::kDriverUniformsBindingIndex);
+ }
+ 
++void ContextMtl::setGraphicsImageLayers(gl::ShaderType stage,
++                                        const std::array<uint32_t, 4> &layers,
++                                        mtl::RenderCommandEncoder *encoder)
++{
++    for (size_t index = 0; index < layers.size(); ++index)
++    {
++        mDriverUniforms.storageBufferSizes[index][0] = layers[index];
++    }
++    encoder->setData(stage, mDriverUniforms, mtl::kDriverUniformsBindingIndex);
++}
++
+ angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context,
+                                                     GLint drawCallFirstVertex,
+                                                     uint32_t verticesPerInstance)
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index 40e4406..5717107 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -1022,12 +1022,20 @@ bool IsMetalDisplayAvailable()
+         mNativeCaps.maxAtomicCounterBufferBindings                         = 1;
+         mNativeCaps.maxAtomicCounterBufferSize                             = mtl::kMaxUBOSize;
+         mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute]        = 4;
+-        mNativeCaps.maxCombinedImageUniforms                               = 4;
++        mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Vertex] =
++            mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute];
++        mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Fragment] =
++            mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute];
++        mNativeCaps.maxCombinedImageUniforms = std::max(
++            mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute],
++            mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Vertex] +
++                mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Fragment]);
+         mNativeCaps.maxImageUnits = std::max(mNativeCaps.maxImageUnits, 4);
+         // Storage blocks and color targets use independent Metal argument tables.
+         // Derive the aggregate GLES link limit from both supported pipeline types.
+         mNativeCaps.maxCombinedShaderOutputResources = std::max(
+-            mNativeCaps.maxCombinedShaderStorageBlocks + mNativeCaps.maxDrawBuffers,
++            mNativeCaps.maxCombinedShaderStorageBlocks + mNativeCaps.maxDrawBuffers +
++                mNativeCaps.maxCombinedImageUniforms,
+             mNativeCaps.maxShaderStorageBlocks[gl::ShaderType::Compute] +
+                 mNativeCaps.maxShaderImageUniforms[gl::ShaderType::Compute]);
+     }
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index 97dc79f..a0e768d 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -8,6 +8,7 @@
+ 
+ #include "libANGLE/renderer/metal/ProgramExecutableMtl.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <limits>
+ 
+@@ -37,6 +38,101 @@ bool CompareBlockInfo(const sh::BlockMemberInfo &a, const sh::BlockMemberInfo &b
+     return a.offset < b.offset;
+ }
+ 
++// Metal does not allow the same texture to be supplied to multiple arguments
++// of one shader when any of those arguments can write.  Until image aliases
++// are lowered to a shared read/write argument, reject overlapping writable
++// bindings instead of issuing an invalid Metal draw.  Use the translated
++// shader's access qualifier, not the image unit's potentially broader access.
++bool ImageBindingsOverlap(const gl::ImageUnit &a, const gl::ImageUnit &b)
++{
++    if (!a.texture.get() || a.texture.get() != b.texture.get() || a.level != b.level)
++    {
++        return false;
++    }
++    if (a.texture->getType() == gl::TextureType::_3D)
++    {
++        // Non-layered 3D images use an entire 3D Metal view plus a layer index.
++        return true;
++    }
++    return a.layered || b.layered || a.layer == b.layer ||
++           a.texture->getType() == gl::TextureType::_2D;
++}
++
++angle::Result ValidateGraphicsImageAliases(const gl::Context *glContext,
++                                           const gl::ProgramExecutable &executable,
++                                           const mtl::TranslatedShaderInfo &shaderInfo)
++{
++    ContextMtl *context    = mtl::GetImpl(glContext);
++    const gl::State &state = glContext->getState();
++    struct ImageUse
++    {
++        const gl::ImageUnit *unit;
++        bool readOnly;
++    };
++    std::array<ImageUse, mtl::kMaxComputeTextures> usedImages = {};
++    size_t usedImageCount = 0;
++    const auto &bindings = executable.getImageBindings();
++    for (size_t imageIndex = 0; imageIndex < bindings.size(); ++imageIndex)
++    {
++        if (imageIndex >= shaderInfo.actualComputeImageBindings.size())
++        {
++            continue;
++        }
++        const uint32_t reflectedSlot = shaderInfo.actualComputeImageBindings[imageIndex];
++        const uint32_t firstSlot = reflectedSlot & ~angle::metal::kReadOnlyImageBindingBit;
++        if (firstSlot >= mtl::kMaxComputeTextures)
++        {
++            continue;
++        }
++        const bool readOnly = (reflectedSlot & angle::metal::kReadOnlyImageBindingBit) != 0;
++        const auto &units = bindings[imageIndex].boundImageUnits;
++        for (size_t element = 0; element < units.size(); ++element)
++        {
++            const gl::ImageUnit &image = state.getImageUnit(units[element]);
++            if (!image.texture.get())
++            {
++                continue;
++            }
++            for (size_t index = 0; index < usedImageCount; ++index)
++            {
++                const ImageUse &other = usedImages[index];
++                ANGLE_CHECK(context,
++                            !ImageBindingsOverlap(image, *other.unit) ||
++                                (readOnly && other.readOnly),
++                            "Overlapping writable Metal graphics images are not supported",
++                            GL_INVALID_OPERATION);
++            }
++            ASSERT(usedImageCount < usedImages.size());
++            usedImages[usedImageCount++] = {&image, readOnly};
++            if (readOnly)
++            {
++                continue;
++            }
++            for (size_t samplerIndex = 0; samplerIndex < executable.getSamplerBindings().size();
++                 ++samplerIndex)
++            {
++                const auto &metalSampler = shaderInfo.actualSamplerBindings[samplerIndex];
++                if (metalSampler.samplerBinding >= mtl::kMaxShaderSamplers ||
++                    metalSampler.textureBinding >= mtl::kMaxComputeTextures)
++                {
++                    continue;
++                }
++                const auto &sampler = executable.getSamplerBindings()[samplerIndex];
++                for (uint32_t samplerElement = 0; samplerElement < sampler.textureUnitsCount;
++                     ++samplerElement)
++                {
++                    const GLuint unit = sampler.getTextureUnit(
++                        executable.getSamplerBoundTextureUnits(), samplerElement);
++                    ANGLE_CHECK(context, state.getActiveTexturesCache()[unit] != image.texture.get(),
++                                "Sampling a writable Metal graphics image is not supported",
++                                GL_INVALID_OPERATION);
++                }
++            }
++        }
++    }
++    return angle::Result::Continue;
++}
++
+ size_t GetAlignmentOfUniformGroup(sh::BlockLayoutMap *blockLayoutMap)
+ {
+     size_t align = 1;
+@@ -676,6 +772,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+             stream->readInt(&mMslXfbOnlyVertexShaderInfo.actualXFBBindings[xfbBindIndex]);
+         }
+         mMslXfbOnlyVertexShaderInfo.metalLibrary = nullptr;
++        mMslXfbOnlyVertexShaderInfo.actualComputeImageBindings =
++            mMslShaderTranslateInfo[gl::ShaderType::Vertex].actualComputeImageBindings;
+     }
+ 
+     mProgramHasFlatAttributes = stream->readBool();
+@@ -1374,9 +1472,11 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+     {
+         ANGLE_TRY(encodeGraphicsStorageBuffers(glContext, stage, cmdEncoder));
+         ANGLE_TRY(encodeAccelerationStructures(context, stage, cmdEncoder, nullptr));
++        // Image layer metadata and SSBO range sizes share the driver record.
++        // Upload both while the record still contains this stage's sizes.
++        ANGLE_TRY(commitUniforms(context, cmdEncoder, stage));
++        ANGLE_TRY(updateTextures(glContext, cmdEncoder, forceTexturesSetting, stage));
+     }
+-    ANGLE_TRY(commitUniforms(context, cmdEncoder));
+-    ANGLE_TRY(updateTextures(glContext, cmdEncoder, forceTexturesSetting));
+ 
+     if (uniformBuffersDirty || pipelineDescChanged)
+     {
+@@ -1596,8 +1696,7 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         {
+             continue;
+         }
+-        if ((!mSamplerBindingsDirty[shaderType] && !forceUpdate) ||
+-            !mCurrentShaderVariants[shaderType])
++        if (!mCurrentShaderVariants[shaderType])
+         {
+             continue;
+         }
+@@ -1607,42 +1706,100 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                 ? *mCurrentShaderVariants[shaderType]->translatedSrcInfo
+                 : mMslShaderTranslateInfo[shaderType];
+ 
+-        for (uint32_t textureIndex = 0; textureIndex < mExecutable->getSamplerBindings().size();
+-             ++textureIndex)
++        ANGLE_TRY(ValidateGraphicsImageAliases(glContext, *mExecutable, shaderInfo));
++
++        if (mSamplerBindingsDirty[shaderType] || forceUpdate)
+         {
+-            const gl::SamplerBinding &samplerBinding =
+-                mExecutable->getSamplerBindings()[textureIndex];
+-            const mtl::SamplerBinding &mslBinding = shaderInfo.actualSamplerBindings[textureIndex];
+-            if (mslBinding.textureBinding >= mtl::kMaxShaderSamplers)
++            for (uint32_t textureIndex = 0; textureIndex < mExecutable->getSamplerBindings().size();
++                 ++textureIndex)
+             {
+-                // No binding assigned
+-                continue;
+-            }
++                const gl::SamplerBinding &samplerBinding =
++                    mExecutable->getSamplerBindings()[textureIndex];
++                const mtl::SamplerBinding &mslBinding = shaderInfo.actualSamplerBindings[textureIndex];
++                if (mslBinding.samplerBinding >= mtl::kMaxShaderSamplers ||
++                    mslBinding.textureBinding >= mtl::kMaxComputeTextures)
++                {
++                    // No binding assigned
++                    continue;
++                }
+ 
+-            gl::TextureType textureType = samplerBinding.textureType;
++                gl::TextureType textureType = samplerBinding.textureType;
+ 
+-            for (uint32_t arrayElement = 0; arrayElement < samplerBinding.textureUnitsCount;
+-                 ++arrayElement)
++                for (uint32_t arrayElement = 0; arrayElement < samplerBinding.textureUnitsCount;
++                     ++arrayElement)
++                {
++                    GLuint textureUnit = samplerBinding.getTextureUnit(
++                        mExecutable->getSamplerBoundTextureUnits(), arrayElement);
++                    gl::Texture *texture = completeTextures[textureUnit];
++                    gl::Sampler *sampler = contextMtl->getState().getSampler(textureUnit);
++                    uint32_t textureSlot = mslBinding.textureBinding + arrayElement;
++                    uint32_t samplerSlot = mslBinding.samplerBinding + arrayElement;
++                    if (!texture)
++                    {
++                        ANGLE_TRY(contextMtl->getIncompleteTexture(glContext, textureType,
++                                                                   samplerBinding.format, &texture));
++                    }
++                    TextureMtl *textureMtl = mtl::GetImpl(texture);
++                    ANGLE_TRY(textureMtl->bindToShader(glContext, cmdEncoder, shaderType, sampler,
++                                                       textureSlot, samplerSlot));
++                }  // for array elements
++            }      // for sampler bindings
++        }
++
++        std::array<uint32_t, 4> imageLayers = {};
++        bool hasWrappedImages = false;
++        const auto &imageBindings = mExecutable->getImageBindings();
++        const bool stageUsesWrappedImages = std::any_of(
++            shaderInfo.actualComputeImageBindings.begin(),
++            shaderInfo.actualComputeImageBindings.end(),
++            [](uint32_t slot) {
++                return (slot & ~angle::metal::kReadOnlyImageBindingBit) < mtl::kMaxComputeTextures;
++            });
++        for (size_t imageIndex = 0; imageIndex < imageBindings.size(); ++imageIndex)
++        {
++            const gl::ImageBinding &imageBinding = imageBindings[imageIndex];
++            const uint32_t slot = imageIndex < shaderInfo.actualComputeImageBindings.size()
++                                      ? shaderInfo.actualComputeImageBindings[imageIndex] &
++                                            ~angle::metal::kReadOnlyImageBindingBit
++                                      : mtl::kMaxComputeTextures;
++            if (slot < mtl::kMaxComputeTextures)
+             {
+-                GLuint textureUnit = samplerBinding.getTextureUnit(
+-                    mExecutable->getSamplerBoundTextureUnits(), arrayElement);
+-                gl::Texture *texture = completeTextures[textureUnit];
+-                gl::Sampler *sampler = contextMtl->getState().getSampler(textureUnit);
+-                uint32_t textureSlot = mslBinding.textureBinding + arrayElement;
+-                uint32_t samplerSlot = mslBinding.samplerBinding + arrayElement;
+-                if (!texture)
++                hasWrappedImages = true;
++                for (size_t element = 0; element < imageBinding.boundImageUnits.size(); ++element)
+                 {
+-                    ANGLE_TRY(contextMtl->getIncompleteTexture(glContext, textureType,
+-                                                               samplerBinding.format, &texture));
++                    const uint32_t imageSlot = slot + static_cast<uint32_t>(element);
++                    ASSERT(imageSlot < imageLayers.size());
++                    const gl::ImageUnit &unit =
++                        glState.getImageUnit(imageBinding.boundImageUnits[element]);
++                    imageLayers[imageSlot] = static_cast<uint32_t>(unit.layer);
++                    TextureMtl *texture = unit.texture.get() ? mtl::GetImpl(unit.texture.get()) : nullptr;
++                    const bool planar = imageBinding.textureType == gl::TextureType::_2D;
++                    if (planar)
++                    {
++                        const uint32_t volumeSlot = mtl::kComputeImageVolumeSlot + imageSlot;
++                        const bool volume = texture && unit.texture->getType() == gl::TextureType::_3D;
++                        cmdEncoder->setTexture(shaderType, {}, volume ? imageSlot : volumeSlot);
++                        if (volume)
++                        {
++                            ANGLE_TRY(texture->bindToGraphicsImage(glContext, cmdEncoder, shaderType,
++                                volumeSlot, unit.level, true, 0, unit.format));
++                            continue;
++                        }
++                    }
++                    if (!texture)
++                    {
++                        cmdEncoder->setTexture(shaderType, {}, imageSlot);
++                        continue;
++                    }
++                    ANGLE_TRY(texture->bindToGraphicsImage(glContext, cmdEncoder, shaderType,
++                        imageSlot, unit.level, unit.layered, unit.layer, unit.format));
+                 }
+-                TextureMtl *textureMtl = mtl::GetImpl(texture);
+-                ANGLE_TRY(textureMtl->bindToShader(glContext, cmdEncoder, shaderType, sampler,
+-                                                   textureSlot, samplerSlot));
+-            }  // for array elements
+-        }      // for sampler bindings
+-
+-        for (const gl::ImageBinding &imageBinding : mExecutable->getImageBindings())
+-        {
++                continue;
++            }
++            if (stageUsesWrappedImages)
++            {
++                continue;  // This image uniform belongs to another shader stage.
++            }
+             if (imageBinding.boundImageUnits.size() != 1)
+             {
+                 UNIMPLEMENTED();
+@@ -1658,6 +1815,11 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+             }
+ 
+             const gl::ImageUnit &imageUnit = glState.getImageUnit(glslImageBinding);
++            if (!imageUnit.texture.get())
++            {
++                cmdEncoder->setTexture(shaderType, {}, static_cast<uint32_t>(mtlRWTextureBinding));
++                continue;
++            }
+             TextureMtl *textureMtl         = mtl::GetImpl(imageUnit.texture.get());
+             if (imageUnit.layered)
+             {
+@@ -1668,6 +1830,10 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                 glContext, cmdEncoder, shaderType, static_cast<uint32_t>(mtlRWTextureBinding),
+                 imageUnit.level, imageUnit.layer, imageUnit.format));
+         }
++        if (hasWrappedImages)
++        {
++            contextMtl->setGraphicsImageLayers(shaderType, imageLayers, cmdEncoder);
++        }
+     }  // for shader types
+ 
+     return angle::Result::Continue;
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index b8134d5..a122ac3 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -35,7 +35,7 @@
+ namespace
+ {
+ constexpr uint32_t kMetalProgramBinaryVersion =
+-    0x4d43503c;  // Graphics shader storage buffer driver uniforms and bindings
++    0x4d43503d;  // Graphics image reflection and resource bindings
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.h b/src/libANGLE/renderer/metal/TextureMtl.h
+index 676cfd7..fa50af8 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.h
++++ b/src/libANGLE/renderer/metal/TextureMtl.h
+@@ -188,6 +188,14 @@ class TextureMtl : public TextureImpl
+                                     int level,
+                                     int layer,
+                                     GLenum format);
++    angle::Result bindToGraphicsImage(const gl::Context *context,
++                                      mtl::RenderCommandEncoder *encoder,
++                                      gl::ShaderType shaderType,
++                                      int textureSlotIndex,
++                                      int level,
++                                      bool layered,
++                                      int layer,
++                                      GLenum format);
+ 
+     angle::Result bindToComputeShader(const gl::Context *context,
+                                       mtl::ComputeCommandEncoder *encoder,
+@@ -218,6 +226,15 @@ class TextureMtl : public TextureImpl
+                                         int level,
+                                         int layer,
+                                         GLenum format);
++    template <typename Encoder>
++    angle::Result bindToLayeredImageImpl(const gl::Context *context,
++                                         Encoder *encoder,
++                                         gl::ShaderType shaderType,
++                                         int textureSlotIndex,
++                                         int level,
++                                         bool layered,
++                                         int layer,
++                                         GLenum format);
+     void deallocateNativeStorage(bool keepImages, bool keepSamplerStateAndFormat = false);
+     angle::Result createNativeStorage(const gl::Context *context,
+                                       gl::TextureType type,
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 36ca9ae..9e8749a 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -2116,10 +2116,37 @@ uint32_t height(GLuint glLevel) const
+                                              bool layered,
+                                              int layer,
+                                              GLenum format)
++{
++    return bindToLayeredImageImpl(context, encoder, gl::ShaderType::Compute, textureSlotIndex,
++                                  level, layered, layer, format);
++}
++
++angle::Result TextureMtl::bindToGraphicsImage(const gl::Context *context,
++                                              mtl::RenderCommandEncoder *encoder,
++                                              gl::ShaderType shaderType,
++                                              int textureSlotIndex,
++                                              int level,
++                                              bool layered,
++                                              int layer,
++                                              GLenum format)
++{
++    return bindToLayeredImageImpl(context, encoder, shaderType, textureSlotIndex, level, layered,
++                                  layer, format);
++}
++
++template <typename Encoder>
++angle::Result TextureMtl::bindToLayeredImageImpl(const gl::Context *context,
++                                                 Encoder *encoder,
++                                                 gl::ShaderType shaderType,
++                                                 int textureSlotIndex,
++                                                 int level,
++                                                 bool layered,
++                                                 int layer,
++                                                 GLenum format)
+ {
+     if (!layered || mState.getType() == gl::TextureType::_2D)
+     {
+-        return bindToShaderImageImpl(context, encoder, gl::ShaderType::Compute, textureSlotIndex,
++        return bindToShaderImageImpl(context, encoder, shaderType, textureSlotIndex,
+                                      level, mState.getType() == gl::TextureType::_2D ? 0 : layer,
+                                      format);
+     }
+@@ -2136,7 +2163,7 @@ uint32_t height(GLuint glLevel) const
+         view = mNativeTextureStorage->createLayeredShaderImageView(level,
+                                                                    imageAccessFormat.metalFormat);
+     }
+-    encoder->setRWTexture(gl::ShaderType::Compute, view, textureSlotIndex);
++    encoder->setRWTexture(shaderType, view, textureSlotIndex);
+     return angle::Result::Continue;
+ }
+ 
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index e3b19a5..3cd5d18 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -2094,7 +2094,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+                                                        const TextureRef &texture,
+                                                        uint32_t index)
+ {
+-    if (index >= kMaxShaderSamplers)
++    if (index >= kMaxComputeTextures)
+     {
+         return *this;
+     }
+@@ -2103,12 +2103,17 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+ 
+     id<MTLTexture> mtlTexture = (texture ? texture->get() : nil);
+ 
+-    RenderCommandEncoderShaderStates &shaderStates = mStateCache.perShaderStates[shaderType];
+-    if (shaderStates.textures[index] == mtlTexture)
++    // Sampled textures use slots 0..15. Additional image/volume slots do not
++    // have entries in the legacy cache and are always rebound explicitly.
++    if (index < kMaxShaderSamplers)
+     {
+-        return *this;
++        RenderCommandEncoderShaderStates &shaderStates = mStateCache.perShaderStates[shaderType];
++        if (shaderStates.textures[index] == mtlTexture)
++        {
++            return *this;
++        }
++        shaderStates.textures[index] = mtlTexture;
+     }
+-    shaderStates.textures[index] = mtlTexture;
+ 
+     mCommands.push(static_cast<CmdType>(mSetTextureCmds[shaderType]))
+         .push([mtlTexture ANGLE_MTL_RETAIN])
+@@ -2121,7 +2126,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+                                                          const TextureRef &texture,
+                                                          uint32_t index)
+ {
+-    if (index >= kMaxShaderSamplers)
++    if (index >= kMaxComputeTextures)
+     {
+         return *this;
+     }
+diff --git a/src/libANGLE/renderer/metal/mtl_msl_utils.mm b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+index b31a2cc..859b3fd 100644
+--- a/src/libANGLE/renderer/metal/mtl_msl_utils.mm
++++ b/src/libANGLE/renderer/metal/mtl_msl_utils.mm
+@@ -148,7 +148,7 @@
+     hasInvariant         = false;
+     for (mtl::SamplerBinding &binding : actualSamplerBindings)
+     {
+-        binding.textureBinding = mtl::kMaxShaderSamplers;
++        binding.textureBinding = mtl::kMaxComputeTextures;
+         binding.samplerBinding = mtl::kMaxShaderSamplers;
+     }
+     for (int &rwTextureBinding : actualImageBindings)
+@@ -687,22 +687,19 @@ void GenerateTransformFeedbackEmulationOutputs(
+         }
+         auto &computeImages = mslShaderInfoOut->at(type).actualComputeImageBindings;
+         computeImages.assign(executable.getImageBindings().size(), kMaxComputeTextures);
+-        if (type == gl::ShaderType::Compute)
++        const auto &imageMap = reflection->getComputeImageBindings();
++        for (size_t i = 0; i < computeImages.size(); ++i)
+         {
+-            const auto &imageMap = reflection->getComputeImageBindings();
+-            for (size_t i = 0; i < computeImages.size(); ++i)
++            const auto uniform = executable.getUniformIndexFromImageIndex(i);
++            const auto &name = executable.getUniformMappedNames()[uniform];
++            const std::string baseName = gl::ParseResourceName(name, nullptr);
++            auto binding = imageMap.find(baseName);
++            if (binding != imageMap.end())
+             {
+-                const auto uniform = executable.getUniformIndexFromImageIndex(i);
+-                const auto &name           = executable.getUniformMappedNames()[uniform];
+-                const std::string baseName = gl::ParseResourceName(name, nullptr);
+-                auto binding               = imageMap.find(baseName);
+-                if (binding != imageMap.end())
+-                {
+-                    const size_t elements = executable.getImageBindings()[i].boundImageUnits.size();
+-                    const size_t offset =
+-                        executable.getUniforms()[uniform].pod.parentArrayIndex * elements;
+-                    computeImages[i] = static_cast<uint32_t>(binding->second + offset);
+-                }
++                const size_t elements = executable.getImageBindings()[i].boundImageUnits.size();
++                const size_t offset =
++                    executable.getUniforms()[uniform].pod.parentArrayIndex * elements;
++                computeImages[i] = static_cast<uint32_t>(binding->second + offset);
+             }
+         }
+         if (type == gl::ShaderType::Compute)

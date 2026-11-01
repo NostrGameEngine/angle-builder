@@ -73,16 +73,32 @@ glGetIntegerv(GL_MINOR_VERSION, &minor);
 
 GLES 3.1 provides compute shaders, SSBOs, memory barriers and individual indirect draws. Multi-draw indirect is an additional extension: check `GL_EXT_multi_draw_indirect` by enumerating `glGetStringi(GL_EXTENSIONS, i)` and resolve its entry points with `eglGetProcAddress`. This profile enables that extension for GLES 3.1 contexts without private feature overrides. The backend currently encodes multiple Metal indirect draws in a CPU loop; it does not use Metal indirect command buffers.
 
+The experimental Metal profile supports `imageLoad` and `imageStore` in vertex,
+fragment and compute shaders. Query `GL_MAX_VERTEX_IMAGE_UNIFORMS`,
+`GL_MAX_FRAGMENT_IMAGE_UNIFORMS` and `GL_MAX_COMPUTE_IMAGE_UNIFORMS` after
+creating the context. The eligible profile currently reports four per stage;
+these are ANGLE's resource-slot limits. Writable graphics-image aliases have
+an additional [documented restriction](metal-gles31-capabilities.md#image-descriptors).
+
 In this ANGLE build, requesting minor version 0 still creates a GLES 3.0 context even when using the GLES 3.1 libraries. That context rejects compute shaders and does not expose GLES 3.1 MDI. The default profile rejects a GLES 3.1 context request. Both profiles reject GLES 3.2.
 
 ## Availability and validation
 
 The selectable GLES 3.1 profile is experimental. The macOS runtime gate requires macOS 15 or newer, Apple GPU family 7 or newer, tier 2 argument buffers and read/write textures, at least 128 threads per threadgroup, 16 KiB of threadgroup memory and 128 MiB maximum buffer length. Unsupported devices retain the baseline API limit. Runtime validation has been performed on an Apple M2; the feature predicate does not establish validation on every eligible device. The maximum conformant version remains GLES 3.0: this profile is not a GLES 3.1 certification claim.
 
+Apple family 7 includes the M1 and A14 GPUs; newer Apple GPU families can pass
+the same predicate when their reported properties meet its requirements. The
+profile does not currently enable GLES 3.1 on Intel Macs: its shader memory
+fences use a Metal feature documented for Apple silicon. See Apple's
+[GPU families](https://developer.apple.com/documentation/metal/mtlgpufamily)
+and [Metal Shading Language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf).
+
 The same profile can be built for a [physical iPhone](ios-device-metal-tests.md)
-with an iOS 18 minimum target. Its direct EGL, compute, synchronization and MDI
-probes have passed on an iPhone 12 with an A14 GPU and iOS 27.0.1, with Metal
-API and Shader Validation enabled. The [simulator runner](ios-simulator-metal-tests.md)
+with an iOS 18 minimum target. Its direct EGL, compute, graphics-stage SSBO,
+2D image load/store, atomic-counter, transform-feedback, synchronization and MDI
+probes have passed
+on an iPhone 12 with an A14 GPU and iOS 27.0.1, with Metal API and Shader
+Validation enabled. The [simulator runner](ios-simulator-metal-tests.md)
 tests a separate platform with a virtual GPU; its capabilities do not establish
 the capabilities of the corresponding physical iPhone.
 
@@ -93,6 +109,6 @@ ANGLE_DIR=/store/DEV/angle ANGLE_METAL_PROFILE=gles31 \
     bash scripts/test-macos-metal-profile.sh
 ```
 
-This checks explicit 3.0 and 3.1 context creation, compute output and guard words, extension visibility and 3.2 rejection. Use `ANGLE_NATIVE_DIR` to test staged libraries. `ANGLE_METAL_PROFILE=gles30` checks baseline context rejection and limits. The culling probe additionally verifies compute-generated multi-draw indirect commands against reference images; its runner accepts a verified release manifest through `ANGLE_NATIVE_MANIFEST`.
+This checks explicit 3.0 and 3.1 context creation, compute output, vertex/fragment images, storage buffers and atomic counters, their range rebinding and cross-stage synchronization, extension visibility and 3.2 rejection. Use `ANGLE_NATIVE_DIR` to test staged libraries. `ANGLE_METAL_PROFILE=gles30` checks baseline context rejection and limits. The culling probe additionally verifies compute-generated multi-draw indirect commands against reference images; its runner accepts a verified release manifest through `ANGLE_NATIVE_MANIFEST`.
 
 An isolated [iOS Simulator build and test runner](ios-simulator-metal-tests.md) is also available. It uses the same profile argument with an iOS 18 minimum. For the Java/Graal iOS application, [libJGLIOS](https://github.com/NostrGameEngine/libJGLIOS/tree/GLES31#angle-gles-31-profile) imports this repository's pinned patch series and adds its iOS compatibility patches. Select `-PangleIosMetalProfile=gles31` in that build and request context version 3.1 before graphics initialization. The macOS build command does not produce iOS frameworks.

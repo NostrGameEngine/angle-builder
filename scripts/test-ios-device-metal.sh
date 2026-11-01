@@ -74,16 +74,26 @@ if not match:
 device = json.loads(match.group(1))
 (results / 'device.json').write_text(json.dumps(device,indent=2)+'\n')
 if profile != 'capabilities':
-    if f'METAL_PROFILE_PASS selected={profile}' not in log or 'GLES30_PBUFFER_RENDER_PASS' not in log:
+    if (f'METAL_PROFILE_PASS selected={profile}' not in log or 'GLES30_PBUFFER_RENDER_PASS' not in log or
+            'GLES30_XFB_PASS' not in log):
         raise SystemExit('Physical EGL context or baseline rendering did not pass')
     if 'Metal API Validation Enabled' not in log or 'Metal GPU Validation Enabled' not in log:
         raise SystemExit('Metal API or Shader Validation did not activate')
 if profile == 'gles31':
     frames = [line for line in log.splitlines() if line.startswith('FRAME ')]
-    if ('COMPUTE_SYNCHRONIZATION_PASS' not in log or 'METAL_GPU_CULLING_PASS' not in log or
+    if ('COMPUTE_SYNCHRONIZATION_PASS' not in log or 'GRAPHICS_SSBO_PASS' not in log or
+            'GRAPHICS_IMAGE_PASS vertex=load_store fragment=load_store binary=1' not in log or
+            'IMAGE_ALIAS_PASS vertex=1 graphics=1 compute=1 mixed_shape=1 mixed_format=1 four=1 binary=1 exchange=1' not in log or
+            'GRAPHICS_SSBO_ARRAY_PASS' not in log or 'GRAPHICS_SSBO_INVALIDATION_PASS' not in log or
+            'GRAPHICS_SSBO_STAGE_LIMIT_PASS' not in log or 'GRAPHICS_SSBO_PIPELINE_PASS' not in log or
+            'GRAPHICS_ATOMIC_COUNTER_PASS' not in log or
+            'GRAPHICS_ATOMIC_COUNTER_STAGE_LIMIT_PASS' not in log or
+            'GRAPHICS_SSBO_XFB_PASS' not in log or 'GRAPHICS_SSBO_XFB_RASTER_PASS' not in log or
+            'GRAPHICS_SSBO_XFB_INSTANCE_PASS' not in log or 'GRAPHICS_SSBO_XFB_PIPELINE_PASS' not in log or
+            'METAL_GPU_CULLING_PASS' not in log or
             len(frames) != 3 or any('image_match=1' not in line or 'command_guards=1' not in line or
                                    'counter_guards=1' not in line for line in frames)):
-        raise SystemExit('Compute, synchronization or MDI output differs')
+        raise SystemExit('Compute, graphics images, synchronization or MDI output differs')
 inputs = ['tests/ios-metal-probe-app.mm','tests/metal-device-info.mm',
           'scripts/prepare-ios-device-probe.py','scripts/test-ios-device-metal.sh']
 if profile != 'capabilities':

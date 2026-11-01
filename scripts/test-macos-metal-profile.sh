@@ -16,4 +16,11 @@ xcrun clang++ -std=c++17 -fobjc-arc -I "$ANGLE_DIR/include" \
   "$ROOT_DIR/tests/metal-profile-probe.mm" -L "$native_dir" -lEGL -lGLESv2 \
   -Wl,-rpath,"$native_dir" -framework Foundation \
   -o "$test_dir/metal-profile-probe"
-(cd "$native_dir" && MTL_DEBUG_LAYER=1 "$test_dir/metal-profile-probe" "$profile")
+(cd "$native_dir" && MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
+  "$test_dir/metal-profile-probe" "$profile")
+if [[ "$profile" == gles31 ]]; then
+  MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 python3 "$ROOT_DIR/tests/metal-graphics-image-probe.py" \
+    --native-dir "$native_dir"
+  MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 python3 "$ROOT_DIR/tests/metal-image-alias-probe.py" \
+    --native-dir "$native_dir"
+fi

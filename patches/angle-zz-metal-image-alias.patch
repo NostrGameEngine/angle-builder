@@ -1,0 +1,1336 @@
+diff --git a/src/common/metal_shader_bindings.h b/src/common/metal_shader_bindings.h
+index 5813fbe..70f2243 100644
+--- a/src/common/metal_shader_bindings.h
++++ b/src/common/metal_shader_bindings.h
+@@ -25,8 +25,15 @@ constexpr uint32_t kGraphicsStorageBindingCount =
+ constexpr uint32_t kGraphicsStorageSizeSlots = (kBufferArgumentCount + 3) / 4 * 4;
+ // Byte offset of storageBufferSizes in the graphics driver-uniform ABI.
+ constexpr uint32_t kGraphicsStorageSizeOffsetBytes = 64;
+-// Image slot reflection retains the GLSL readonly qualifier in its high bit.
++// Image slot reflection retains the GLSL access qualifiers in its high bits.
+ constexpr uint32_t kReadOnlyImageBindingBit = uint32_t{1} << 31;
++constexpr uint32_t kReadWriteImageBindingBit = uint32_t{1} << 30;
++constexpr uint32_t kImageBindingFlags = kReadOnlyImageBindingBit | kReadWriteImageBindingBit;
++// The GLES 3.1 profile uses four image slots.  The additional arguments are
++// inside the 128-entry table guaranteed for its Apple GPU family gate.
++constexpr uint32_t kAliasImageSlot = 24;
++constexpr uint32_t kAliasVolumeSlot = 28;
++constexpr uint32_t kImageTextureArgumentCount = 32;
+ }  // namespace metal
+ }  // namespace angle
+ 
+diff --git a/src/compiler/translator/msl/EmitMetal.cpp b/src/compiler/translator/msl/EmitMetal.cpp
+index 4e318b9..7ec581d 100644
+--- a/src/compiler/translator/msl/EmitMetal.cpp
++++ b/src/compiler/translator/msl/EmitMetal.cpp
+@@ -231,7 +231,9 @@ class GenMetalTraverser : public TIntermTraverser
+     bool mRasterOrderGroupsSupported       = false;
+     bool mStorageAccessSupported           = true;
+     bool mEmittingNativeImages             = false;
++    bool mEmittingAliasNativeImages        = false;
+     bool useWrappedImages() const;
++    bool useImageAliasBindings() const;
+     void emitImageInitialization(const TVariable &parameter, const TVariable *driverUniforms);
+     std::vector<StorageAggregateLayout> mStorageLayouts;
+     std::unordered_map<std::string, size_t> mStorageLayoutIndices;
+@@ -272,6 +274,11 @@ bool GenMetalTraverser::useWrappedImages() const
+            (mCompiler.getShaderVersion() >= 310 && !mCompiler.hasPixelLocalStorageUniforms());
+ }
+ 
++bool GenMetalTraverser::useImageAliasBindings() const
++{
++    return useWrappedImages();
++}
++
+ void GenMetalTraverser::emitIndentation()
+ {
+     ASSERT(mIndentLevel >= 0);
+@@ -1131,21 +1138,25 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
+             {
+                 if (IsImage2D(basicType))
+                 {
+-                    mOut << (useWrappedImages() && !mEmittingNativeImages
+-                                 ? "ANGLE_image2d<"
+-                                 : "metal::texture2d<");
++                    mOut << (mEmittingNativeImages || !useWrappedImages()
++                                 ? "metal::texture2d<"
++                             : useImageAliasBindings() ? "ANGLE_aliasImage2d<"
++                                                        : "ANGLE_image2d<");
+                 }
+                 else if (IsImage3D(basicType))
+                 {
+-                    mOut << "metal::texture3d<";
++                    mOut << (useImageAliasBindings() && !mEmittingNativeImages
++                                 ? "ANGLE_aliasImage3d<" : "metal::texture3d<");
+                 }
+                 else if (IsImage2DArray(basicType))
+                 {
+-                    mOut << "metal::texture2d_array<";
++                    mOut << (useImageAliasBindings() && !mEmittingNativeImages
++                                 ? "ANGLE_aliasImage2dArray<" : "metal::texture2d_array<");
+                 }
+                 else if (IsImageCube(basicType))
+                 {
+-                    mOut << "metal::texturecube<";
++                    mOut << (useImageAliasBindings() && !mEmittingNativeImages
++                                 ? "ANGLE_aliasImageCube<" : "metal::texturecube<");
+                 }
+                 else
+                 {
+@@ -1154,18 +1165,25 @@ void GenMetalTraverser::emitBareTypeName(const TType &type, const EmitTypeConfig
+                 mOut << (IsFloatImage(basicType)     ? "float"
+                          : IsIntegerImage(basicType) ? "int"
+                                                      : "uint");
+-                if (type.getMemoryQualifier().readonly)
++                if (type.getMemoryQualifier().readonly ||
++                    (mEmittingNativeImages && useImageAliasBindings() &&
++                     !mEmittingAliasNativeImages && !type.getMemoryQualifier().writeonly))
+                 {
+-                    mOut << ", metal::access::read>";
++                    mOut << ", metal::access::read";
+                 }
+                 else if (type.getMemoryQualifier().writeonly)
+                 {
+-                    mOut << ", metal::access::write>";
++                    mOut << ", metal::access::write";
+                 }
+                 else
+                 {
+-                    mOut << ", metal::access::read_write>";
++                    mOut << ", metal::access::read_write";
++                }
++                if (mEmittingNativeImages && useImageAliasBindings())
++                {
++                    mOut << " ANGLE_IMAGE_COHERENCE";
+                 }
++                mOut << ">";
+             }
+             else
+             {
+@@ -1470,13 +1488,17 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+         TranslatorMetalReflection *reflection = mtl::getTranslatorMetalReflection(&mCompiler);
+         if (useWrappedImages())
+         {
++            // GLSL coherent images may communicate across workgroups. Metal
++            // 3.2 is needed to request device-wide texture coherence.
++            reflection->requiresComputeMemoryFences = true;
+             TInfoSinkBase mappedName;
+             Name(field).emit(mappedName, kUserVariableNamePrefix);
+-            const bool readOnly = mCompiler.getShaderType() != GL_COMPUTE_SHADER &&
+-                                  type.getMemoryQualifier().readonly;
++            const bool readOnly = type.getMemoryQualifier().readonly;
++            const bool readWrite = !readOnly && !type.getMemoryQualifier().writeonly;
+             reflection->addComputeImageBinding(
+                 mappedName.c_str(), mMainTextureIndex |
+-                    (readOnly ? angle::metal::kReadOnlyImageBindingBit : 0));
++                    (readOnly ? angle::metal::kReadOnlyImageBindingBit : 0) |
++                    (readWrite ? angle::metal::kReadWriteImageBindingBit : 0));
+             // Retain declared-unit reflection for the native translation tests.
+             // Runtime GLES bindings use the uniform-name map above.
+             if (type.getLayoutQualifier().binding >= 0 &&
+@@ -1507,6 +1529,37 @@ void GenMetalTraverser::emitFieldDeclaration(const TField &field,
+             emitNameOf(field);
+             mOut << "_volume [[texture(" << (20 + imageSlot) << ")]]";
+         }
++        if (mEmittingNativeImages && useImageAliasBindings())
++        {
++            // Native image arguments retain their original access qualifiers.
++            // The extra nullable handle is used only when overlapping images
++            // must share a single Metal read/write texture argument.
++            TType aliasType(type);
++            TMemoryQualifier memory = type.getMemoryQualifier();
++            memory.readonly = false;
++            memory.writeonly = false;
++            aliasType.setMemoryQualifier(memory);
++            // Metal permits 2D, array and cube textures to be viewed as a
++            // 2D array. Three-dimensional storage needs a separate handle.
++            aliasType.setBasicType(EbtUImage2DArray);
++            mOut << ";\n";
++            emitIndentation();
++            mEmittingAliasNativeImages = true;
++            emitType(aliasType, {});
++            mOut << " ";
++            emitNameOf(field);
++            mOut << "_alias [[texture("
++                 << (angle::metal::kAliasImageSlot + imageSlot) << ")]]";
++            aliasType.setBasicType(EbtUImage3D);
++            mOut << ";\n";
++            emitIndentation();
++            emitType(aliasType, {});
++            mEmittingAliasNativeImages = false;
++            mOut << " ";
++            emitNameOf(field);
++            mOut << "_alias_volume [[texture("
++                 << (angle::metal::kAliasVolumeSlot + imageSlot) << ")]]";
++        }
+     }
+ }
+ 
+@@ -1704,7 +1757,7 @@ void GenMetalTraverser::emitStructDeclaration(const TType &type)
+     if (wrappedImages && mEmittingNativeImages && mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+     {
+         emitIndentation();
+-        mOut << "constant uint *ANGLE_imageLayers [[buffer(23)]];\n";
++        mOut << "constant metal::uint2 *ANGLE_imageLayers [[buffer(23)]];\n";
+     }
+     emitCloseBrace();
+ }
+@@ -3040,6 +3093,53 @@ void GenMetalTraverser::emitImageInitialization(const TVariable &parameter,
+     mOut << " ";
+     emitNameOf(parameter);
+     mOut << ";\n";
++    auto indicesFor = [](const TType &type, size_t element) {
++        std::string indices;
++        size_t remainder = element;
++        for (size_t dimension = type.getNumArraySizes(); dimension > 0; --dimension)
++        {
++            size_t stride = 1;
++            for (size_t inner = 0; inner + 1 < dimension; ++inner)
++            {
++                stride *= type.getArraySizes()[inner];
++            }
++            indices += "[" + std::to_string(remainder / stride) + "]";
++            remainder %= stride;
++        }
++        return indices;
++    };
++    auto emitNativeMember = [&](const TField &field, size_t element, const char *suffix) {
++        emitNameOf(parameter);
++        mOut << "_native.";
++        emitNameOf(field);
++        mOut << suffix << indicesFor(*field.type(), element);
++    };
++    auto emitMetadata = [&](size_t imageSlot, char component) {
++        if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
++        {
++            emitNameOf(parameter);
++            mOut << "_native.ANGLE_imageLayers[" << imageSlot << "]." << component;
++        }
++        else if (driverUniforms)
++        {
++            emitNameOf(*driverUniforms);
++            mOut << ".";
++            const auto &fields = driverUniforms->getType().getStruct()->fields();
++            auto it = std::find_if(fields.begin(), fields.end(), [](const TField *field) {
++                return field->name() == "storageBufferSizes";
++            });
++            ASSERT(it != fields.end());
++            emitNameOf(**it);
++            mOut << "[" << imageSlot << "]." << component;
++        }
++        else
++        {
++            static_assert(angle::metal::kGraphicsStorageSizeOffsetBytes % 8 == 0);
++            mOut << "ANGLE_graphicsImageDriver["
++                 << angle::metal::kGraphicsStorageSizeOffsetBytes / 8 + imageSlot
++                 << "]." << component;
++        }
++    };
+     size_t slot = 0;
+     for (const TField *field : parameter.getType().getStruct()->fields())
+     {
+@@ -3047,69 +3147,62 @@ void GenMetalTraverser::emitImageInitialization(const TVariable &parameter,
+         const size_t elements = type.getArraySizeProduct();
+         for (size_t element = 0; element < elements; ++element)
+         {
+-            std::string indices;
+-            size_t remainder = element;
+-            for (size_t dimension = type.getNumArraySizes(); dimension > 0; --dimension)
+-            {
+-                size_t stride = 1;
+-                for (size_t inner = 0; inner + 1 < dimension; ++inner)
+-                {
+-                    stride *= type.getArraySizes()[inner];
+-                }
+-                indices += "[" + std::to_string(remainder / stride) + "]";
+-                remainder %= stride;
+-            }
+-            auto emitMember = [&](bool native, bool volume) {
+-                emitNameOf(parameter);
+-                if (native)
+-                {
+-                    mOut << "_native";
+-                }
+-                mOut << ".";
+-                emitNameOf(*field);
+-                if (volume)
+-                {
+-                    mOut << "_volume";
+-                }
+-                mOut << indices;
+-            };
+             emitIndentation();
+-            emitMember(false, false);
++            emitNameOf(parameter);
++            mOut << ".";
++            emitNameOf(*field);
++            mOut << indicesFor(type, element);
+             mOut << " = ";
+-            if (IsImage2D(type.getBasicType()))
++            const bool planar = IsImage2D(type.getBasicType());
++            if (planar || useImageAliasBindings())
+             {
+                 mOut << "{";
+             }
+-            emitMember(true, false);
+-            if (IsImage2D(type.getBasicType()))
++            emitNativeMember(*field, element, "");
++            if (planar)
+             {
+                 mOut << ", ";
+-                emitMember(true, true);
++                emitNativeMember(*field, element, "_volume");
+                 mOut << ", ";
+-                if (mCompiler.getShaderType() == GL_COMPUTE_SHADER)
+-                {
+-                    emitNameOf(parameter);
+-                    mOut << "_native.ANGLE_imageLayers[" << slot + element << "]";
+-                }
+-                else if (driverUniforms)
+-                {
+-                    emitNameOf(*driverUniforms);
+-                    mOut << ".";
+-                    const auto &fields = driverUniforms->getType().getStruct()->fields();
+-                    auto it = std::find_if(fields.begin(), fields.end(), [](const TField *field) {
+-                        return field->name() == "storageBufferSizes";
+-                    });
+-                    ASSERT(it != fields.end());
+-                    emitNameOf(**it);
+-                    mOut << "[" << slot + element << "].x";
+-                }
+-                else
+-                {
+-                    static_assert(angle::metal::kGraphicsStorageSizeOffsetBytes % 8 == 0);
+-                    mOut << "ANGLE_graphicsImageDriver["
+-                         << angle::metal::kGraphicsStorageSizeOffsetBytes / 8 + slot + element
+-                         << "].x";
+-                }
++                emitMetadata(slot + element, 'x');
++            }
++            if (useImageAliasBindings())
++            {
++                mOut << ", (";
++                emitMetadata(slot + element, 'y');
++                mOut << " >> 8u)";
++                auto emitAliasSelection = [&](const char *suffix) {
++                    size_t candidateSlot = 0;
++                    size_t alternatives = 0;
++                    for (const TField *candidate : parameter.getType().getStruct()->fields())
++                    {
++                        const TType &candidateType = *candidate->type();
++                        const size_t candidateElements = candidateType.getArraySizeProduct();
++                        for (size_t candidateElement = 0; candidateElement < candidateElements;
++                             ++candidateElement)
++                        {
++                            mOut << "((";
++                            emitMetadata(slot + element, 'y');
++                            mOut << " & 255u) == " << candidateSlot + candidateElement + 1 << "u ? ";
++                            emitNativeMember(*candidate, candidateElement, suffix);
++                            mOut << " : ";
++                            ++alternatives;
++                        }
++                        candidateSlot += candidateElements;
++                    }
++                    emitNativeMember(*field, element, suffix);
++                    for (size_t count = 0; count < alternatives; ++count)
++                    {
++                        mOut << ")";
++                    }
++                };
++                mOut << ", ";
++                emitAliasSelection("_alias");
++                mOut << ", ";
++                emitAliasSelection("_alias_volume");
++            }
++            if (planar || useImageAliasBindings())
++            {
+                 mOut << "}";
+             }
+             mOut << ";\n";
+@@ -3924,6 +4017,11 @@ bool sh::EmitMetal(TCompiler &compiler,
+         }
+     }
+ 
++    if (compiler.getShaderType() == GL_COMPUTE_SHADER ||
++        (compiler.getShaderVersion() >= 310 && !compiler.hasPixelLocalStorageUniforms()))
++    {
++        out << "#define ANGLE_IMAGE_DEVICE_COHERENCE 1\n";
++    }
+     out << "\n\n";
+ 
+     if (!EmitProgramPrelude(root, out, ppc))
+diff --git a/src/compiler/translator/msl/ProgramPrelude.cpp b/src/compiler/translator/msl/ProgramPrelude.cpp
+index 7d2e829..c016ef7 100644
+--- a/src/compiler/translator/msl/ProgramPrelude.cpp
++++ b/src/compiler/translator/msl/ProgramPrelude.cpp
+@@ -3345,13 +3345,101 @@ ANGLE_ALWAYS_INLINE void ANGLE_imulExtended(T x, T y,
+ )")
+ 
+ PROGRAM_PRELUDE_DECLARE(image2dType, R"(
++#if defined(ANGLE_IMAGE_DEVICE_COHERENCE) && __METAL_VERSION__ >= 320
++#define ANGLE_IMAGE_COHERENCE , metal::memory_coherence_device
++#else
++#define ANGLE_IMAGE_COHERENCE
++#endif
++
+ template <typename T, metal::access Access>
+ struct ANGLE_image2d
+ {
+-    metal::texture2d<T, Access> planar;
+-    metal::texture3d<T, Access> volume;
++    metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE> planar;
++    metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE> volume;
+     uint layer;
+ };
++
++// The original access-qualified handle is used when the image is independent.
++// Aliased images instead share one separately bound read/write handle.
++template <typename T, metal::access Access>
++struct ANGLE_aliasImage2d
++{
++    metal::texture2d<T, (Access == metal::access::read_write ? metal::access::read : Access) ANGLE_IMAGE_COHERENCE> planar;
++    metal::texture3d<T, (Access == metal::access::read_write ? metal::access::read : Access) ANGLE_IMAGE_COHERENCE> volume;
++    uint layer;
++    uint format;
++    metal::texture2d_array<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasArray;
++    metal::texture3d<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasVolume;
++};
++template <typename T, metal::access Access>
++struct ANGLE_aliasImage3d
++{
++    metal::texture3d<T, (Access == metal::access::read_write ? metal::access::read : Access) ANGLE_IMAGE_COHERENCE> texture;
++    uint format;
++    metal::texture2d_array<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasArray;
++    metal::texture3d<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasVolume;
++};
++template <typename T, metal::access Access>
++struct ANGLE_aliasImage2dArray
++{
++    metal::texture2d_array<T, (Access == metal::access::read_write ? metal::access::read : Access) ANGLE_IMAGE_COHERENCE> texture;
++    uint format;
++    metal::texture2d_array<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasArray;
++    metal::texture3d<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasVolume;
++};
++template <typename T, metal::access Access>
++struct ANGLE_aliasImageCube
++{
++    metal::texturecube<T, (Access == metal::access::read_write ? metal::access::read : Access) ANGLE_IMAGE_COHERENCE> texture;
++    uint format;
++    metal::texture2d_array<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasArray;
++    metal::texture3d<uint, metal::access::read_write ANGLE_IMAGE_COHERENCE> aliasVolume;
++};
++
++// GL image formats of equal size share an unsigned integer view. Convert at
++// each access, since two aliases can interpret the same bits differently.
++template <typename T>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_decodeImageAlias(metal::uint4 raw, uint format)
++{
++    switch (format)
++    {
++        case 0x822e: return metal::vec<T, 4>(T(as_type<float>(raw.x)), T(0), T(0), T(1)); // R32F
++        case 0x8235: return metal::vec<T, 4>(T(as_type<int>(raw.x)), T(0), T(0), T(1)); // R32I
++        case 0x8236: return metal::vec<T, 4>(T(raw.x), T(0), T(0), T(1)); // R32UI
++        case 0x8058: return metal::vec<T, 4>(metal::unpack_unorm4x8_to_float(raw.x));
++        case 0x8f97: return metal::vec<T, 4>(metal::unpack_snorm4x8_to_float(raw.x));
++        case 0x8d7c: return metal::vec<T, 4>(as_type<metal::uchar4>(raw.x));
++        case 0x8d8e: return metal::vec<T, 4>(as_type<metal::char4>(raw.x));
++        case 0x881a: return metal::vec<T, 4>(metal::float4(as_type<metal::half4>(metal::ushort4(raw))));
++        case 0x8d76: return metal::vec<T, 4>(raw);
++        case 0x8d88: return metal::vec<T, 4>(as_type<metal::short4>(metal::ushort4(raw)));
++        case 0x8814: return metal::vec<T, 4>(as_type<metal::float4>(raw));
++        case 0x8d70: return metal::vec<T, 4>(raw);
++        case 0x8d82: return metal::vec<T, 4>(as_type<metal::int4>(raw));
++        default: return metal::vec<T, 4>(0);
++    }
++}
++template <typename T>
++ANGLE_ALWAYS_INLINE metal::uint4 ANGLE_encodeImageAlias(metal::vec<T, 4> value, uint format)
++{
++    switch (format)
++    {
++        case 0x822e: return metal::uint4(as_type<uint>(float(value.x)), 0, 0, 0);
++        case 0x8235: return metal::uint4(as_type<uint>(int(value.x)), 0, 0, 0);
++        case 0x8236: return metal::uint4(uint(value.x), 0, 0, 0);
++        case 0x8058: return metal::uint4(metal::pack_float_to_unorm4x8(metal::float4(value)), 0, 0, 0);
++        case 0x8f97: return metal::uint4(metal::pack_float_to_snorm4x8(metal::float4(value)), 0, 0, 0);
++        case 0x8d7c: return metal::uint4(as_type<uint>(metal::uchar4(metal::min(metal::uint4(value), 255u))), 0, 0, 0);
++        case 0x8d8e: return metal::uint4(as_type<uint>(metal::char4(metal::clamp(metal::int4(value), -128, 127))), 0, 0, 0);
++        case 0x881a: return metal::uint4(as_type<metal::ushort4>(metal::half4(metal::float4(value))));
++        case 0x8d76: return metal::min(metal::uint4(value), 65535u);
++        case 0x8d88: return metal::uint4(as_type<metal::ushort4>(metal::short4(metal::clamp(metal::int4(value), -32768, 32767))));
++        case 0x8814: return as_type<metal::uint4>(metal::float4(value));
++        case 0x8d70: return metal::uint4(value);
++        case 0x8d82: return as_type<metal::uint4>(metal::int4(value));
++        default: return metal::uint4(0);
++    }
++}
+ )")
+ 
+ PROGRAM_PRELUDE_DECLARE(imageSize,
+@@ -3369,32 +3457,70 @@ ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const ANGLE_image2d<T, Access> &
+     return metal::int2(image.planar.get_width(), image.planar.get_height());
+ }
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access> &texture)
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE> &texture)
+ {
+     if (metal::is_null_texture(texture)) return metal::int2(0);
+     return metal::int2(texture.get_width(), texture.get_height());
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture3d<T, Access> &texture)
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE> &texture)
+ {
+     if (metal::is_null_texture(texture)) return metal::int3(0);
+     return metal::int3(texture.get_width(), texture.get_height(), texture.get_depth());
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d_array<T, Access> &texture)
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE> &texture)
+ {
+     if (metal::is_null_texture(texture)) return metal::int3(0);
+     return metal::int3(texture.get_width(), texture.get_height(), texture.get_array_size());
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texturecube<T, Access> &texture)
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE> &texture)
+ {
+     if (metal::is_null_texture(texture)) return metal::int2(0);
+     return metal::int2(texture.get_width(), texture.get_height());
+ }
++
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const ANGLE_aliasImage2d<T, Access> &image)
++{
++    if (!metal::is_null_texture(image.aliasVolume))
++        return image.layer < image.aliasVolume.get_depth()
++                   ? metal::int2(image.aliasVolume.get_width(), image.aliasVolume.get_height())
++                   : metal::int2(0);
++    if (!metal::is_null_texture(image.aliasArray))
++        return image.layer < image.aliasArray.get_array_size()
++                   ? metal::int2(image.aliasArray.get_width(), image.aliasArray.get_height())
++                   : metal::int2(0);
++    if (!metal::is_null_texture(image.volume))
++        return image.layer < image.volume.get_depth()
++                   ? metal::int2(image.volume.get_width(), image.volume.get_height())
++                   : metal::int2(0);
++    if (metal::is_null_texture(image.planar)) return metal::int2(0);
++    return metal::int2(image.planar.get_width(), image.planar.get_height());
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const ANGLE_aliasImage3d<T, Access> &image)
++{
++    return metal::is_null_texture(image.aliasVolume) ? ANGLE_imageSize(image.texture)
++                                                    : ANGLE_imageSize(image.aliasVolume);
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const ANGLE_aliasImage2dArray<T, Access> &image)
++{
++    return metal::is_null_texture(image.aliasArray) ? ANGLE_imageSize(image.texture)
++                                                   : ANGLE_imageSize(image.aliasArray);
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE auto ANGLE_imageSize(thread const ANGLE_aliasImageCube<T, Access> &image)
++{
++    return metal::is_null_texture(image.aliasArray)
++               ? ANGLE_imageSize(image.texture)
++               : metal::int2(image.aliasArray.get_width(), image.aliasArray.get_height());
++}
+ )",
+                         image2dType())
+ 
+@@ -3410,7 +3536,7 @@ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const ANGLE_image2d<
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d<T, Access> &texture, metal::int2 coord)
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int2 coord)
+ {
+     const auto size = ANGLE_imageSize(texture);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3421,7 +3547,7 @@ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture3d<T, Access> &texture, metal::int3 coord)
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int3 coord)
+ {
+     const auto size = ANGLE_imageSize(texture);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3432,7 +3558,7 @@ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d_array<T, Access> &texture, metal::int3 coord)
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int3 coord)
+ {
+     const auto size = ANGLE_imageSize(texture);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3443,7 +3569,7 @@ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texturecube<T, Access> &texture, metal::int3 coord)
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int3 coord)
+ {
+     const auto size = metal::int3(ANGLE_imageSize(texture), 6);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3452,6 +3578,42 @@ ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const metal::texture
+     }
+     return texture.read(uint2(coord.xy), uint(coord.z));
+ }
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const ANGLE_aliasImage2d<T, Access> &image, metal::int2 coord)
++{
++    const auto size = ANGLE_imageSize(image);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return metal::vec<T, 4>(0);
++    if (!metal::is_null_texture(image.aliasVolume))
++        return ANGLE_decodeImageAlias<T>(image.aliasVolume.read(uint3(uint2(coord), image.layer)), image.format);
++    if (!metal::is_null_texture(image.aliasArray))
++        return ANGLE_decodeImageAlias<T>(image.aliasArray.read(uint2(coord), image.layer), image.format);
++    return metal::is_null_texture(image.volume) ? image.planar.read(uint2(coord))
++                                              : image.volume.read(uint3(uint2(coord), image.layer));
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const ANGLE_aliasImage3d<T, Access> &image, metal::int3 coord)
++{
++    const auto size = ANGLE_imageSize(image);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return metal::vec<T, 4>(0);
++    return metal::is_null_texture(image.aliasVolume) ? ANGLE_imageLoad(image.texture, coord)
++               : ANGLE_decodeImageAlias<T>(ANGLE_imageLoad(image.aliasVolume, coord), image.format);
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const ANGLE_aliasImage2dArray<T, Access> &image, metal::int3 coord)
++{
++    const auto size = ANGLE_imageSize(image);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return metal::vec<T, 4>(0);
++    return metal::is_null_texture(image.aliasArray) ? ANGLE_imageLoad(image.texture, coord)
++               : ANGLE_decodeImageAlias<T>(ANGLE_imageLoad(image.aliasArray, coord), image.format);
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE metal::vec<T, 4> ANGLE_imageLoad(thread const ANGLE_aliasImageCube<T, Access> &image, metal::int3 coord)
++{
++    const auto size = metal::int3(ANGLE_imageSize(image), 6);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return metal::vec<T, 4>(0);
++    return metal::is_null_texture(image.aliasArray) ? ANGLE_imageLoad(image.texture, coord)
++               : ANGLE_decodeImageAlias<T>(ANGLE_imageLoad(image.aliasArray, coord), image.format);
++}
+ )",
+                         imageSize())
+ 
+@@ -3467,7 +3629,7 @@ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const ANGLE_image2d<T, Access>
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d<T, Access> &texture, metal::int2 coord, metal::vec<T, 4> value)
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int2 coord, metal::vec<T, 4> value)
+ {
+     const auto size = ANGLE_imageSize(texture);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3478,7 +3640,7 @@ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d<T, Acces
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture3d<T, Access> &texture, metal::int3 coord, metal::vec<T, 4> value)
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture3d<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int3 coord, metal::vec<T, 4> value)
+ {
+     const auto size = ANGLE_imageSize(texture);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3489,7 +3651,7 @@ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture3d<T, Acces
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d_array<T, Access> &texture, metal::int3 coord, metal::vec<T, 4> value)
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d_array<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int3 coord, metal::vec<T, 4> value)
+ {
+     const auto size = ANGLE_imageSize(texture);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3500,7 +3662,7 @@ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d_array<T,
+ }
+ 
+ template <typename T, metal::access Access>
+-ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texturecube<T, Access> &texture, metal::int3 coord, metal::vec<T, 4> value)
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texturecube<T, Access ANGLE_IMAGE_COHERENCE> &texture, metal::int3 coord, metal::vec<T, 4> value)
+ {
+     const auto size = metal::int3(ANGLE_imageSize(texture), 6);
+     if (metal::any(coord < 0) || metal::any(coord >= size))
+@@ -3509,6 +3671,65 @@ ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texturecube<T, Acc
+     }
+     texture.write(value, uint2(coord.xy), uint(coord.z));
+ }
++// Unqualified GLSL images use the shared read/write view even when they are
++// the only binding. Their unused native fallback is read-only, preserving the
++// Metal per-function read/write texture limit.
++template <typename T>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d<T, metal::access::read ANGLE_IMAGE_COHERENCE> &, metal::int2, metal::vec<T, 4>) {}
++template <typename T>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture3d<T, metal::access::read ANGLE_IMAGE_COHERENCE> &, metal::int3, metal::vec<T, 4>) {}
++template <typename T>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texture2d_array<T, metal::access::read ANGLE_IMAGE_COHERENCE> &, metal::int3, metal::vec<T, 4>) {}
++template <typename T>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread const metal::texturecube<T, metal::access::read ANGLE_IMAGE_COHERENCE> &, metal::int3, metal::vec<T, 4>) {}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread ANGLE_aliasImage2d<T, Access> &image, metal::int2 coord, metal::vec<T, 4> value)
++{
++    const auto size = ANGLE_imageSize(image);
++    if (metal::any(coord < 0) || metal::any(coord >= size)) return;
++    if (!metal::is_null_texture(image.aliasVolume))
++    {
++        image.aliasVolume.write(ANGLE_encodeImageAlias(value, image.format), uint3(uint2(coord), image.layer));
++        image.aliasVolume.fence();
++    }
++    else if (!metal::is_null_texture(image.aliasArray))
++    {
++        image.aliasArray.write(ANGLE_encodeImageAlias(value, image.format), uint2(coord), image.layer);
++        image.aliasArray.fence();
++    }
++    else if (metal::is_null_texture(image.volume)) ANGLE_imageStore(image.planar, coord, value);
++    else ANGLE_imageStore(image.volume, metal::int3(coord, int(image.layer)), value);
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread ANGLE_aliasImage3d<T, Access> &image, metal::int3 coord, metal::vec<T, 4> value)
++{
++    if (metal::is_null_texture(image.aliasVolume)) ANGLE_imageStore(image.texture, coord, value);
++    else
++    {
++        ANGLE_imageStore(image.aliasVolume, coord, ANGLE_encodeImageAlias(value, image.format));
++        image.aliasVolume.fence();
++    }
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread ANGLE_aliasImage2dArray<T, Access> &image, metal::int3 coord, metal::vec<T, 4> value)
++{
++    if (metal::is_null_texture(image.aliasArray)) ANGLE_imageStore(image.texture, coord, value);
++    else
++    {
++        ANGLE_imageStore(image.aliasArray, coord, ANGLE_encodeImageAlias(value, image.format));
++        image.aliasArray.fence();
++    }
++}
++template <typename T, metal::access Access>
++ANGLE_ALWAYS_INLINE void ANGLE_imageStore(thread ANGLE_aliasImageCube<T, Access> &image, metal::int3 coord, metal::vec<T, 4> value)
++{
++    if (metal::is_null_texture(image.aliasArray)) ANGLE_imageStore(image.texture, coord, value);
++    else
++    {
++        ANGLE_imageStore(image.aliasArray, coord, ANGLE_encodeImageAlias(value, image.format));
++        image.aliasArray.fence();
++    }
++}
+ )",
+                         imageSize())
+ 
+@@ -4660,7 +4881,7 @@ void ProgramPrelude::visitVariable(const Name &name, const TType &type)
+     {
+         arrayVertexID();
+     }
+-    if (IsImage2D(type.getBasicType()))
++    if (IsImage(type.getBasicType()))
+     {
+         image2dType();
+     }
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index c85fcef..6b1577c 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -329,6 +329,7 @@ class ContextMtl : public ContextImpl, public mtl::Context
+         const std::array<mtl::StorageBufferSize, mtl::kGraphicsStorageSizeSlots> &sizes,
+         mtl::RenderCommandEncoder *encoder);
+     void setGraphicsImageLayers(gl::ShaderType stage, const std::array<uint32_t, 4> &layers,
++                                const std::array<uint32_t, 4> &aliases,
+                                 mtl::RenderCommandEncoder *encoder);
+ 
+     const mtl::ClearColorValue &getClearColorValue() const;
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 1aa2a55..0e880b4 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -3297,11 +3297,13 @@ static bool isDrawNoOp(const mtl::RenderPipelineDesc &descriptor,
+ 
+ void ContextMtl::setGraphicsImageLayers(gl::ShaderType stage,
+                                         const std::array<uint32_t, 4> &layers,
++                                        const std::array<uint32_t, 4> &aliases,
+                                         mtl::RenderCommandEncoder *encoder)
+ {
+     for (size_t index = 0; index < layers.size(); ++index)
+     {
+         mDriverUniforms.storageBufferSizes[index][0] = layers[index];
++        mDriverUniforms.storageBufferSizes[index][1] = aliases[index];
+     }
+     encoder->setData(stage, mDriverUniforms, mtl::kDriverUniformsBindingIndex);
+ }
+diff --git a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+index a0e768d..5dcce2d 100644
+--- a/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm
+@@ -38,39 +38,64 @@ bool CompareBlockInfo(const sh::BlockMemberInfo &a, const sh::BlockMemberInfo &b
+     return a.offset < b.offset;
+ }
+ 
+-// Metal does not allow the same texture to be supplied to multiple arguments
+-// of one shader when any of those arguments can write.  Until image aliases
+-// are lowered to a shared read/write argument, reject overlapping writable
+-// bindings instead of issuing an invalid Metal draw.  Use the translated
+-// shader's access qualifier, not the image unit's potentially broader access.
++// Metal requires a single read/write argument for overlapping writable images.
++// Separate readonly arguments may share a texture.
+ bool ImageBindingsOverlap(const gl::ImageUnit &a, const gl::ImageUnit &b)
+ {
+-    if (!a.texture.get() || a.texture.get() != b.texture.get() || a.level != b.level)
+-    {
+-        return false;
+-    }
+-    if (a.texture->getType() == gl::TextureType::_3D)
++    // A single full-mip view covers layered images and individual slices.
++    return a.texture.get() && a.texture.get() == b.texture.get() && a.level == b.level;
++}
++
++GLenum GetAliasedReadWriteFormat(id<MTLDevice> device, GLenum format)
++{
++    switch (format)
+     {
+-        // Non-layered 3D images use an entire 3D Metal view plus a layer index.
+-        return true;
++        case GL_R32F:
++        case GL_R32I:
++        case GL_R32UI:
++        case GL_RGBA8_SNORM:
++        case GL_RGBA8:
++        case GL_RGBA8I:
++        case GL_RGBA8UI:
++            return device.readWriteTextureSupport >= MTLReadWriteTextureTier1 ? GL_R32UI : GL_NONE;
++        case GL_RGBA16F:
++        case GL_RGBA16I:
++        case GL_RGBA16UI:
++            return device.readWriteTextureSupport >= MTLReadWriteTextureTier2 ? GL_RGBA16UI : GL_NONE;
++        case GL_RGBA32F:
++        case GL_RGBA32I:
++        case GL_RGBA32UI:
++            return device.readWriteTextureSupport >= MTLReadWriteTextureTier2 ? GL_RGBA32UI : GL_NONE;
++        default:
++            return GL_NONE;
+     }
+-    return a.layered || b.layered || a.layer == b.layer ||
+-           a.texture->getType() == gl::TextureType::_2D;
+ }
+ 
+-angle::Result ValidateGraphicsImageAliases(const gl::Context *glContext,
+-                                           const gl::ProgramExecutable &executable,
+-                                           const mtl::TranslatedShaderInfo &shaderInfo)
++angle::Result CollectImageAliases(const gl::Context *glContext,
++                                          const gl::ProgramExecutable &executable,
++                                          const mtl::TranslatedShaderInfo &shaderInfo,
++                                          std::array<uint32_t, 4> *aliases)
+ {
+     ContextMtl *context    = mtl::GetImpl(glContext);
+     const gl::State &state = glContext->getState();
+     struct ImageUse
+     {
+         const gl::ImageUnit *unit;
++        uint32_t slot;
+         bool readOnly;
++        bool readWrite;
+     };
+-    std::array<ImageUse, mtl::kMaxComputeTextures> usedImages = {};
++    std::array<ImageUse, 4> usedImages = {};
+     size_t usedImageCount = 0;
++    std::array<uint32_t, 4> roots = {0, 1, 2, 3};
++    aliases->fill(0);
++    auto findRoot = [&](uint32_t slot) {
++        while (roots[slot] != slot)
++        {
++            slot = roots[slot];
++        }
++        return slot;
++    };
+     const auto &bindings = executable.getImageBindings();
+     for (size_t imageIndex = 0; imageIndex < bindings.size(); ++imageIndex)
+     {
+@@ -79,12 +104,13 @@ bool ImageBindingsOverlap(const gl::ImageUnit &a, const gl::ImageUnit &b)
+             continue;
+         }
+         const uint32_t reflectedSlot = shaderInfo.actualComputeImageBindings[imageIndex];
+-        const uint32_t firstSlot = reflectedSlot & ~angle::metal::kReadOnlyImageBindingBit;
++        const uint32_t firstSlot = reflectedSlot & ~angle::metal::kImageBindingFlags;
+         if (firstSlot >= mtl::kMaxComputeTextures)
+         {
+             continue;
+         }
+         const bool readOnly = (reflectedSlot & angle::metal::kReadOnlyImageBindingBit) != 0;
++        const bool readWrite = (reflectedSlot & angle::metal::kReadWriteImageBindingBit) != 0;
+         const auto &units = bindings[imageIndex].boundImageUnits;
+         for (size_t element = 0; element < units.size(); ++element)
+         {
+@@ -93,17 +119,31 @@ bool ImageBindingsOverlap(const gl::ImageUnit &a, const gl::ImageUnit &b)
+             {
+                 continue;
+             }
++            const uint32_t slot = firstSlot + static_cast<uint32_t>(element);
++            ANGLE_CHECK(context, slot < usedImages.size(), "Invalid Metal image slot",
++                        GL_INVALID_OPERATION);
+             for (size_t index = 0; index < usedImageCount; ++index)
+             {
+                 const ImageUse &other = usedImages[index];
+-                ANGLE_CHECK(context,
+-                            !ImageBindingsOverlap(image, *other.unit) ||
+-                                (readOnly && other.readOnly),
+-                            "Overlapping writable Metal graphics images are not supported",
++                if (!ImageBindingsOverlap(image, *other.unit) || (readOnly && other.readOnly))
++                {
++                    continue;
++                }
++                const GLenum rawFormat = GetAliasedReadWriteFormat(
++                    context->getDisplay()->getMetalDevice(), image.format);
++                const bool sameView = rawFormat != GL_NONE &&
++                    rawFormat == GetAliasedReadWriteFormat(
++                        context->getDisplay()->getMetalDevice(), other.unit->format);
++                ANGLE_CHECK(context, sameView,
++                            "Incompatible overlapping writable Metal images",
+                             GL_INVALID_OPERATION);
++                const uint32_t a = findRoot(slot);
++                const uint32_t b = findRoot(other.slot);
++                roots[std::max(a, b)] = std::min(a, b);
+             }
+-            ASSERT(usedImageCount < usedImages.size());
+-            usedImages[usedImageCount++] = {&image, readOnly};
++            ANGLE_CHECK(context, usedImageCount < usedImages.size(),
++                        "Too many Metal image arguments", GL_INVALID_OPERATION);
++            usedImages[usedImageCount++] = {&image, slot, readOnly, readWrite};
+             if (readOnly)
+             {
+                 continue;
+@@ -124,12 +164,39 @@ bool ImageBindingsOverlap(const gl::ImageUnit &a, const gl::ImageUnit &b)
+                     const GLuint unit = sampler.getTextureUnit(
+                         executable.getSamplerBoundTextureUnits(), samplerElement);
+                     ANGLE_CHECK(context, state.getActiveTexturesCache()[unit] != image.texture.get(),
+-                                "Sampling a writable Metal graphics image is not supported",
++                                "Sampling a writable Metal image is not supported",
+                                 GL_INVALID_OPERATION);
+                 }
+             }
+         }
+     }
++    for (size_t index = 0; index < usedImageCount; ++index)
++    {
++        const uint32_t slot = usedImages[index].slot;
++        const uint32_t root = findRoot(slot);
++        bool shared = root != slot;
++        if (!shared)
++        {
++            for (size_t other = 0; other < usedImageCount; ++other)
++            {
++                if (usedImages[other].slot != slot && findRoot(usedImages[other].slot) == root)
++                {
++                    shared = true;
++                    break;
++                }
++            }
++        }
++        // A native read/write image also uses the shared raw view when it is
++        // the sole image: the other two handles then remain read-only/write-only,
++        // keeping the total within Metal's eight read/write texture arguments.
++        if (shared || usedImages[index].readWrite)
++        {
++            // The low byte stores a one-based native slot. The remaining bits
++            // carry this image unit's GL format for the shader conversion.
++            (*aliases)[slot] = (static_cast<uint32_t>(usedImages[index].unit->format) << 8) |
++                               (root + 1);
++        }
++    }
+     return angle::Result::Continue;
+ }
+ 
+@@ -1119,6 +1186,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                 "Compute local size exceeds this Metal pipeline's limit", GL_INVALID_OPERATION);
+     const auto &glState = glContext->getState();
+     const auto &info    = getComputeShaderInfo();
++    std::array<uint32_t, 4> imageAliases = {};
++    ANGLE_TRY(CollectImageAliases(glContext, *mExecutable, info, &imageAliases));
+     mtl::ComputeDriverUniforms driver;
+     std::array<mtl::BufferRef, mtl::kMaxComputeStorageBuffers> buffers;
+     std::array<size_t, mtl::kMaxComputeStorageBuffers> offsets = {};
+@@ -1219,11 +1288,12 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         uint32_t slot;
+         bool planar;
+     };
+-    std::array<uint32_t, 4> imageLayers = {};
++    std::array<std::array<uint32_t, 2>, 4> imageMetadata = {};
+     std::vector<StorageImage> storageImages;
+     for (size_t i = 0; i < mExecutable->getImageBindings().size(); ++i)
+     {
+-        const uint32_t slot = info.actualComputeImageBindings[i];
++        const uint32_t slot = info.actualComputeImageBindings[i] &
++                              ~angle::metal::kImageBindingFlags;
+         if (slot >= mtl::kMaxComputeTextures)
+         {
+             continue;
+@@ -1233,8 +1303,11 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         {
+             const auto &unit = glState.getImageUnit(binding.boundImageUnits[element]);
+             const bool planar = binding.textureType == gl::TextureType::_2D;
+-            ASSERT(slot + element < imageLayers.size());
+-            imageLayers[slot + element] = static_cast<uint32_t>(unit.layer);
++            ASSERT(slot + element < imageMetadata.size());
++            imageMetadata[slot + element][0] = unit.texture.get() &&
++                    unit.texture->getType() == gl::TextureType::_2D
++                ? 0 : static_cast<uint32_t>(unit.layer);
++            imageMetadata[slot + element][1] = imageAliases[slot + element];
+             if (!unit.texture.get())
+             {
+                 storageImages.push_back(
+@@ -1289,14 +1362,39 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         ANGLE_TRY(texture.texture->bindToComputeShader(glContext, encoder, texture.sampler,
+                                                        texture.textureSlot, texture.samplerSlot));
+     }
+-    encoder->setData(imageLayers, mtl::kComputeImageLayerBuffer);
++    encoder->setData(imageMetadata, mtl::kComputeImageLayerBuffer);
+     for (const auto &image : storageImages)
+     {
++        const uint32_t aliasSlot = angle::metal::kAliasImageSlot + image.slot;
++        const uint32_t aliasVolumeSlot = angle::metal::kAliasVolumeSlot + image.slot;
++        const bool aliased = imageAliases[image.slot] != 0;
++        const bool canonical = (imageAliases[image.slot] & 255u) == image.slot + 1;
++        const bool nativeVolume = image.texture &&
++                                  image.unit->texture->getType() == gl::TextureType::_3D;
++        const bool volume = image.planar && nativeVolume;
++        encoder->setTexture({}, aliasSlot);
++        encoder->setTexture({}, aliasVolumeSlot);
++        if (aliased)
++        {
++            encoder->setTexture({}, image.slot);
++            if (image.planar)
++            {
++                encoder->setTexture({}, mtl::kComputeImageVolumeSlot + image.slot);
++            }
++            if (canonical)
++            {
++                ASSERT(image.texture);
++                ANGLE_TRY(image.texture->bindToComputeAliasedImage(
++                    glContext, encoder, nativeVolume ? aliasVolumeSlot : aliasSlot,
++                    image.unit->level,
++                    GetAliasedReadWriteFormat(context->getDisplay()->getMetalDevice(),
++                                              image.unit->format)));
++            }
++            continue;
++        }
+         if (image.planar)
+         {
+             const uint32_t volumeSlot = mtl::kComputeImageVolumeSlot + image.slot;
+-            const bool volume =
+-                image.texture && image.unit->texture->getType() == gl::TextureType::_3D;
+             // Both handles are rebound for every dispatch, including null units.
+             encoder->setTexture({}, volume ? image.slot : volumeSlot);
+             if (volume)
+@@ -1706,7 +1804,8 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                 ? *mCurrentShaderVariants[shaderType]->translatedSrcInfo
+                 : mMslShaderTranslateInfo[shaderType];
+ 
+-        ANGLE_TRY(ValidateGraphicsImageAliases(glContext, *mExecutable, shaderInfo));
++        std::array<uint32_t, 4> imageAliases = {};
++        ANGLE_TRY(CollectImageAliases(glContext, *mExecutable, shaderInfo, &imageAliases));
+ 
+         if (mSamplerBindingsDirty[shaderType] || forceUpdate)
+         {
+@@ -1753,14 +1852,14 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+             shaderInfo.actualComputeImageBindings.begin(),
+             shaderInfo.actualComputeImageBindings.end(),
+             [](uint32_t slot) {
+-                return (slot & ~angle::metal::kReadOnlyImageBindingBit) < mtl::kMaxComputeTextures;
++                return (slot & ~angle::metal::kImageBindingFlags) < mtl::kMaxComputeTextures;
+             });
+         for (size_t imageIndex = 0; imageIndex < imageBindings.size(); ++imageIndex)
+         {
+             const gl::ImageBinding &imageBinding = imageBindings[imageIndex];
+             const uint32_t slot = imageIndex < shaderInfo.actualComputeImageBindings.size()
+                                       ? shaderInfo.actualComputeImageBindings[imageIndex] &
+-                                            ~angle::metal::kReadOnlyImageBindingBit
++                                            ~angle::metal::kImageBindingFlags
+                                       : mtl::kMaxComputeTextures;
+             if (slot < mtl::kMaxComputeTextures)
+             {
+@@ -1771,13 +1870,45 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+                     ASSERT(imageSlot < imageLayers.size());
+                     const gl::ImageUnit &unit =
+                         glState.getImageUnit(imageBinding.boundImageUnits[element]);
+-                    imageLayers[imageSlot] = static_cast<uint32_t>(unit.layer);
++                    imageLayers[imageSlot] = unit.texture.get() &&
++                            unit.texture->getType() == gl::TextureType::_2D
++                        ? 0 : static_cast<uint32_t>(unit.layer);
+                     TextureMtl *texture = unit.texture.get() ? mtl::GetImpl(unit.texture.get()) : nullptr;
+                     const bool planar = imageBinding.textureType == gl::TextureType::_2D;
++                    const uint32_t aliasSlot = angle::metal::kAliasImageSlot + imageSlot;
++                    const uint32_t aliasVolumeSlot =
++                        angle::metal::kAliasVolumeSlot + imageSlot;
++                    const bool aliased = imageAliases[imageSlot] != 0;
++                    const bool canonical = (imageAliases[imageSlot] & 255u) == imageSlot + 1;
++                    const bool nativeVolume = texture &&
++                                              unit.texture->getType() == gl::TextureType::_3D;
++                    const bool volume = planar && nativeVolume;
++                    // Clear both modes on every draw. A rebinding may turn an
++                    // independent image into an alias, or the reverse.
++                    cmdEncoder->setTexture(shaderType, {}, aliasSlot);
++                    cmdEncoder->setTexture(shaderType, {}, aliasVolumeSlot);
++                    if (aliased)
++                    {
++                        cmdEncoder->setTexture(shaderType, {}, imageSlot);
++                        if (planar)
++                        {
++                            cmdEncoder->setTexture(shaderType, {},
++                                                   mtl::kComputeImageVolumeSlot + imageSlot);
++                        }
++                        if (canonical)
++                        {
++                            ASSERT(texture);
++                            ANGLE_TRY(texture->bindToGraphicsAliasedImage(
++                                glContext, cmdEncoder, shaderType,
++                                nativeVolume ? aliasVolumeSlot : aliasSlot, unit.level,
++                                GetAliasedReadWriteFormat(
++                                    contextMtl->getDisplay()->getMetalDevice(), unit.format)));
++                        }
++                        continue;
++                    }
+                     if (planar)
+                     {
+                         const uint32_t volumeSlot = mtl::kComputeImageVolumeSlot + imageSlot;
+-                        const bool volume = texture && unit.texture->getType() == gl::TextureType::_3D;
+                         cmdEncoder->setTexture(shaderType, {}, volume ? imageSlot : volumeSlot);
+                         if (volume)
+                         {
+@@ -1832,7 +1963,7 @@ kernel void main0(const device uchar *source [[buffer(0)]],
+         }
+         if (hasWrappedImages)
+         {
+-            contextMtl->setGraphicsImageLayers(shaderType, imageLayers, cmdEncoder);
++            contextMtl->setGraphicsImageLayers(shaderType, imageLayers, imageAliases, cmdEncoder);
+         }
+     }  // for shader types
+ 
+diff --git a/src/libANGLE/renderer/metal/ProgramMtl.mm b/src/libANGLE/renderer/metal/ProgramMtl.mm
+index a122ac3..a161ef0 100644
+--- a/src/libANGLE/renderer/metal/ProgramMtl.mm
++++ b/src/libANGLE/renderer/metal/ProgramMtl.mm
+@@ -35,7 +35,7 @@
+ namespace
+ {
+ constexpr uint32_t kMetalProgramBinaryVersion =
+-    0x4d43503d;  // Graphics image reflection and resource bindings
++    0x4d43503e;  // Shared image alias bindings and metadata
+ inline std::map<std::string, std::string> GetDefaultSubstitutionDictionary()
+ {
+     return {};
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.h b/src/libANGLE/renderer/metal/TextureMtl.h
+index fa50af8..fd097ca 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.h
++++ b/src/libANGLE/renderer/metal/TextureMtl.h
+@@ -196,6 +196,12 @@ class TextureMtl : public TextureImpl
+                                       bool layered,
+                                       int layer,
+                                       GLenum format);
++    angle::Result bindToGraphicsAliasedImage(const gl::Context *context,
++                                             mtl::RenderCommandEncoder *encoder,
++                                             gl::ShaderType shaderType,
++                                             int textureSlotIndex,
++                                             int level,
++                                             GLenum format);
+ 
+     angle::Result bindToComputeShader(const gl::Context *context,
+                                       mtl::ComputeCommandEncoder *encoder,
+@@ -209,9 +215,21 @@ class TextureMtl : public TextureImpl
+                                      bool layered,
+                                      int layer,
+                                      GLenum format);
++    angle::Result bindToComputeAliasedImage(const gl::Context *context,
++                                            mtl::ComputeCommandEncoder *encoder,
++                                            int textureSlotIndex,
++                                            int level,
++                                            GLenum format);
+ 
+   private:
+     template <typename Encoder>
++    angle::Result bindToAliasedImageImpl(const gl::Context *context,
++                                         Encoder *encoder,
++                                         gl::ShaderType shaderType,
++                                         int textureSlotIndex,
++                                         int level,
++                                         GLenum format);
++    template <typename Encoder>
+     angle::Result bindToShaderImpl(const gl::Context *context,
+                                    Encoder *encoder,
+                                    gl::ShaderType shaderType,
+@@ -422,6 +440,7 @@ class TextureMtl : public TextureImpl
+     // Indexed by format, then layer, then level.
+     std::map<MTLPixelFormat, LayerLevelTextureViewVector> mShaderImageViews;
+     std::map<MTLPixelFormat, TextureViewVector> mLayeredShaderImageViews;
++    std::map<MTLPixelFormat, TextureViewVector> mAliasedShaderImageViews;
+ 
+     // Mipmap views are indexed from (base GL level -> max GL level):
+     mtl::NativeTexLevelArray mLevelViewsWithinBaseMax;
+diff --git a/src/libANGLE/renderer/metal/TextureMtl.mm b/src/libANGLE/renderer/metal/TextureMtl.mm
+index 9e8749a..5d08182 100644
+--- a/src/libANGLE/renderer/metal/TextureMtl.mm
++++ b/src/libANGLE/renderer/metal/TextureMtl.mm
+@@ -860,6 +860,11 @@ uint32_t height(GLuint glLevel) const
+         return mNativeTexture->createLayeredShaderImageView(getNativeLevel(glLevel), format);
+     }
+ 
++    mtl::TextureRef createAliasedShaderImageView(GLuint glLevel, MTLPixelFormat format)
++    {
++        return mNativeTexture->createAliasedShaderImageView(getNativeLevel(glLevel), format);
++    }
++
+     mtl::TextureRef createShaderImageView2D(GLuint glLevel, int layer, MTLPixelFormat format)
+     {
+         return mNativeTexture->createShaderImageView2D(getNativeLevel(glLevel), layer, format);
+@@ -893,8 +898,6 @@ uint32_t height(GLuint glLevel) const
+     if (!keepImages)
+     {
+         mTexImageDefs.clear();
+-        mShaderImageViews.clear();
+-        mLayeredShaderImageViews.clear();
+     }
+     else if (mNativeTextureStorage)
+     {
+@@ -902,6 +905,11 @@ uint32_t height(GLuint glLevel) const
+         retainImageDefinitions();
+     }
+ 
++    // Views refer to this native storage, even when image definitions survive.
++    mShaderImageViews.clear();
++    mLayeredShaderImageViews.clear();
++    mAliasedShaderImageViews.clear();
++
+     mNativeTextureStorage       = nullptr;
+     mViewFromBaseToMaxLevel     = nullptr;
+     mSwizzleStencilSamplingView = nullptr;
+@@ -2134,6 +2142,53 @@ uint32_t height(GLuint glLevel) const
+                                   layer, format);
+ }
+ 
++angle::Result TextureMtl::bindToGraphicsAliasedImage(const gl::Context *context,
++                                                     mtl::RenderCommandEncoder *encoder,
++                                                     gl::ShaderType shaderType,
++                                                     int textureSlotIndex,
++                                                     int level,
++                                                     GLenum format)
++{
++    return bindToAliasedImageImpl(context, encoder, shaderType, textureSlotIndex, level, format);
++}
++
++angle::Result TextureMtl::bindToComputeAliasedImage(const gl::Context *context,
++                                                    mtl::ComputeCommandEncoder *encoder,
++                                                    int textureSlotIndex,
++                                                    int level,
++                                                    GLenum format)
++{
++    return bindToAliasedImageImpl(context, encoder, gl::ShaderType::Compute, textureSlotIndex,
++                                  level, format);
++}
++
++template <typename Encoder>
++angle::Result TextureMtl::bindToAliasedImageImpl(const gl::Context *context,
++                                                 Encoder *encoder,
++                                                 gl::ShaderType shaderType,
++                                                 int textureSlotIndex,
++                                                 int level,
++                                                 GLenum format)
++{
++    ASSERT(mNativeTextureStorage);
++    ASSERT(mState.getImmutableFormat());
++    ASSERT(0 <= level && static_cast<uint32_t>(level) < mState.getImmutableLevels());
++    ContextMtl *contextMtl = mtl::GetImpl(context);
++    const auto imageFormat =
++        contextMtl->getPixelFormat(angle::Format::InternalFormatToID(format));
++    auto &views = mAliasedShaderImageViews[imageFormat.metalFormat];
++    views.resize(mState.getImmutableLevels());
++    auto &view = views[level];
++    if (!view)
++    {
++        view = mNativeTextureStorage->createAliasedShaderImageView(level, imageFormat.metalFormat);
++    }
++    ANGLE_CHECK(contextMtl, view && view->valid(), "Cannot create Metal image alias view",
++                GL_INVALID_OPERATION);
++    encoder->setRWTexture(shaderType, view, textureSlotIndex);
++    return angle::Result::Continue;
++}
++
+ template <typename Encoder>
+ angle::Result TextureMtl::bindToLayeredImageImpl(const gl::Context *context,
+                                                  Encoder *encoder,
+diff --git a/src/libANGLE/renderer/metal/mtl_command_buffer.mm b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+index 3cd5d18..aa9ccd8 100644
+--- a/src/libANGLE/renderer/metal/mtl_command_buffer.mm
++++ b/src/libANGLE/renderer/metal/mtl_command_buffer.mm
+@@ -2094,7 +2094,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+                                                        const TextureRef &texture,
+                                                        uint32_t index)
+ {
+-    if (index >= kMaxComputeTextures)
++    if (index >= angle::metal::kImageTextureArgumentCount)
+     {
+         return *this;
+     }
+@@ -2126,7 +2126,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+                                                          const TextureRef &texture,
+                                                          uint32_t index)
+ {
+-    if (index >= kMaxComputeTextures)
++    if (index >= angle::metal::kImageTextureArgumentCount)
+     {
+         return *this;
+     }
+@@ -2848,7 +2848,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+ }
+ ComputeCommandEncoder &ComputeCommandEncoder::setTexture(const TextureRef &texture, uint32_t index)
+ {
+-    if (index >= kMaxComputeTextures)
++    if (index >= angle::metal::kImageTextureArgumentCount)
+     {
+         return *this;
+     }
+@@ -2861,7 +2861,7 @@ void RandomizeClearValue(ObjCAttachmentDescriptor *objCRenderPassAttachment)
+ ComputeCommandEncoder &ComputeCommandEncoder::setTextureForWrite(const TextureRef &texture,
+                                                                  uint32_t index)
+ {
+-    if (index >= kMaxComputeTextures)
++    if (index >= angle::metal::kImageTextureArgumentCount)
+     {
+         return *this;
+     }
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.h b/src/libANGLE/renderer/metal/mtl_resources.h
+index 2751a51..0001d0f 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.h
++++ b/src/libANGLE/renderer/metal/mtl_resources.h
+@@ -264,6 +264,7 @@ class Texture final : public Resource,
+     TextureRef createViewWithDifferentFormat(MTLPixelFormat format);
+     // Create a view for a shader image binding.
+     TextureRef createLayeredShaderImageView(const MipmapNativeLevel &level, MTLPixelFormat format);
++    TextureRef createAliasedShaderImageView(const MipmapNativeLevel &level, MTLPixelFormat format);
+     TextureRef createShaderImageView2D(const MipmapNativeLevel &level,
+                                        int layer,
+                                        MTLPixelFormat format);
+diff --git a/src/libANGLE/renderer/metal/mtl_resources.mm b/src/libANGLE/renderer/metal/mtl_resources.mm
+index ce02d0a..4febfa3 100644
+--- a/src/libANGLE/renderer/metal/mtl_resources.mm
++++ b/src/libANGLE/renderer/metal/mtl_resources.mm
+@@ -769,6 +769,18 @@ bool needMultisampleColorFormatShaderReadWorkaround(ContextMtl *context, MTLText
+                                   NSMakeRange(0, cubeFacesOrArrayLength())));
+ }
+ 
++TextureRef Texture::createAliasedShaderImageView(const MipmapNativeLevel &level,
++                                                 MTLPixelFormat format)
++{
++    ASSERT(isShaderReadable());
++    ASSERT(isShaderWritable());
++    ASSERT(format == pixelFormat() || supportFormatView());
++    const MTLTextureType aliasType = textureType() == MTLTextureType3D
++                                         ? MTLTextureType3D : MTLTextureType2DArray;
++    return TextureRef(new Texture(this, format, aliasType, NSMakeRange(level.get(), 1),
++                                  NSMakeRange(0, cubeFacesOrArrayLength())));
++}
++
+ TextureRef Texture::createShaderImageView2D(const MipmapNativeLevel &level,
+                                             int layer,
+                                             MTLPixelFormat format)
