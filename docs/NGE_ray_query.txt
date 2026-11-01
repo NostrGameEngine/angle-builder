@@ -1,0 +1,173 @@
+Name
+    GL_NGE_ray_query
+
+Status
+    Private extension, draft 1. Availability is reported per ANGLE context.
+    GLES 3.1 alone does not imply support for this extension. The shader
+    interface uses the names and traversal model of Khronos GLSL_EXT_ray_query;
+    the GLES commands that construct and bind acceleration structures are
+    specific to this draft.
+
+Dependencies
+    OpenGL ES 3.0 and GLSL ES 3.00 for vertex and fragment queries.
+    OpenGL ES 3.1 and GLSL ES 3.10 for compute queries.
+
+Overview
+    Shaders traverse an instanced top-level acceleration structure (TLAS) built
+    from triangle or AABB bottom-level acceleration structures (BLAS). Acceleration
+    structures are shared objects. Binding points are context state. Traversal
+    state belongs to one shader invocation.
+
+New tokens
+    MAX_ACCELERATION_STRUCTURE_BINDINGS                 0x6000
+    ACCELERATION_STRUCTURE                              0x6001
+    ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT         0x0001
+    ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT         0x0002
+    ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_CULL_DISABLE_BIT 0x0001
+    ACCELERATION_STRUCTURE_INSTANCE_TRIANGLE_FLIP_FACING_BIT  0x0002
+    ACCELERATION_STRUCTURE_INSTANCE_FORCE_OPAQUE_BIT     0x0004
+    ACCELERATION_STRUCTURE_INSTANCE_FORCE_NON_OPAQUE_BIT 0x0008
+
+New commands
+    void GenAccelerationStructures(sizei n, uint *structures);
+    void DeleteAccelerationStructures(sizei n, const uint *structures);
+    boolean IsAccelerationStructure(uint structure);
+    void BuildTriangleAccelerationStructure(uint structure,
+        uint vertexBuffer, intptr vertexOffset, sizei vertexStride,
+        sizei vertexCount, uint indexBuffer, intptr indexOffset,
+        enum indexType, sizei indexCount, bitfield flags);
+    void BuildAabbAccelerationStructure(uint structure, uint buffer,
+        intptr offset, sizei stride, sizei count, bitfield flags);
+    void SetAccelerationStructureInstance(uint structure, uint instance,
+        uint blas, const float *transform, uint customIndex, uint mask,
+        bitfield flags);
+    void BuildTopLevelAccelerationStructure(uint structure,
+        sizei instanceCount, bitfield flags);
+    void BindAccelerationStructure(uint binding, uint structure);
+
+Objects and builds
+    GenAccelerationStructures creates names immediately. Zero is never an
+    object name. Delete ignores zero and unknown names, and unbinds deleted
+    objects from the calling context. Other context bindings, configured TLAS
+    instances and queued GPU commands retain their referenced objects/resources.
+
+    A name becomes a BLAS or a TLAS on first successful geometry build or
+    instance configuration, respectively. Its kind cannot subsequently change.
+
+    Vertices are three consecutive 32-bit floats at vertexOffset + vertex *
+    vertexStride. Offset and stride must be multiples of four; stride is at
+    least twelve. The declared vertex range must fit within vertexBuffer.
+    Non-indexed geometry uses indexBuffer zero, indexType NONE, indexOffset
+    zero and indexCount zero. vertexCount must then be a positive multiple of
+    three. Indexed geometry uses UNSIGNED_SHORT or UNSIGNED_INT, an offset
+    aligned to the index size, and a positive indexCount divisible by three.
+    Its index-buffer range must fit. Every supplied index must be less than
+    vertexCount; applications must supply valid geometry values.
+
+    AABB geometry consists of six consecutive 32-bit floats per box: minimum
+    x/y/z followed by maximum x/y/z. Its stride must be at least 24 bytes and
+    a multiple of four. The offset must be non-negative and a multiple of the
+    stride. count must be positive and the buffer range must fit. Applications
+    must supply finite, ordered bounds. AABB candidates are conservative and
+    can be false positives; shaders must test the procedural geometry before
+    calling rayQueryGenerateIntersectionEXT.
+
+    The build preference bits are optional and mutually exclusive. Builds do
+    not update existing native storage in place. A successful rebuild creates
+    a new generation. Existing TLAS generations continue to reference their
+    original BLAS generations until the TLAS is rebuilt.
+
+    SetAccelerationStructureInstance configures pending instance metadata.
+    The BLAS must already be built. transform points to twelve finite floats:
+    a row-major, invertible, affine 3-by-4 object-to-world matrix. customIndex
+    is at most 0xffffff; mask is at most 0xff. Instance indices are below 65536.
+    Force-opaque and force-non-opaque cannot both be set. The flip-facing bit
+    reverses the triangle facing classification used by traversal.
+    The shader binding table record offset is zero for every instance created
+    by this API.
+
+    BuildTopLevelAccelerationStructure builds the first instanceCount slots.
+    Every slot must have a configured BLAS. Pending instance changes do not
+    affect the preceding built generation until this build succeeds.
+
+    GPU writes to geometry, BLAS/TLAS builds and traversal reads are ordered
+    through the backend's resource dependencies on one queue. No CPU completion
+    wait is required between these commands. Ordinary GLES synchronization still
+    governs CPU access and communication through other shader resources.
+
+Bindings and reflection
+    MAX_ACCELERATION_STRUCTURE_BINDINGS is an integer context limit, four
+    in this initial profile. Binding zero as the object name unbinds a slot.
+    A shader resource is declared using an explicit immutable binding:
+
+        #extension GL_NGE_ray_query : require
+        layout(binding = 0) uniform accelerationStructureEXT scene;
+
+    An acceleration-structure array consumes consecutive bindings starting at
+    its declared binding. Array indexing must be dynamically uniform. Distinct
+    active uniforms must not overlap. The
+    binding namespace is independent of texture, image and buffer bindings.
+    Acceleration structures may be passed to GLSL functions. Structure and
+    interface-block fields of this type are unsupported. Reflection reports type
+    ACCELERATION_STRUCTURE. These uniforms have no glUniform location.
+    Draw and dispatch require a built TLAS at every active declared binding.
+
+Shader traversal
+    rayQueryEXT is opaque invocation-local state. It can be declared without a
+    storage qualifier in global or function scope, used in arrays and passed as
+    a function parameter. Array indices must be dynamically uniform. It cannot
+    be copied, initialized, constructed, stored in a structure or returned.
+    Built-in query functions access its mutable state. Neither opaque type
+    accepts a precision qualifier.
+
+    Core traversal functions:
+        void rayQueryInitializeEXT(inout rayQueryEXT q,
+            accelerationStructureEXT scene, uint flags, uint mask,
+            vec3 origin, float tMin, vec3 direction, float tMax);
+        bool rayQueryProceedEXT(inout rayQueryEXT q);
+        void rayQueryConfirmIntersectionEXT(inout rayQueryEXT q);
+        void rayQueryTerminateEXT(inout rayQueryEXT q);
+        void rayQueryGenerateIntersectionEXT(inout rayQueryEXT q, float t);
+
+    Ray getters (one query argument):
+        float rayQueryGetRayTMinEXT;
+        uint  rayQueryGetRayFlagsEXT;
+        vec3  rayQueryGetWorldRayOriginEXT;
+        vec3  rayQueryGetWorldRayDirectionEXT;
+        bool  rayQueryGetIntersectionCandidateAABBOpaqueEXT;
+
+    Intersection getters take (rayQueryEXT q, bool committed). The selector
+    must be a compile-time constant; false selects the current candidate and
+    true selects the committed intersection.
+        uint    rayQueryGetIntersectionTypeEXT;
+        float   rayQueryGetIntersectionTEXT;
+        int     rayQueryGetIntersectionInstanceCustomIndexEXT;
+        int     rayQueryGetIntersectionInstanceIdEXT;
+        uint    rayQueryGetIntersectionInstanceShaderBindingTableRecordOffsetEXT;
+        int     rayQueryGetIntersectionGeometryIndexEXT;
+        int     rayQueryGetIntersectionPrimitiveIndexEXT;
+        vec2    rayQueryGetIntersectionBarycentricsEXT;
+        bool    rayQueryGetIntersectionFrontFaceEXT;
+        vec3    rayQueryGetIntersectionObjectRayOriginEXT;
+        vec3    rayQueryGetIntersectionObjectRayDirectionEXT;
+        mat4x3  rayQueryGetIntersectionObjectToWorldEXT;
+        mat4x3  rayQueryGetIntersectionWorldToObjectEXT;
+
+    Ray flags and candidate/committed intersection constants have the values
+    and meanings of GLSL_EXT_ray_query, with the standard EXT suffix. In particular,
+    candidate triangle is zero, while committed none/triangle/generated are
+    zero/one/two. Triangle and AABB geometry are constructible in this draft.
+    State-dependent getters require a valid corresponding intersection.
+
+Errors and availability
+    Negative counts, invalid ranges/alignment, invalid preferences, invalid
+    instance metadata and binding indices outside the context limit generate
+    INVALID_VALUE. Unsupported index formats generate INVALID_ENUM. Kind
+    changes, unbuilt dependencies, mapped inputs, incomplete TLAS inputs and
+    missing TLAS bindings generate INVALID_OPERATION. Native allocation failure
+    generates OUT_OF_MEMORY. Invalid shader declarations fail compilation.
+
+    WebGL and protected contexts do not expose this extension. Backend exposure
+    requires native traversal support for all three requested shader stages,
+    sufficient acceleration-structure bindings, and functioning GPU resource
+    ownership and synchronization. Unsupported devices must omit the extension.
